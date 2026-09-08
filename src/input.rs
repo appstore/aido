@@ -62,7 +62,7 @@ fn gather_from_files(files: &[PathBuf]) -> Result<UserContent> {
             .len();
         if size > MAX_FILE_BYTES {
             bail!(
-                "'{}' is {} MB; refusing input files over {} MB (contents are sent as a single request)",
+                "'{}' is {} MB; refusing input files over {} MB (they are fully loaded into memory)",
                 path.display(),
                 size / (1024 * 1024),
                 MAX_FILE_BYTES / (1024 * 1024)

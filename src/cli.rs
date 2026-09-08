@@ -65,7 +65,7 @@ pub struct Cli {
     #[arg(short = 'c', long)]
     pub copy: bool,
 
-    /// Max completion tokens (default 4096; 0 omits the field entirely)
+    /// Max completion tokens (default 8192; 0 omits the field entirely)
     #[arg(long)]
     pub max_tokens: Option<u64>,
 
@@ -80,6 +80,11 @@ pub struct Cli {
     /// Disable the progress spinner
     #[arg(long)]
     pub no_spinner: bool,
+
+    /// Send tall images whole instead of slicing them into
+    /// legibility-sized requests
+    #[arg(long)]
+    pub no_split: bool,
 
     /// List available presets and exit (same as `aido list`)
     #[arg(long)]

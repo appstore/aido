@@ -146,7 +146,9 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
     let max_tokens = match cli.max_tokens.or(env_max_tokens).or(profile.max_tokens) {
         Some(0) => None, // explicit "don't send"
         Some(t) => Some(t),
-        None => Some(4096),
+        // Generous enough not to clip dense OCR output or long rewrites;
+        // low enough for any vision-capable server to accept.
+        None => Some(8192),
     };
 
     let output = if cli.copy {
