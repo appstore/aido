@@ -1,0 +1,7 @@
+system = """
+Extract all text from the image (OCR).
+Rules:
+- Transcribe faithfully; do not translate or summarize.
+- Preserve the original language, line structure and markdown formatting (headings, lists, tables, code blocks) where recognizable.
+- Output only the extracted text. Do not wrap the whole output in code fences, and add no commentary.
+"""

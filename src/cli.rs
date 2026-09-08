@@ -1,0 +1,103 @@
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    Stdout,
+    Clipboard,
+    Both,
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OutputMode::Stdout => "stdout",
+            OutputMode::Clipboard => "clipboard",
+            OutputMode::Both => "both",
+        })
+    }
+}
+
+/// Send clipboard or piped stdin content to an OpenAI-compatible model.
+#[derive(Debug, Parser)]
+#[command(
+    name = "aiclip",
+    version,
+    about = "Send clipboard or piped stdin content to an OpenAI-compatible model",
+    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aiclip \"clean up this text\" --copy\n  aiclip --preset ocr --copy          # screenshot -> OCR -> clipboard\n  git diff | aiclip --preset code-review\n  echo hi | aiclip --base-url http://localhost:30000 -m qwen3"
+)]
+pub struct Cli {
+    /// System instructions for the model (the input text is sent as the user message)
+    #[arg(value_name = "PROMPT", conflicts_with_all = ["prompt", "preset"])]
+    pub prompt_pos: Option<String>,
+
+    /// System instructions for the model (same as the positional PROMPT)
+    #[arg(short = 'p', long, conflicts_with = "preset")]
+    pub prompt: Option<String>,
+
+    /// Use a prompt preset (see --list-presets)
+    #[arg(long)]
+    pub preset: Option<String>,
+
+    /// Config profile to use (see --init for a sample config)
+    #[arg(long)]
+    pub profile: Option<String>,
+
+    /// Model name
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    /// OpenAI-compatible base URL, e.g. https://api.openai.com/v1 or http://localhost:30000
+    #[arg(long)]
+    pub base_url: Option<String>,
+
+    /// API key (prefer the AICLIP_API_KEY / OPENAI_API_KEY env vars)
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Where to write the result
+    #[arg(short = 'o', long, value_enum, conflicts_with = "copy")]
+    pub output: Option<OutputMode>,
+
+    /// Shorthand for --output clipboard
+    #[arg(short = 'c', long)]
+    pub copy: bool,
+
+    /// Max completion tokens (default 4096; 0 omits the field entirely)
+    #[arg(long)]
+    pub max_tokens: Option<u64>,
+
+    /// Sampling temperature
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Request timeout in seconds (default 120)
+    #[arg(long)]
+    pub timeout: Option<u64>,
+
+    /// Disable the progress spinner
+    #[arg(long)]
+    pub no_spinner: bool,
+
+    /// List available presets and exit
+    #[arg(long)]
+    pub list_presets: bool,
+
+    /// Write a sample config file and exit
+    #[arg(long)]
+    pub init: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Commands {
+    /// Internal: hold clipboard contents in the background (Linux)
+    #[command(name = "__hold", hide = true)]
+    Hold {
+        /// Seconds to keep the clipboard alive
+        secs: u64,
+    },
+}
