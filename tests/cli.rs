@@ -241,6 +241,28 @@ fn unknown_action_fails_with_suggestion() {
 }
 
 #[test]
+fn prompt_like_action_gets_migration_hint() {
+    // Old versions took any positional text as the prompt; sentences (with
+    // or without spaces) landing in the action slot should point at -p.
+    for arg in ["polish this text for me", "润色这段话"] {
+        let out = run(&[arg, "--no-spinner"], b"hi\n", &[]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("unknown action"), "stderr was: {err}");
+        assert!(err.contains("-p/--prompt"), "stderr was: {err}");
+    }
+}
+
+#[test]
+fn unknown_preset_fails_with_suggestion() {
+    let out = run(&["--preset", "transalte", "--no-spinner"], b"hi\n", &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown preset"), "stderr was: {err}");
+    assert!(err.contains("did you mean 'translate'"), "stderr was: {err}");
+}
+
+#[test]
 fn action_conflicts_with_prompt_flag() {
     let out = run(&["ocr", "-p", "extra", "--no-spinner"], b"hi\n", &[]);
     assert!(!out.status.success());

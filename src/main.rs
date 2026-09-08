@@ -38,8 +38,11 @@ async fn main() -> Result<()> {
         match all.get(name) {
             Some(p) => p.system.clone(),
             None => {
-                let names: Vec<String> = all.keys().cloned().collect();
-                bail!("unknown preset '{name}'; available: {} (see `aido list`)", names.join(", "))
+                let names: Vec<&str> = all.keys().map(String::as_str).collect();
+                let hint = presets::closest(name, &names)
+                    .map(|best| format!(" (did you mean '{best}'?)"))
+                    .unwrap_or_default();
+                bail!("unknown preset '{name}'; available: {}{hint} (see `aido list`)", names.join(", "))
             }
         }
     } else {
@@ -80,6 +83,13 @@ async fn main() -> Result<()> {
 /// they are never treated as preset actions.
 const RESERVED_ACTIONS: &[&str] = &["list", "help", "__hold"];
 
+/// Old versions accepted any positional text as the prompt, so text with
+/// whitespace or non-ASCII characters in the action slot is that old habit
+/// rather than a misspelled action name — it should be pointed at -p.
+fn looks_like_prompt(word: &str) -> bool {
+    word.chars().any(|c| c.is_whitespace() || !c.is_ascii())
+}
+
 /// The first argument (when not a flag) is an action: `aido ocr ...` becomes
 /// `aido --preset ocr ...`. The rewrite happens before clap because preset
 /// names are only known at runtime; anything else in that slot is an error.
@@ -97,7 +107,15 @@ fn parse_cli() -> Result<cli::Cli> {
                 let hint = presets::closest(first, &actions)
                     .map(|best| format!(" (did you mean '{best}'?)"))
                     .unwrap_or_default();
-                bail!("unknown action '{first}'; available: {}{hint}", actions.join(", "));
+                let prompt_hint = if looks_like_prompt(first) {
+                    "; for an ad-hoc prompt, use -p/--prompt"
+                } else {
+                    ""
+                };
+                bail!(
+                    "unknown action '{first}'; available: {}{hint}{prompt_hint}",
+                    actions.join(", ")
+                );
             }
         }
     }
