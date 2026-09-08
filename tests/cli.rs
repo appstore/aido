@@ -751,6 +751,62 @@ fn directory_input_fails() {
 }
 
 #[test]
+fn whitespace_file_is_skipped_with_a_warning() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let blank = temp_file("blank.txt", b"   \n\n  ");
+    let real = temp_file("real.txt", b"real content\n");
+    let out = run(
+        &[
+            "summarize",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            blank.to_str().unwrap(),
+            real.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("warning"), "stderr was: {err}");
+    assert!(err.contains("blank.txt"), "stderr was: {err}");
+    let req = request_json(&server.request());
+    assert_eq!(req["messages"][1]["content"], "real content\n");
+    std::fs::remove_file(&blank).ok();
+    std::fs::remove_file(&real).ok();
+}
+
+#[test]
+fn oversized_file_is_refused() {
+    // set_len creates a sparse file: 33 MB of logical size, ~0 bytes on disk.
+    let file = std::env::temp_dir().join(format!("aido-test-huge-{}.bin", std::process::id()));
+    std::fs::File::create(&file)
+        .unwrap()
+        .set_len(33 * 1024 * 1024)
+        .unwrap();
+    let out = run(
+        &[
+            "summarize",
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("32 MB"), "stderr was: {err}");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
 fn max_tokens_flag_overrides_and_zero_omits() {
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
     run(

@@ -88,7 +88,7 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 | 参数 | 说明 |
 |---|---|
 | `<ACTION>` | 第一个参数位：运行一个 preset（如 `aido ocr`），等价于 `--preset`；action 名必须最先出现 |
-| `<FILE>...` | 输入文件（须搭配 action 或 `-p`，位置任意）：文本原样发送，PNG/JPEG 图片走 vision 模型，可一次传多个混用 |
+| `<FILE>...` | 输入文件（须搭配 action 或 `-p`，位置任意）：文本原样发送，PNG/JPEG 图片走 vision 模型，可一次传多个混用；单个文件超过 32 MB 直接报错 |
 | `-p, --prompt <PROMPT>` | system 指令（临时任务用这个）；输入内容作为 user 消息发送 |
 | `--preset <NAME>` | 使用 prompt 预设（`aido list` 查看），与 `<ACTION>` 写法等价 |
 | `--profile <NAME>` | 使用配置文件中的 profile |

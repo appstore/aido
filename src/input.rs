@@ -44,6 +44,10 @@ pub fn gather(files: &[PathBuf]) -> Result<UserContent> {
     }
 }
 
+/// Whole files are read into memory and images are base64-encoded into a
+/// single request, so oversized files fail fast instead of exhausting memory.
+const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Read each file and classify it by content (not extension): PNG image,
 /// JPEG image (re-encoded as PNG), or UTF-8 text.
 fn gather_from_files(files: &[PathBuf]) -> Result<UserContent> {
@@ -53,10 +57,27 @@ fn gather_from_files(files: &[PathBuf]) -> Result<UserContent> {
         if path.is_dir() {
             bail!("'{}' is a directory, not a file", path.display());
         }
+        let size = std::fs::metadata(path)
+            .with_context(|| format!("cannot read '{}'", path.display()))?
+            .len();
+        if size > MAX_FILE_BYTES {
+            bail!(
+                "'{}' is {} MB; refusing input files over {} MB (contents are sent as a single request)",
+                path.display(),
+                size / (1024 * 1024),
+                MAX_FILE_BYTES / (1024 * 1024)
+            );
+        }
         let buf =
             std::fs::read(path).with_context(|| format!("cannot read '{}'", path.display()))?;
         let origin = format!("'{}'", path.display());
         let content = classify_bytes(&origin, buf)?;
+        if content.text.is_none() && content.images.is_empty() {
+            // Whitespace-only: keep going with the other files, but say so
+            // instead of silently dropping this one.
+            eprintln!("warning: {origin} is empty or whitespace-only; skipped");
+            continue;
+        }
         match content.text {
             Some(text) => texts.push((path.clone(), text)),
             None => images.extend(content.images),
