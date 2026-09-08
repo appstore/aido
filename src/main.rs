@@ -14,11 +14,14 @@ use clap::Parser;
 async fn main() -> Result<()> {
     restore_sigpipe();
 
-    let cli = cli::Cli::parse();
+    let cli = parse_cli()?;
 
     // Internal: detached child that keeps the Linux clipboard alive.
     if let Some(cli::Commands::Hold { secs }) = &cli.command {
         return run_hold(*secs);
+    }
+    if let Some(cli::Commands::List) = &cli.command {
+        return presets::list();
     }
     if cli.init {
         return config::init();
@@ -36,11 +39,11 @@ async fn main() -> Result<()> {
             Some(p) => p.system.clone(),
             None => {
                 let names: Vec<String> = all.keys().cloned().collect();
-                bail!("unknown preset '{name}'; available: {} (see --list-presets)", names.join(", "))
+                bail!("unknown preset '{name}'; available: {} (see `aido list`)", names.join(", "))
             }
         }
     } else {
-        cli.prompt_pos.clone().or_else(|| cli.prompt.clone()).unwrap_or_default()
+        cli.prompt.clone().unwrap_or_default()
     };
 
     let user = input::gather()?;
@@ -71,6 +74,36 @@ async fn main() -> Result<()> {
     }
     output::emit(&reply, resolved.output, resolved.hold_secs)?;
     Ok(())
+}
+
+/// Names owned by real subcommands (including clap's built-in `help`);
+/// they are never treated as preset actions.
+const RESERVED_ACTIONS: &[&str] = &["list", "help", "__hold"];
+
+/// The first argument (when not a flag) is an action: `aido ocr ...` becomes
+/// `aido --preset ocr ...`. The rewrite happens before clap because preset
+/// names are only known at runtime; anything else in that slot is an error.
+fn parse_cli() -> Result<cli::Cli> {
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(first) = args.first().and_then(|a| a.to_str()) {
+        if !first.is_empty() && !first.starts_with('-') && !RESERVED_ACTIONS.contains(&first) {
+            let all = presets::load_all()?;
+            if all.contains_key(first) {
+                args.insert(0, std::ffi::OsString::from("--preset"));
+            } else {
+                let mut actions: Vec<&str> = all.keys().map(String::as_str).collect();
+                actions.extend(["list", "help"]);
+                actions.sort_unstable();
+                let hint = presets::closest(first, &actions)
+                    .map(|best| format!(" (did you mean '{best}'?)"))
+                    .unwrap_or_default();
+                bail!("unknown action '{first}'; available: {}{hint}", actions.join(", "));
+            }
+        }
+    }
+    Ok(cli::Cli::parse_from(
+        std::iter::once(std::ffi::OsString::from("aido")).chain(args),
+    ))
 }
 
 /// `aido | head` should die silently like any other unix tool, not panic.

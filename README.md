@@ -3,9 +3,9 @@
 把剪贴板或管道里的内容发给任意 **OpenAI 兼容**的模型，结果写回终端或剪贴板。
 
 ```
-截图 → Ctrl+C → aido --preset ocr --copy → Ctrl+V
+截图 → Ctrl+C → aido ocr --copy → Ctrl+V
 
-git diff | aido --preset code-review
+git diff | aido code-review
 ```
 
 适用于 OpenAI / vLLM / SGLang / llama.cpp / Ollama / LM Studio / 智谱 等一切暴露 `/v1/chat/completions` 的服务。
@@ -37,7 +37,7 @@ aido --init
 export OPENAI_API_KEY=sk-...
 
 # 3. 用起来：剪贴板文本 → 整理 → 写回剪贴板
-aido "帮我润色这段文字" --copy
+aido -p "帮我润色这段文字" --copy
 ```
 
 **输入优先级：管道 stdin > 剪贴板。** 剪贴板里是文本就当文本发，是图片就走 vision 模型（自动转 PNG → base64 → `image_url`）。
@@ -46,26 +46,29 @@ aido "帮我润色这段文字" --copy
 
 ```bash
 # 截图 OCR（剪贴板中的图片发给 vision 模型）
-aido --preset ocr --copy
+aido ocr --copy
 
 # 翻译（英文→中文，其他语言→英文）
-aido --preset translate --copy
+aido translate --copy
 
 # Code review
-git diff | aido --preset code-review
+git diff | aido code-review
 
 # 摘要
-aido --preset summarize
+aido summarize
 
 # 本地模型（vLLM / SGLang / llama.cpp / Ollama / LM Studio）
-git diff | aido --base-url http://localhost:30000 -m qwen3 --preset code-review
+git diff | aido code-review --base-url http://localhost:30000 -m qwen3
 
 # 管道传图片（无需剪贴板，可用于无头环境）
-aido < screenshot.png --preset ocr --copy
+aido < screenshot.png ocr --copy
 
 # 指定完整 prompt
 pbpaste | aido -p "改成正式商务邮件语气" --copy
 ```
+
+> **Action 语法**：preset 名直接作为第一个参数（`aido ocr`），等价于 `aido --preset ocr`，后面可接任意
+> flags。注意 action 名必须紧跟 `aido`——`aido --copy ocr` 会报错。临时指令一律用 `-p/--prompt` 传递。
 
 > **关于图片输入**：图片以 `image_url`（base64 PNG）形式发送，必须搭配支持视觉的模型
 > （如 gpt-4o、glm-4.6v、qwen2.5-vl），纯文本模型无法处理图片。剪贴板中的图片自动走此
@@ -75,8 +78,9 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 
 | 参数 | 说明 |
 |---|---|
-| `[PROMPT]` 或 `-p, --prompt <PROMPT>` | system 指令；输入内容作为 user 消息发送 |
-| `--preset <NAME>` | 使用 prompt 预设（`--list-presets` 查看） |
+| `<ACTION>` | 第一个参数位：运行一个 preset（如 `aido ocr`），等价于 `--preset`；action 名必须最先出现 |
+| `-p, --prompt <PROMPT>` | system 指令（临时任务用这个）；输入内容作为 user 消息发送 |
+| `--preset <NAME>` | 使用 prompt 预设（`aido list` 查看），与 `<ACTION>` 写法等价 |
 | `--profile <NAME>` | 使用配置文件中的 profile |
 | `-m, --model <MODEL>` | 模型名 |
 | `--base-url <URL>` | 接口地址；无路径时自动补 `/v1` |
@@ -87,7 +91,7 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 | `--temperature <T>` | 采样温度 |
 | `--timeout <SECS>` | 请求超时，默认 120 秒 |
 | `--no-spinner` | 关闭 stderr 上的等待动画 |
-| `--list-presets` | 列出所有 preset |
+| `--list-presets` | 列出所有 preset（同 `aido list`） |
 | `--init` | 生成示例配置文件 |
 
 结果只写 stdout；进度、警告、错误一律走 stderr，退出码非 0 表示失败——可以放心接管道。
@@ -144,7 +148,7 @@ model = "glm-4.6"
 
 ## Presets
 
-内置 4 个：`ocr`、`translate`、`summarize`、`code-review`（`--list-presets` 查看）。
+内置 4 个：`ocr`、`translate`、`summarize`、`code-review`（`aido list` 查看）。
 
 自定义 preset：在配置目录下的 `presets/` 放 `NAME.toml`（文件名即 preset 名，Linux 为 `~/.config/aido/presets/`，其他平台见上文配置路径表；可用 `AIDO_PRESETS_DIR` 指定其他目录）。例如润色工具 `polish.toml`：
 
@@ -158,7 +162,7 @@ system = """
 """
 ```
 
-使用：`aido --preset polish --copy`。
+使用：`aido polish --copy`。
 
 写 preset 的要点：
 
@@ -166,8 +170,9 @@ system = """
 - 指令末尾加一条“只输出 X、不加解释”之类的收尾约束，能显著减少模型废话。
 - 多行文本用 TOML 三引号字符串 `"""..."""`，内容中不能出现连续三个双引号。
 - 与内置 preset 同名的文件会覆盖它，如自定义 `translate.toml` 即可修改默认翻译目标语言。
+- 文件名即 action 名（`aido polish`），因此 `list` / `help` 是保留名，且不能以 `-` 开头。
 - 格式非法的文件只会在 stderr 给一条 warning 并被忽略，不影响其他 preset。
-- `aido --list-presets` 可随时核对最终生效的完整列表。
+- `aido list` 可随时核对最终生效的完整列表。
 
 ## Linux 剪贴板说明
 

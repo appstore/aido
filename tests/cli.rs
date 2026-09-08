@@ -170,10 +170,10 @@ fn text_input_stdout_output() {
 }
 
 #[test]
-fn system_prompt_via_flag_and_positional() {
+fn system_prompt_via_flag() {
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
     let out = run(
-        &["--base-url", server.url().as_str(), "--no-spinner", "be brief"],
+        &["--base-url", server.url().as_str(), "--no-spinner", "-p", "be brief"],
         b"hi\n",
         &[],
     );
@@ -199,6 +199,80 @@ fn preset_supplies_system_prompt() {
     assert!(sys.to_lowercase().contains("ocr"));
     assert_eq!(req["messages"][1]["role"], "user");
     assert_eq!(req["messages"][1]["content"], "some text\n");
+}
+
+#[test]
+fn action_syntax_runs_preset() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &["ocr", "--base-url", server.url().as_str(), "--no-spinner"],
+        b"some text\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let req = request_json(&server.request());
+    assert_eq!(req["messages"][0]["role"], "system");
+    let sys = req["messages"][0]["content"].as_str().unwrap();
+    assert!(sys.to_lowercase().contains("ocr"));
+    assert_eq!(req["messages"][1]["content"], "some text\n");
+}
+
+#[test]
+fn action_name_must_come_first() {
+    // With flags first there is nowhere for 'ocr' to land — it must fail
+    // loudly instead of being sent to the model as a prompt.
+    let out = run(
+        &["--base-url", "http://127.0.0.1:1", "--no-spinner", "ocr"],
+        b"hi\n",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unrecognized subcommand"), "stderr was: {err}");
+}
+
+#[test]
+fn unknown_action_fails_with_suggestion() {
+    let out = run(&["transalte", "--no-spinner"], b"hi\n", &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown action"), "stderr was: {err}");
+    assert!(err.contains("did you mean 'translate'"), "stderr was: {err}");
+}
+
+#[test]
+fn action_conflicts_with_prompt_flag() {
+    let out = run(&["ocr", "-p", "extra", "--no-spinner"], b"hi\n", &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used"), "stderr was: {err}");
+}
+
+#[test]
+fn list_subcommand_lists_presets() {
+    let out = run(&["list"], b"", &[]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for name in ["code-review", "ocr", "summarize", "translate"] {
+        assert!(stdout.contains(name), "missing {name} in:\n{stdout}");
+    }
+}
+
+#[test]
+fn custom_preset_dir_actions_work() {
+    let dir = std::env::temp_dir().join(format!("aido-test-actions-{}", std::process::id()));
+    let presets_dir = dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+    std::fs::write(presets_dir.join("polish.toml"), "system = \"polish the text\"\n").unwrap();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &["polish", "--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(request_json(&server.request())["messages"][0]["content"], "polish the text");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
