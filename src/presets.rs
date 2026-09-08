@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -7,6 +7,57 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Preset {
     pub system: String,
+    /// Optional per-action API overrides. They rank just below CLI flags and
+    /// above env vars / the config profile (see config::resolve): a preset can
+    /// pin the model/endpoint its action needs even in shells where OPENAI_*
+    /// vars are exported for other tools.
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f32>,
+}
+
+impl Preset {
+    /// Field names this preset overrides, for the `aido list` tag; values
+    /// are deliberately not shown (the api key must not leak).
+    pub fn override_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.base_url.is_some() {
+            keys.push("base_url");
+        }
+        if self.api_key.is_some() {
+            keys.push("api_key");
+        }
+        if self.model.is_some() {
+            keys.push("model");
+        }
+        if self.max_tokens.is_some() {
+            keys.push("max_tokens");
+        }
+        if self.temperature.is_some() {
+            keys.push("temperature");
+        }
+        keys
+    }
+}
+
+/// Look up a preset by name, suggesting the closest one on a miss.
+pub fn get(name: &str) -> Result<Preset> {
+    let all = load_all()?;
+    match all.get(name) {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let names: Vec<&str> = all.keys().map(String::as_str).collect();
+            let hint = closest(name, &names)
+                .map(|best| format!(" (did you mean '{best}'?)"))
+                .unwrap_or_default();
+            bail!(
+                "unknown preset '{name}'; available: {}{hint} (see `aido list`)",
+                names.join(", ")
+            )
+        }
+    }
 }
 
 const BUILTIN: &[(&str, &str)] = &[
@@ -97,7 +148,13 @@ fn edit_distance(a: &str, b: &str) -> usize {
 pub fn list() -> Result<()> {
     let all = load_all()?;
     for (name, preset) in &all {
-        println!("{name:<14} {}", first_line(&preset.system));
+        let overrides = preset.override_keys();
+        let tag = if overrides.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", overrides.join(", "))
+        };
+        println!("{name:<14} {}{tag}", first_line(&preset.system));
     }
     eprintln!("\nrun an action: aido <NAME> [flags...], e.g. aido ocr --copy");
     if let Some(dir) = user_preset_dir() {
