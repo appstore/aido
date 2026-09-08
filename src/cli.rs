@@ -32,7 +32,8 @@ pub struct Cli {
     #[arg(short = 'p', long, conflicts_with = "preset")]
     pub prompt: Option<String>,
 
-    /// Input file(s): text is read as-is; PNG/JPEG images are sent to vision models
+    /// Input file(s), paired with an action or -p/--prompt; text is sent
+    /// as-is, PNG/JPEG images go to vision models
     #[arg(value_name = "FILE")]
     pub files: Vec<std::path::PathBuf>,
 

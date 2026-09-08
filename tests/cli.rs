@@ -272,8 +272,8 @@ fn action_syntax_runs_preset() {
 #[test]
 fn action_name_must_come_first() {
     // With flags first there is nowhere for 'ocr' to land — the action slot
-    // is gone, so 'ocr' parses as a FILE and must fail loudly instead of
-    // being sent to the model as a prompt.
+    // is gone, so 'ocr' parses as a FILE and the error must point out that
+    // actions come first instead of being sent to the model as a prompt.
     let out = run(
         &["--base-url", "http://127.0.0.1:1", "--no-spinner", "ocr"],
         b"hi\n",
@@ -281,8 +281,8 @@ fn action_name_must_come_first() {
     );
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("cannot read"), "stderr was: {err}");
-    assert!(err.contains("ocr"), "stderr was: {err}");
+    assert!(err.contains("action name"), "stderr was: {err}");
+    assert!(err.contains("first argument"), "stderr was: {err}");
 }
 
 #[test]
@@ -506,6 +506,7 @@ fn jpeg_file_is_reencoded_as_png() {
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
     let out = run(
         &[
+            "ocr",
             "--base-url",
             server.url().as_str(),
             "--no-spinner",
@@ -521,7 +522,7 @@ fn jpeg_file_is_reencoded_as_png() {
     );
 
     let req = request_json(&server.request());
-    let content = &req["messages"][0]["content"]; // no action: no system message
+    let content = &req["messages"][1]["content"];
     assert!(content.is_array());
     let url = content[1]["image_url"]["url"].as_str().unwrap();
     assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
@@ -577,6 +578,7 @@ fn multiple_text_files_are_labeled() {
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
     let out = run(
         &[
+            "summarize",
             "--base-url",
             server.url().as_str(),
             "--no-spinner",
@@ -593,7 +595,7 @@ fn multiple_text_files_are_labeled() {
     );
 
     let req = request_json(&server.request());
-    let content = req["messages"][0]["content"].as_str().unwrap();
+    let content = req["messages"][1]["content"].as_str().unwrap();
     assert!(
         content.contains("--- "),
         "missing file labels in:\n{content}"
@@ -605,7 +607,7 @@ fn multiple_text_files_are_labeled() {
 }
 
 #[test]
-fn bare_file_without_action_runs_promptless() {
+fn bare_file_requires_an_action() {
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
     let file = temp_file("notes.txt", b"just a file\n");
     let out = run(
@@ -618,15 +620,55 @@ fn bare_file_without_action_runs_promptless() {
         b"",
         &[],
     );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("requires an action"), "stderr was: {err}");
+    assert!(err.contains("notes.txt"), "stderr was: {err}");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn cjk_filename_is_file_input_not_an_action() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let file = temp_file("笔记.txt", "中文内容\n".as_bytes());
+
+    // A CJK path in the action slot is file input, not a typo'd action;
+    // the error must ask for an action, not report "unknown action".
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("requires an action"), "stderr was: {err}");
+    assert!(!err.contains("unknown action"), "stderr was: {err}");
+
+    // The same file, still first, works once a prompt is appended.
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+            "-p",
+            "be brief",
+        ],
+        b"",
+        &[],
+    );
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let req = request_json(&server.request());
-    assert_eq!(req["messages"].as_array().unwrap().len(), 1); // no system message
-    assert_eq!(req["messages"][0]["role"], "user");
-    assert_eq!(req["messages"][0]["content"], "just a file\n");
+    assert_eq!(req["messages"][1]["content"], "中文内容\n");
     std::fs::remove_file(&file).ok();
 }
 
@@ -669,6 +711,7 @@ fn empty_file_fails_instead_of_falling_back() {
     let file = temp_file("empty.txt", b"");
     let out = run(
         &[
+            "summarize",
             "--base-url",
             "http://127.0.0.1:1",
             "--no-spinner",
@@ -692,6 +735,7 @@ fn directory_input_fails() {
     std::fs::create_dir_all(&dir).unwrap();
     let out = run(
         &[
+            "summarize",
             "--base-url",
             "http://127.0.0.1:1",
             "--no-spinner",
