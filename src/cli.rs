@@ -25,7 +25,7 @@ impl std::fmt::Display for OutputMode {
     name = "aido",
     version,
     about = "Send clipboard, piped stdin, or file content to an OpenAI-compatible model",
-    after_help = "Input priority: files > piped stdin > clipboard (text, or images for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  aido ocr screenshot.png        # file input: text or image files\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
+    after_help = "Input priority: files > piped stdin > clipboard (text, or images for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  aido ocr screenshot.png        # file input: text or image files\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  aido last                      # re-print the most recent result\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
 )]
 pub struct Cli {
     /// System instructions for the model (the input text is sent as the user message)
@@ -65,6 +65,10 @@ pub struct Cli {
     #[arg(short = 'c', long)]
     pub copy: bool,
 
+    /// Also write the result to this file (composes with any --output mode)
+    #[arg(long, value_name = "FILE")]
+    pub save: Option<std::path::PathBuf>,
+
     /// Max completion tokens (default 8192; 0 omits the field entirely)
     #[arg(long)]
     pub max_tokens: Option<u64>,
@@ -102,6 +106,13 @@ pub struct Cli {
 pub enum Commands {
     /// List available presets
     List,
+
+    /// Print the most recent saved result (see the history section)
+    Last {
+        /// Copy the result back to the clipboard instead of printing it
+        #[arg(short = 'c', long)]
+        copy: bool,
+    },
 
     /// Internal: hold clipboard contents in the background (Linux)
     #[command(name = "__hold", hide = true)]

@@ -1,4 +1,5 @@
 use crate::cli::{Cli, OutputMode};
+use crate::history;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -28,6 +29,8 @@ pub struct Settings {
     pub output: Option<OutputMode>,
     pub timeout_secs: Option<u64>,
     pub hold_secs: Option<u64>,
+    /// How many results to keep on disk (0 disables history)
+    pub history_keep: Option<usize>,
 }
 
 /// Effective values after merging CLI flags, environment variables,
@@ -42,6 +45,7 @@ pub struct Resolved {
     pub output: OutputMode,
     pub timeout_secs: u64,
     pub hold_secs: u64,
+    pub history_keep: usize,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -173,6 +177,7 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
         output,
         timeout_secs: cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120),
         hold_secs: cfg.settings.hold_secs.unwrap_or(45),
+        history_keep: cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP),
     })
 }
 
@@ -221,6 +226,7 @@ default_profile = "default"
 # output = "stdout"        # stdout | clipboard | both
 # timeout_secs = 120
 # hold_secs = 45           # Linux: seconds to keep the clipboard alive after writing
+# history_keep = 50        # results kept on disk; 0 disables, see `aido last`
 
 [profiles.default]
 base_url = "https://api.openai.com/v1"

@@ -1,6 +1,7 @@
 mod cli;
 mod clipboard;
 mod config;
+mod history;
 mod input;
 mod openai;
 mod output;
@@ -24,6 +25,25 @@ async fn main() -> Result<()> {
     }
     if let Some(cli::Commands::List) = &cli.command {
         return presets::list();
+    }
+    if let Some(cli::Commands::Last { copy }) = &cli.command {
+        // Parent flags must reach the subcommand: `aido -c last`,
+        // `aido --save f last` etc. would otherwise be silently ignored.
+        // `aido last` is the recovery command, so a broken config only
+        // drops the preference hints instead of failing the run.
+        let cfg = config::load().ok();
+        let wants_clipboard = |m: Option<cli::OutputMode>| {
+            matches!(m, Some(cli::OutputMode::Clipboard | cli::OutputMode::Both))
+        };
+        let copy = *copy
+            || cli.copy
+            || wants_clipboard(cli.output)
+            || wants_clipboard(cfg.as_ref().and_then(|c| c.settings.output));
+        let hold_secs = cfg
+            .as_ref()
+            .and_then(|c| c.settings.hold_secs)
+            .unwrap_or(45);
+        return run_last(copy, hold_secs, cli.save.as_deref());
     }
     if cli.init {
         return config::init();
@@ -102,13 +122,19 @@ async fn main() -> Result<()> {
         }
         eprintln!("warning: model returned empty content");
     }
-    output::emit(&reply, resolved.output, resolved.hold_secs)?;
+    history::record(&reply, resolved.history_keep);
+    output::emit(
+        &reply,
+        resolved.output,
+        resolved.hold_secs,
+        cli.save.as_deref(),
+    )?;
     Ok(())
 }
 
 /// Names owned by real subcommands (including clap's built-in `help`);
 /// they are never treated as preset actions.
-const RESERVED_ACTIONS: &[&str] = &["list", "help", "__hold"];
+const RESERVED_ACTIONS: &[&str] = &["list", "help", "last", "__hold"];
 
 /// Old versions accepted any positional text as the prompt, so text with
 /// whitespace or non-ASCII characters in the action slot is that old habit
@@ -170,7 +196,7 @@ fn parse_cli() -> Result<cli::Cli> {
                 // action or -p is enforced after parsing.
             } else {
                 let mut actions: Vec<&str> = all.keys().map(String::as_str).collect();
-                actions.extend(["list", "help"]);
+                actions.extend(["list", "help", "last"]);
                 actions.sort_unstable();
                 let hint = presets::closest(first, &actions)
                     .map(|best| format!(" (did you mean '{best}'?)"))
@@ -202,6 +228,31 @@ fn restore_sigpipe() {
 
 #[cfg(not(unix))]
 fn restore_sigpipe() {}
+
+/// `aido last`: re-print (or re-copy) the most recent history entry, so a
+/// clipboard lost to a later copy doesn't mean paying for the model again.
+fn run_last(copy: bool, hold_secs: u64, save: Option<&std::path::Path>) -> Result<()> {
+    let Some(text) = history::last()? else {
+        bail!(
+            "no saved results yet; every non-empty result is kept on disk \
+               (settings.history_keep, 0 disables)"
+        );
+    };
+    if !text.trim().is_empty() {
+        if let Some(path) = save {
+            output::save_to_file(&text, path)?;
+        }
+    }
+    if copy {
+        // Same trailing-newline trim as a normal clipboard write.
+        let text = text.trim_end();
+        clipboard::write_text(text, hold_secs)?;
+        eprintln!("✓ copied {} chars to clipboard", text.chars().count());
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
 
 fn run_hold(secs: u64) -> Result<()> {
     use std::io::Read;
