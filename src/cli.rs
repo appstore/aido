@@ -19,18 +19,22 @@ impl std::fmt::Display for OutputMode {
     }
 }
 
-/// Send clipboard or piped stdin content to an OpenAI-compatible model.
+/// Send clipboard, piped stdin, or file content to an OpenAI-compatible model.
 #[derive(Debug, Parser)]
 #[command(
     name = "aido",
     version,
-    about = "Send clipboard or piped stdin content to an OpenAI-compatible model",
-    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
+    about = "Send clipboard, piped stdin, or file content to an OpenAI-compatible model",
+    after_help = "Input priority: files > piped stdin > clipboard (text, or images for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  aido ocr screenshot.png        # file input: text or image files\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
 )]
 pub struct Cli {
     /// System instructions for the model (the input text is sent as the user message)
     #[arg(short = 'p', long, conflicts_with = "preset")]
     pub prompt: Option<String>,
+
+    /// Input file(s): text is read as-is; PNG/JPEG images are sent to vision models
+    #[arg(value_name = "FILE")]
+    pub files: Vec<std::path::PathBuf>,
 
     /// Use a prompt preset (see `aido list`); shorthand: aido NAME
     #[arg(long)]

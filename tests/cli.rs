@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
@@ -101,6 +102,17 @@ fn empty_config() -> std::path::PathBuf {
     let path =
         std::env::temp_dir().join(format!("aido-test-empty-{}-{n}.toml", std::process::id()));
     std::fs::write(&path, "").unwrap();
+    path
+}
+
+static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// A temp input file with a unique name, so parallel tests never collide.
+fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let n = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("aido-test-file-{}-{n}-{name}", std::process::id()));
+    std::fs::write(&path, bytes).unwrap();
     path
 }
 
@@ -259,8 +271,9 @@ fn action_syntax_runs_preset() {
 
 #[test]
 fn action_name_must_come_first() {
-    // With flags first there is nowhere for 'ocr' to land — it must fail
-    // loudly instead of being sent to the model as a prompt.
+    // With flags first there is nowhere for 'ocr' to land — the action slot
+    // is gone, so 'ocr' parses as a FILE and must fail loudly instead of
+    // being sent to the model as a prompt.
     let out = run(
         &["--base-url", "http://127.0.0.1:1", "--no-spinner", "ocr"],
         b"hi\n",
@@ -268,7 +281,8 @@ fn action_name_must_come_first() {
     );
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("unrecognized subcommand"), "stderr was: {err}");
+    assert!(err.contains("cannot read"), "stderr was: {err}");
+    assert!(err.contains("ocr"), "stderr was: {err}");
 }
 
 #[test]
@@ -400,6 +414,296 @@ fn png_stdin_becomes_vision_message() {
     assert_eq!(content[1]["type"], "image_url");
     let url = content[1]["image_url"]["url"].as_str().unwrap();
     assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
+}
+
+#[test]
+fn text_file_input() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let file = temp_file("notes.txt", b"file body\n");
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "-p",
+            "be brief",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = request_json(&server.request());
+    assert_eq!(req["messages"][0]["role"], "system");
+    assert_eq!(req["messages"][1]["role"], "user");
+    assert_eq!(req["messages"][1]["content"], "file body\n");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn image_file_becomes_vision_message() {
+    let img = image::RgbaImage::from_pixel(3, 3, image::Rgba([200u8, 10, 10, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let file = temp_file("shot.png", &png);
+
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"red square"}}]}"#,
+    );
+    let out = run(
+        &[
+            "ocr", // action syntax: preset first, then the file
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let req = request_json(&server.request());
+    let content = &req["messages"][1]["content"];
+    assert!(content.is_array());
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    // PNG files are passed through byte-for-byte
+    let url = content[1]["image_url"]["url"].as_str().unwrap();
+    let payload = url.strip_prefix("data:image/png;base64,").unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap(),
+        png
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn jpeg_file_is_reencoded_as_png() {
+    let img = image::RgbaImage::from_pixel(3, 3, image::Rgba([200u8, 10, 10, 255]));
+    let mut jpg = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    let file = temp_file("shot.jpg", &jpg);
+
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let req = request_json(&server.request());
+    let content = &req["messages"][0]["content"]; // no action: no system message
+    assert!(content.is_array());
+    let url = content[1]["image_url"]["url"].as_str().unwrap();
+    assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn mixed_text_and_image_files() {
+    let img = image::RgbaImage::from_pixel(3, 3, image::Rgba([200u8, 10, 10, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let png_file = temp_file("shot.png", &png);
+    let txt_file = temp_file("notes.txt", b"see the picture\n");
+
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &[
+            "ocr",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            png_file.to_str().unwrap(),
+            txt_file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let req = request_json(&server.request());
+    let content = &req["messages"][1]["content"];
+    assert!(content.is_array());
+    // the user's own text becomes the text part, images follow
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "see the picture\n");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(content.as_array().unwrap().len(), 2);
+    std::fs::remove_file(&png_file).ok();
+    std::fs::remove_file(&txt_file).ok();
+}
+
+#[test]
+fn multiple_text_files_are_labeled() {
+    let a = temp_file("a.txt", b"alpha\n");
+    let b = temp_file("b.txt", b"beta\n");
+
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let req = request_json(&server.request());
+    let content = req["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        content.contains("--- "),
+        "missing file labels in:\n{content}"
+    );
+    assert!(content.contains("alpha"), "missing alpha in:\n{content}");
+    assert!(content.contains("beta"), "missing beta in:\n{content}");
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[test]
+fn bare_file_without_action_runs_promptless() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let file = temp_file("notes.txt", b"just a file\n");
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = request_json(&server.request());
+    assert_eq!(req["messages"].as_array().unwrap().len(), 1); // no system message
+    assert_eq!(req["messages"][0]["role"], "user");
+    assert_eq!(req["messages"][0]["content"], "just a file\n");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn files_take_priority_over_stdin() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let file = temp_file("notes.txt", b"from file\n");
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "-p",
+            "be brief",
+            file.to_str().unwrap(),
+        ],
+        b"from stdin\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = request_json(&server.request());
+    assert_eq!(req["messages"][1]["content"], "from file\n");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn missing_file_fails() {
+    let out = run(&["ocr", "--no-spinner", "nope.png"], b"", &[]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nope.png"), "stderr was: {err}");
+}
+
+#[test]
+fn empty_file_fails_instead_of_falling_back() {
+    let file = temp_file("empty.txt", b"");
+    let out = run(
+        &[
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no text or image content"),
+        "stderr was: {err}"
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn directory_input_fails() {
+    let dir = std::env::temp_dir().join(format!("aido-test-input-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = run(
+        &[
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--no-spinner",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("directory"), "stderr was: {err}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

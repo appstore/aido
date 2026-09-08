@@ -57,34 +57,42 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-pub fn build_messages(system: Option<&str>, user: &UserContent) -> Vec<Message> {
+pub fn build_messages(system: Option<&str>, user: &UserContent) -> Result<Vec<Message>> {
+    if user.text.is_none() && user.images.is_empty() {
+        bail!("no input content to send");
+    }
     let system = system.filter(|s| !s.trim().is_empty());
     let mut messages = Vec::new();
     if let Some(s) = system {
         messages.push(Message::system(s));
     }
-    match user {
-        UserContent::Text(text) => messages.push(Message::user(Content::Text(text.clone()))),
-        UserContent::Png(png) => {
-            // A text part is included because some servers reject image-only messages.
-            let note = if system.is_some() {
-                "Process the attached image according to the system instructions."
-            } else {
-                "Describe the attached image."
-            };
-            messages.push(Message::user(Content::Parts(vec![
-                Part::Text {
-                    text: note.to_string(),
-                },
-                Part::ImageUrl {
-                    image_url: ImageUrl {
-                        url: png_data_url(png),
-                    },
-                },
-            ])));
+    if user.images.is_empty() {
+        if let Some(text) = &user.text {
+            messages.push(Message::user(Content::Text(text.clone())));
         }
+    } else {
+        // A text part is included because some servers reject image-only messages.
+        let text = user.text.clone().unwrap_or_else(|| {
+            let noun = if user.images.len() > 1 {
+                "images"
+            } else {
+                "image"
+            };
+            if system.is_some() {
+                format!("Process the attached {noun} according to the system instructions.")
+            } else {
+                format!("Describe the attached {noun}.")
+            }
+        });
+        let mut parts = vec![Part::Text { text }];
+        parts.extend(user.images.iter().map(|png| Part::ImageUrl {
+            image_url: ImageUrl {
+                url: png_data_url(png),
+            },
+        }));
+        messages.push(Message::user(Content::Parts(parts)));
     }
-    messages
+    Ok(messages)
 }
 
 fn png_data_url(png: &[u8]) -> String {
@@ -204,7 +212,18 @@ enum ApiErrorValue {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_base_url;
+    use super::{build_messages, normalize_base_url};
+    use crate::input::UserContent;
+
+    #[test]
+    fn rejects_empty_user_content() {
+        let user = UserContent {
+            text: None,
+            images: Vec::new(),
+        };
+        assert!(build_messages(None, &user).is_err());
+        assert!(build_messages(Some("do something"), &user).is_err());
+    }
 
     #[test]
     fn normalizes_base_urls() {

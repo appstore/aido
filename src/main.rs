@@ -52,10 +52,11 @@ async fn main() -> Result<()> {
         cli.prompt.clone().unwrap_or_default()
     };
 
-    let user = input::gather()?;
+    let user = input::gather(&cli.files)?;
+    let messages = openai::build_messages(Some(&system), &user)?;
     let request = openai::ChatRequest {
         model: resolved.model.clone(),
-        messages: openai::build_messages(Some(&system), &user),
+        messages,
         max_tokens: resolved.max_tokens,
         temperature: resolved.temperature,
     };
@@ -96,6 +97,15 @@ fn looks_like_prompt(word: &str) -> bool {
     word.chars().any(|c| c.is_whitespace() || !c.is_ascii())
 }
 
+/// A word that names no action but looks like a file path (a separator, an
+/// extension, or an existing file) is file input rather than a typo.
+fn looks_like_path(word: &str) -> bool {
+    word.contains('/')
+        || word.contains('\\')
+        || word.contains('.')
+        || std::path::Path::new(word).exists()
+}
+
 /// The first argument (when not a flag) is an action: `aido ocr ...` becomes
 /// `aido --preset ocr ...`. The rewrite happens before clap because preset
 /// names are only known at runtime; anything else in that slot is an error.
@@ -106,6 +116,9 @@ fn parse_cli() -> Result<cli::Cli> {
             let all = presets::load_all()?;
             if all.contains_key(first) {
                 args.insert(0, std::ffi::OsString::from("--preset"));
+            } else if !looks_like_prompt(first) && looks_like_path(first) {
+                // File input without an action: leave it (and any further
+                // positionals) for clap to parse as FILEs.
             } else {
                 let mut actions: Vec<&str> = all.keys().map(String::as_str).collect();
                 actions.extend(["list", "help"]);

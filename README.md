@@ -1,9 +1,11 @@
 # aido
 
-把剪贴板或管道里的内容发给任意 **OpenAI 兼容**的模型，结果写回终端或剪贴板。
+把文件、剪贴板或管道里的内容发给任意 **OpenAI 兼容**的模型，结果写回终端或剪贴板。
 
 ```
 截图 → Ctrl+C → aido ocr --copy → Ctrl+V
+
+aido ocr screenshot.png
 
 git diff | aido code-review
 ```
@@ -40,7 +42,7 @@ export OPENAI_API_KEY=sk-...
 aido -p "帮我润色这段文字" --copy
 ```
 
-**输入优先级：管道 stdin > 剪贴板。** 剪贴板里是文本就当文本发，是图片就走 vision 模型（自动转 PNG → base64 → `image_url`）。
+**输入优先级：文件路径 > 管道 stdin > 剪贴板。** 剪贴板里是文本就当文本发，是图片就走 vision 模型（自动转 PNG → base64 → `image_url`）。
 
 ## 常用场景
 
@@ -57,6 +59,11 @@ git diff | aido code-review
 # 摘要
 aido summarize
 
+# 文件输入（文本或图片；可以一次给多个，文本和图片可混用）
+aido ocr screenshot.png
+aido -p "总结一下" notes.md
+aido code-review diff.txt screenshot.png
+
 # 本地模型（vLLM / SGLang / llama.cpp / Ollama / LM Studio）
 git diff | aido code-review --base-url http://localhost:30000 -m qwen3
 
@@ -68,17 +75,19 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 ```
 
 > **Action 语法**：preset 名直接作为第一个参数（`aido ocr`），等价于 `aido --preset ocr`，后面可接任意
-> flags。注意 action 名必须紧跟 `aido`——`aido --copy ocr` 会报错。临时指令一律用 `-p/--prompt` 传递。
+> flags 和文件路径。注意 action 名必须最先出现——`aido --copy ocr` 会把 `ocr` 当成文件名而报错。临时指令一律用 `-p/--prompt` 传递。
 
 > **关于图片输入**：图片以 `image_url`（base64 PNG）形式发送，必须搭配支持视觉的模型
 > （如 gpt-4o、glm-4.6v、qwen2.5-vl），纯文本模型无法处理图片。剪贴板中的图片自动走此
-> 路径；stdin 支持 PNG 和 JPEG（JPEG 会自动转 PNG）。
+> 路径；文件和 stdin 支持 PNG 和 JPEG（JPEG 会自动转 PNG）。文本与图片文件可混用，
+> 会合并进同一条 user 消息（多个文本文件按文件名分节）。
 
 ## 命令行参数
 
 | 参数 | 说明 |
 |---|---|
 | `<ACTION>` | 第一个参数位：运行一个 preset（如 `aido ocr`），等价于 `--preset`；action 名必须最先出现 |
+| `<FILE>...` | 输入文件（action 之后的任意位置）：文本原样发送，PNG/JPEG 图片走 vision 模型，可一次传多个混用 |
 | `-p, --prompt <PROMPT>` | system 指令（临时任务用这个）；输入内容作为 user 消息发送 |
 | `--preset <NAME>` | 使用 prompt 预设（`aido list` 查看），与 `<ACTION>` 写法等价 |
 | `--profile <NAME>` | 使用配置文件中的 profile |
@@ -166,7 +175,7 @@ system = """
 
 写 preset 的要点：
 
-- preset 就是 **system 指令**，剪贴板/管道内容永远是 user 消息——写“要求模型做什么”，待处理内容不要写进去。
+- preset 就是 **system 指令**，剪贴板/管道/文件内容永远是 user 消息——写“要求模型做什么”，待处理内容不要写进去。
 - 指令末尾加一条“只输出 X、不加解释”之类的收尾约束，能显著减少模型废话。
 - 多行文本用 TOML 三引号字符串 `"""..."""`，内容中不能出现连续三个双引号。
 - 与内置 preset 同名的文件会覆盖它，如自定义 `translate.toml` 即可修改默认翻译目标语言。
