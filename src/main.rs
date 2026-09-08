@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
     restore_sigpipe();
 
     let cli = parse_cli()?;
+    require_action_for_files(&cli)?;
 
     // Internal: detached child that keeps the Linux clipboard alive.
     if let Some(cli::Commands::Hold { secs }) = &cli.command {
@@ -52,10 +53,11 @@ async fn main() -> Result<()> {
         cli.prompt.clone().unwrap_or_default()
     };
 
-    let user = input::gather()?;
+    let user = input::gather(&cli.files)?;
+    let messages = openai::build_messages(Some(&system), &user)?;
     let request = openai::ChatRequest {
         model: resolved.model.clone(),
-        messages: openai::build_messages(Some(&system), &user),
+        messages,
         max_tokens: resolved.max_tokens,
         temperature: resolved.temperature,
     };
@@ -96,9 +98,47 @@ fn looks_like_prompt(word: &str) -> bool {
     word.chars().any(|c| c.is_whitespace() || !c.is_ascii())
 }
 
+/// A word that names no action but looks like a file path (a separator, an
+/// extension, or an existing file) is file input rather than a typo.
+fn looks_like_path(word: &str) -> bool {
+    word.contains('/')
+        || word.contains('\\')
+        || word.contains('.')
+        || std::path::Path::new(word).exists()
+}
+
+/// Files are explicit input and only mean something with an instruction
+/// behind them, so a bare `aido notes.txt` is an error; an action or a
+/// -p prompt must name what to do with the file.
+fn require_action_for_files(cli: &cli::Cli) -> Result<()> {
+    if cli.files.is_empty() || cli.preset.is_some() || cli.prompt.is_some() {
+        return Ok(());
+    }
+    let example = cli.files[0].display();
+    // `aido --copy ocr` lands here: the misplaced action name parses as a
+    // file, so point out that actions must come first.
+    let all = presets::load_all()?;
+    if let Some(name) = cli
+        .files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .find(|n| all.contains_key(*n))
+    {
+        bail!(
+            "'{name}' is an action name; actions must be the first argument, e.g. `aido {name} ...`"
+        );
+    }
+    bail!(
+        "file input requires an action or -p/--prompt, e.g. `aido ocr {example}` \
+         or `aido -p \"<instructions>\" {example}` (see `aido list`)"
+    );
+}
+
 /// The first argument (when not a flag) is an action: `aido ocr ...` becomes
 /// `aido --preset ocr ...`. The rewrite happens before clap because preset
-/// names are only known at runtime; anything else in that slot is an error.
+/// names are only known at runtime; anything else in that slot is either left
+/// for clap as file input (which then requires an action or -p) or reported
+/// as an unknown action.
 fn parse_cli() -> Result<cli::Cli> {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some(first) = args.first().and_then(|a| a.to_str()) {
@@ -106,6 +146,9 @@ fn parse_cli() -> Result<cli::Cli> {
             let all = presets::load_all()?;
             if all.contains_key(first) {
                 args.insert(0, std::ffi::OsString::from("--preset"));
+            } else if looks_like_path(first) {
+                // File input: left for clap to parse as FILEs; the required
+                // action or -p is enforced after parsing.
             } else {
                 let mut actions: Vec<&str> = all.keys().map(String::as_str).collect();
                 actions.extend(["list", "help"]);
