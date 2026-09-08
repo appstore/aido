@@ -59,6 +59,13 @@ git diff | aido code-review
 # 摘要
 aido summarize
 
+# 找回上次的结果（剪贴板被覆盖也不怕，见「结果留底」）
+aido last
+aido last --copy              # 直接塞回剪贴板
+
+# 结果另存一份到指定文件（与任意 --output 模式可叠加）
+aido ocr --copy --save /tmp/ocr.txt
+
 # 文件输入（文本或图片；须搭配 action 或 -p，可以一次给多个，文本和图片可混用）
 aido ocr screenshot.png
 aido -p "总结一下" notes.md
@@ -102,6 +109,7 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 | `--api-key <KEY>` | API key（⚠️ 会进入 shell 历史和 `ps` 输出，日常请用环境变量） |
 | `-o, --output <MODE>` | `stdout`（默认）/ `clipboard` / `both` |
 | `-c, --copy` | `--output clipboard` 的简写 |
+| `--save <FILE>` | 结果同时写入指定文件（父目录不存在会自动创建），可与任意 `--output` 模式叠加，对 `aido last` 同样生效 |
 | `--max-tokens <N>` | 默认 8192；传 `0` 表示完全不发送该字段 |
 | `--temperature <T>` | 采样温度 |
 | `--timeout <SECS>` | 请求超时，默认 120 秒 |
@@ -113,6 +121,28 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 结果只写 stdout；进度、警告、错误一律走 stderr，退出码非 0 表示失败——可以放心接管道。
 
 模型返回空内容时：`stdout` 模式只输出一条警告；`clipboard` / `both` 模式直接失败退出，**不会**用空串覆盖剪贴板里的原始内容。
+
+## 结果留底
+
+剪贴板里的结果一旦没及时粘贴、又被新内容覆盖，就丢了——重跑一遍既费时又费 token。因此每次成功运行的**非空结果**都会在本地留一份：
+
+- `aido last`：把最近一条结果打到 stdout（可接管道/重定向）
+- `aido last --copy`：把最近一条结果直接塞回剪贴板（`aido -c last`、`-o clipboard/both` 以及 config 的 `output` 设置同样生效）
+- `--save <FILE>`：本次结果另存到指定文件（与 `--copy` 等模式叠加生效，对 `aido last` 同样可用）
+
+历史目录与保留策略：
+
+| 平台 | 路径 |
+|---|---|
+| Linux | `~/.local/share/aido/history/` |
+| macOS | `~/Library/Application Support/aido/history/` |
+| Windows | `%LOCALAPPDATA%\aido\history\` |
+
+- 文件名为 UTC 时间戳（如 `20260909-153012.123.txt`），内容即模型回复原文
+- 默认保留最近 50 条，旧的自动清理；`settings.history_keep` 可调，设为 `0` 关闭留底
+- 留底失败（如目录不可写）只会在 stderr 给一条 warning，不影响本次运行
+- 注意：留底的是**明文**。若不希望结果落在磁盘上，把 `history_keep` 设为 `0`，或用 `AIDO_HISTORY_DIR` 指向内存盘等位置
+- Unix 下新建的历史目录权限为 `0700`、文件为 `0600`，避免多用户系统上被其他账号读取
 
 ## 配置文件
 
@@ -131,6 +161,7 @@ default_profile = "default"
 # output = "clipboard"      # stdout | clipboard | both
 # timeout_secs = 120
 # hold_secs = 45             # Linux: 写入剪贴板后保活秒数
+# history_keep = 50          # 磁盘留底条数（0 关闭），见「结果留底」
 
 [profiles.default]
 base_url = "https://api.openai.com/v1"
@@ -159,6 +190,7 @@ model = "glm-4.6"
 | `AIDO_MAX_TOKENS` | 最大生成 token 数（`0` 表示不发送该字段） |
 | `AIDO_TEMPERATURE` | 采样温度 |
 | `AIDO_PRESETS_DIR` | 自定义 preset 目录 |
+| `AIDO_HISTORY_DIR` | 自定义结果留底目录 |
 
 > ⚠️ 安全提示：避免在命令行用 `--api-key` 传 key——参数会进入 shell 历史和 `ps` 进程列表，优先使用环境变量。
 
@@ -186,7 +218,7 @@ system = """
 - 指令末尾加一条“只输出 X、不加解释”之类的收尾约束，能显著减少模型废话。
 - 多行文本用 TOML 三引号字符串 `"""..."""`，内容中不能出现连续三个双引号。
 - 与内置 preset 同名的文件会覆盖它，如自定义 `translate.toml` 即可修改默认翻译目标语言。
-- 文件名即 action 名（`aido polish`），因此 `list` / `help` 是保留名，且不能以 `-` 开头。
+- 文件名即 action 名（`aido polish`），因此 `list` / `help` / `last` 是保留名，且不能以 `-` 开头。
 - 格式非法的文件只会在 stderr 给一条 warning 并被忽略，不影响其他 preset。
 - `aido list` 可随时核对最终生效的完整列表。
 

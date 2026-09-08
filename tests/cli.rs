@@ -146,12 +146,13 @@ static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// An empty but valid config, so tests never read the developer's real
 /// ~/.config/aido/config.toml (AIDO_CONFIG must point at an existing
-/// file, hence a temp file rather than a nonexistent path).
+/// file, hence a temp file rather than a nonexistent path). History is
+/// off, so ordinary runs never write anywhere either.
 fn empty_config() -> std::path::PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path =
         std::env::temp_dir().join(format!("aido-test-empty-{}-{n}.toml", std::process::id()));
-    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, "[settings]\nhistory_keep = 0\n").unwrap();
     path
 }
 
@@ -166,6 +167,39 @@ fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     path
 }
 
+static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// A fresh history dir, so history tests never touch the developer's
+/// real result store (its contents are asserted via `history_files`).
+fn temp_history_dir() -> std::path::PathBuf {
+    let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("aido-test-history-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn history_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "txt"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// A config file with settings, so tests can flip history behavior.
+fn settings_config(content: &str) -> std::path::PathBuf {
+    let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "aido-test-settings-{}-{n}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
 fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> std::process::Output {
     let config = empty_config();
     let mut cmd = Command::new(EXE);
@@ -176,7 +210,10 @@ fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> std::process:
         .env("AIDO_CONFIG", &config)
         // Point the preset dir at a nonexistent path so the developer's own
         // custom presets cannot override the built-ins under test.
-        .env("AIDO_PRESETS_DIR", "/nonexistent/aido-test-presets");
+        .env("AIDO_PRESETS_DIR", "/nonexistent/aido-test-presets")
+        // Same for the history dir: a writable-looking default would let
+        // tests write results into the developer's real store.
+        .env("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history");
     for var in [
         "OPENAI_API_KEY",
         "AIDO_API_KEY",
@@ -186,6 +223,11 @@ fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> std::process:
         "AIDO_PROFILE",
         "AIDO_MAX_TOKENS",
         "AIDO_TEMPERATURE",
+        // No display: clipboard writes fail deterministically here instead
+        // of overwriting the developer's real clipboard during tests.
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
     ] {
         cmd.env_remove(var);
     }
@@ -1236,4 +1278,292 @@ fn truncated_reply_warns() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("truncated"), "stderr was: {err}");
     assert!(err.contains("--max-tokens"), "stderr was: {err}");
+}
+
+#[test]
+fn history_is_on_by_default_and_last_prints_the_result() {
+    let dir = temp_history_dir();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"SAVED"}}]}"#);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", settings_config("").to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let files = history_files(&dir);
+    assert_eq!(files.len(), 1, "expected exactly one history entry");
+    assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "SAVED");
+
+    // The result survives a lost clipboard: `aido last` prints it again.
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "SAVED\n");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn history_keeps_only_the_newest_n() {
+    let dir = temp_history_dir();
+    let cfg = settings_config("[settings]\nhistory_keep = 1\n");
+    let envs = [
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ];
+
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"FIRST"}}]}"#);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &envs,
+    );
+    assert!(out.status.success());
+    server.request();
+
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"SECOND"}}]}"#,
+    );
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &envs,
+    );
+    assert!(out.status.success());
+    server.request();
+
+    let files = history_files(&dir);
+    assert_eq!(
+        files.len(),
+        1,
+        "history_keep = 1 must prune the older entry"
+    );
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "SECOND\n");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
+fn history_disabled_by_config_writes_nothing() {
+    let dir = temp_history_dir();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[
+            (
+                "AIDO_CONFIG",
+                settings_config("[settings]\nhistory_keep = 0\n")
+                    .to_str()
+                    .unwrap(),
+            ),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(history_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn last_without_saved_results_fails() {
+    // An existing but empty dir...
+    let dir = temp_history_dir();
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no saved results"), "stderr was: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+
+    // ...and a missing one — both are "no history yet", not a read error.
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", "/nonexistent/aido-test-hist")],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no saved results"), "stderr was: {err}");
+}
+
+#[test]
+fn save_flag_writes_the_result_to_the_file() {
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"TO FILE"}}]}"#,
+    );
+    let out_path = std::env::temp_dir().join(format!(
+        "aido-test-save-{}-{}.txt",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--save",
+            out_path.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "TO FILE");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("saved"), "stderr was: {err}");
+    std::fs::remove_file(&out_path).ok();
+}
+
+#[test]
+fn save_flag_creates_missing_parent_dirs() {
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"NESTED"}}]}"#,
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "aido-test-save-dirs-{}-{}",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let out_path = dir.join("nested").join("out.txt");
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--save",
+            out_path.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "NESTED");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn save_flag_skips_empty_reply() {
+    // The model's empty reply must not produce an empty file that reads
+    // as saved content.
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":""}}]}"#);
+    let out_path = std::env::temp_dir().join(format!(
+        "aido-test-save-empty-{}-{}.txt",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--save",
+            out_path.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(out.status.success());
+    assert!(!out_path.exists());
+}
+
+#[test]
+fn last_honors_parent_flags() {
+    // Parent flags must reach the subcommand: `aido --save f last` and
+    // `aido -c last` used to be silently ignored.
+    let dir = temp_history_dir();
+    std::fs::write(dir.join("20260909-120000.000.txt"), "PARENT FLAGS").unwrap();
+
+    let save_path = std::env::temp_dir().join(format!(
+        "aido-test-last-save-{}-{}.txt",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let out = run(
+        &["--save", save_path.to_str().unwrap(), "last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&save_path).unwrap(), "PARENT FLAGS");
+    std::fs::remove_file(&save_path).ok();
+
+    // With copy intent (from -c or -o both) the result goes to the
+    // clipboard (where one exists); either way it must never land on
+    // stdout.
+    for args in [
+        vec!["-c", "last"],
+        vec!["-o", "both", "last"],
+        vec!["--output", "clipboard", "last"],
+    ] {
+        let out = run(&args, b"", &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "args {args:?} must not print"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn empty_reply_is_not_recorded() {
+    let dir = temp_history_dir();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":""}}]}"#);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", settings_config("").to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning"));
+    assert!(history_files(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
 }
