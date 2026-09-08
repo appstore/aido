@@ -102,7 +102,7 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 | `--api-key <KEY>` | API key（⚠️ 会进入 shell 历史和 `ps` 输出，日常请用环境变量） |
 | `-o, --output <MODE>` | `stdout`（默认）/ `clipboard` / `both` |
 | `-c, --copy` | `--output clipboard` 的简写 |
-| `--max-tokens <N>` | 默认 4096；传 `0` 表示完全不发送该字段 |
+| `--max-tokens <N>` | 默认 8192；传 `0` 表示完全不发送该字段 |
 | `--temperature <T>` | 采样温度 |
 | `--timeout <SECS>` | 请求超时，默认 120 秒 |
 | `--no-spinner` | 关闭 stderr 上的等待动画 |

@@ -238,7 +238,7 @@ fn text_input_stdout_output() {
     assert_eq!(req["model"], "test-model");
     assert_eq!(req["messages"][0]["role"], "user");
     assert_eq!(req["messages"][0]["content"], "hello\n");
-    assert_eq!(req["max_tokens"], 4096);
+    assert_eq!(req["max_tokens"], 8192);
     assert!(req.get("temperature").is_none());
     assert!(!String::from_utf8_lossy(&raw)
         .to_lowercase()
