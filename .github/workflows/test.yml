@@ -1,6 +1,6 @@
 name: test
 
-# PR 和 push 到 master：格式检查 + clippy + 测试，Linux/macOS 双平台。
+# PR 和 push 到 master：格式检查 + clippy + 测试（Linux/macOS）+ MSRV 编译检查。
 # 发布流程见 release.yml（只管 release 分支）。
 on:
   pull_request:
@@ -49,3 +49,27 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  msrv:
+    # 验证 Cargo.toml 声明的 rust-version 真的能编译（--locked 锁定依赖版本，防止依赖漂移掩盖问题）
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get MSRV from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+
+      # 工具链版本来自上一步输出，只能用 @master + toolchain 输入（@stable 等标签会忽略该输入）
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check MSRV
+        run: cargo check --all-targets --locked
