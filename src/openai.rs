@@ -23,11 +23,17 @@ pub struct Message {
 
 impl Message {
     fn system(text: impl Into<String>) -> Self {
-        Self { role: "system", content: Content::Text(text.into()) }
+        Self {
+            role: "system",
+            content: Content::Text(text.into()),
+        }
     }
 
     fn user(content: Content) -> Self {
-        Self { role: "user", content }
+        Self {
+            role: "user",
+            content,
+        }
     }
 }
 
@@ -67,8 +73,14 @@ pub fn build_messages(system: Option<&str>, user: &UserContent) -> Vec<Message> 
                 "Describe the attached image."
             };
             messages.push(Message::user(Content::Parts(vec![
-                Part::Text { text: note.to_string() },
-                Part::ImageUrl { image_url: ImageUrl { url: png_data_url(png) } },
+                Part::Text {
+                    text: note.to_string(),
+                },
+                Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: png_data_url(png),
+                    },
+                },
             ])));
         }
     }
@@ -127,7 +139,9 @@ impl Client {
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<ApiErrorWrapper>(&body) {
                 let msg = match err.error {
-                    ApiErrorValue::Object { message: Some(serde_json::Value::String(s)) } => s,
+                    ApiErrorValue::Object {
+                        message: Some(serde_json::Value::String(s)),
+                    } => s,
                     ApiErrorValue::Object { message: Some(v) } => v.to_string(),
                     ApiErrorValue::Object { message: None } => "(no message)".into(),
                     ApiErrorValue::Text(s) => s,
@@ -137,10 +151,14 @@ impl Client {
             bail!("API error (HTTP {status}): {}", truncate_chars(&body, 300));
         }
 
-        let parsed: ChatCompletion = serde_json::from_str(&body)
-            .with_context(|| format!("unexpected response format: {}", truncate_chars(&body, 300)))?;
+        let parsed: ChatCompletion = serde_json::from_str(&body).with_context(|| {
+            format!("unexpected response format: {}", truncate_chars(&body, 300))
+        })?;
         let Some(choice) = parsed.choices.into_iter().next() else {
-            bail!("response contains no choices: {}", truncate_chars(&body, 300));
+            bail!(
+                "response contains no choices: {}",
+                truncate_chars(&body, 300)
+            );
         };
         Ok(choice.message.content.unwrap_or_default())
     }
@@ -190,13 +208,31 @@ mod tests {
 
     #[test]
     fn normalizes_base_urls() {
-        assert_eq!(normalize_base_url("http://localhost:30000"), "http://localhost:30000/v1");
-        assert_eq!(normalize_base_url("http://localhost:30000/"), "http://localhost:30000/v1");
-        assert_eq!(normalize_base_url("http://localhost:30000/v1"), "http://localhost:30000/v1");
-        assert_eq!(normalize_base_url("http://localhost:30000/v1/"), "http://localhost:30000/v1");
-        assert_eq!(normalize_base_url("https://api.openai.com/v1/"), "https://api.openai.com/v1");
+        assert_eq!(
+            normalize_base_url("http://localhost:30000"),
+            "http://localhost:30000/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:30000/"),
+            "http://localhost:30000/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:30000/v1"),
+            "http://localhost:30000/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:30000/v1/"),
+            "http://localhost:30000/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1"
+        );
         // an explicit path is kept as-is (user knows their proxy layout)
-        assert_eq!(normalize_base_url("https://gw.example.com/proxy"), "https://gw.example.com/proxy");
+        assert_eq!(
+            normalize_base_url("https://gw.example.com/proxy"),
+            "https://gw.example.com/proxy"
+        );
         assert_eq!(normalize_base_url("localhost:8080"), "localhost:8080/v1");
     }
 }

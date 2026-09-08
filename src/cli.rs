@@ -25,18 +25,14 @@ impl std::fmt::Display for OutputMode {
     name = "aido",
     version,
     about = "Send clipboard or piped stdin content to an OpenAI-compatible model",
-    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aido \"clean up this text\" --copy\n  aido --preset ocr --copy          # screenshot -> OCR -> clipboard\n  git diff | aido --preset code-review\n  echo hi | aido --base-url http://localhost:30000 -m qwen3"
+    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
 )]
 pub struct Cli {
     /// System instructions for the model (the input text is sent as the user message)
-    #[arg(value_name = "PROMPT", conflicts_with_all = ["prompt", "preset"])]
-    pub prompt_pos: Option<String>,
-
-    /// System instructions for the model (same as the positional PROMPT)
     #[arg(short = 'p', long, conflicts_with = "preset")]
     pub prompt: Option<String>,
 
-    /// Use a prompt preset (see --list-presets)
+    /// Use a prompt preset (see `aido list`); shorthand: aido NAME
     #[arg(long)]
     pub preset: Option<String>,
 
@@ -80,7 +76,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_spinner: bool,
 
-    /// List available presets and exit
+    /// List available presets and exit (same as `aido list`)
     #[arg(long)]
     pub list_presets: bool,
 
@@ -94,6 +90,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// List available presets
+    List,
+
     /// Internal: hold clipboard contents in the background (Linux)
     #[command(name = "__hold", hide = true)]
     Hold {

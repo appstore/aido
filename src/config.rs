@@ -202,7 +202,10 @@ where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
     env_nonempty(key)
-        .map(|v| v.parse::<T>().with_context(|| format!("invalid value for {key}: '{v}'")))
+        .map(|v| {
+            v.parse::<T>()
+                .with_context(|| format!("invalid value for {key}: '{v}'"))
+        })
         .transpose()
 }
 
