@@ -12,7 +12,9 @@ git diff | aido --preset code-review
 
 ## 安装
 
-需要 Rust 1.75+：
+从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包，解压即用（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。
+
+或从源码构建（需要 Rust 1.75+）：
 
 ```bash
 cargo install --path .
@@ -170,6 +172,16 @@ system = """
 ## Linux 剪贴板说明
 
 X11（以及多数 Wayland 合成器）的剪贴板内容依附于写入它的进程，进程退出后内容即失效。aido 写剪贴板时会自动派生一个后台子进程，把内容保持一段时间（默认 45 秒，`settings.hold_secs` 可调），行为与 `xclip` / `wl-copy` 一致。
+
+## 发布流程
+
+push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workflows/release.yml)：跑测试，构建 Linux / macOS（Intel + Apple Silicon）/ Windows 二进制，打 `v<version>` 标签并发布到 [Releases](https://github.com/appstore/aido/releases)。
+
+1. 在 `Cargo.toml` 中更新 `version`
+2. 把代码合入 `release` 分支并 push
+3. 等待 CI 完成，Release 页即出现对应产物
+
+版本号不变而重复 push 时，同一个 `v<version>` Release 会滚动更新：标签移到最新 commit，同名产物被替换。手动触发（workflow_dispatch）只构建不发布，可用于验证 CI 配置。
 
 ## 已知限制 / Roadmap
 

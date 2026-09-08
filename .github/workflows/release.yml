@@ -1,0 +1,143 @@
+name: release
+
+# push 到 release 分支：跑测试 + 三平台构建 + 发布到 GitHub Releases。
+# workflow_dispatch（手动触发）：只构建不发布，用于在不发版的情况下验证 CI。
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一分支上连续多次 push 按顺序执行，避免并发写同一个 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # arm64 runner：aarch64 原生编译；x86_64 直接交叉编译（同 OS 无需额外工具链）
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ring（rustls 后端）在 Windows 上汇编需要 nasm；若 runner 未内置则安装
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+          }
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Get version
+        id: ver
+        shell: bash
+        run: |
+          echo "version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dir="aido-v${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$dir" dist
+          cp "target/${{ matrix.target }}/release/aido" "$dir/"
+          cp README.md "$dir/"
+          tar -czf "dist/${dir}.tar.gz" "$dir"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "aido-v${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $dir, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aido.exe" -Destination $dir
+          Copy-Item README.md -Destination $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/${dir}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aido-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  release:
+    name: Publish to GitHub Releases
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Get version
+        id: ver
+        run: |
+          echo "version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -n1)" >> "$GITHUB_OUTPUT"
+
+      # 把 v<version> 标签移到本次推送的 commit 上；版本号不变时即"滚动更新"该 Release
+      - name: Point release tag at this commit
+        run: |
+          tag="v${{ steps.ver.outputs.version }}"
+          git tag -f "$tag" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$tag"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: aido v${{ steps.ver.outputs.version }}
+          body: |
+            由 `release` 分支自动构建。
+
+            | 产物 | 平台 |
+            |---|---|
+            | `*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+            | `*-x86_64-apple-darwin.tar.gz` | macOS Intel |
+            | `*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+            | `*-x86_64-pc-windows-msvc.zip` | Windows x64 |
+
+            Linux / macOS 解压后 `chmod +x aido` 即可使用。
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true # 同版本重复 push 时替换同名产物（滚动更新）
+          generate_release_notes: true
