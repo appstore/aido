@@ -82,6 +82,11 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 > （如 gpt-4o、glm-4.6v、qwen2.5-vl），纯文本模型无法处理图片。剪贴板中的图片自动走此
 > 路径；文件和 stdin 支持 PNG 和 JPEG（JPEG 会自动转 PNG）。文本与图片文件可混用，
 > 会合并进同一条 user 消息（多个文本文件按文件名分节）。
+>
+> **长图（滚动截屏）**：视觉服务端会把超限图片等比压缩（OpenAI 约定长边 2048px，
+> Qwen-VL 系有 `max_pixels` 上限），长图整张发送会被压到文字不可读、OCR 丢行。
+> aido 会把高超过 3072px 的竖长图自动切成若干竖条（切缝优先落在无内容的空白行），
+> 逐条请求后按顺序拼接结果；`--no-split` 可关闭该行为。
 
 ## 命令行参数
 
@@ -101,6 +106,7 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 | `--temperature <T>` | 采样温度 |
 | `--timeout <SECS>` | 请求超时，默认 120 秒 |
 | `--no-spinner` | 关闭 stderr 上的等待动画 |
+| `--no-split` | 长图不切片，整张发送（默认自动切） |
 | `--list-presets` | 列出所有 preset（同 `aido list`） |
 | `--init` | 生成示例配置文件 |
 
@@ -202,5 +208,4 @@ push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workfl
 
 - 暂无 streaming 输出（长回复期间只有 stderr spinner）
 - 部分 OpenAI 新模型不接受 `max_tokens` 参数名，需要 `--max-tokens 0` 略过
-- 大截图整张 base64 上传，暂无自动降采样压缩
 - 可选方向：shell 补全、`--profile` 列表查看、热键常驻模式

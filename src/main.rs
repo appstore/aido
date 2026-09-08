@@ -6,6 +6,7 @@ mod openai;
 mod output;
 mod presets;
 mod spinner;
+mod split;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -54,23 +55,41 @@ async fn main() -> Result<()> {
     };
 
     let user = input::gather(&cli.files)?;
-    let messages = openai::build_messages(Some(&system), &user)?;
-    let request = openai::ChatRequest {
-        model: resolved.model.clone(),
-        messages,
-        max_tokens: resolved.max_tokens,
-        temperature: resolved.temperature,
-    };
+    // Tall images are sliced into several requests; with nothing to slice
+    // this is a single batch and behaves exactly as before.
+    let batches = split::expand(user, !cli.no_split)?;
 
     let client = openai::Client::new(&resolved)?;
-    let spinner = if cli.no_spinner {
-        spinner::Spinner::disabled()
+    let mut replies: Vec<String> = Vec::with_capacity(batches.len());
+    for (i, batch) in batches.iter().enumerate() {
+        let messages = openai::build_messages(Some(&system), batch)?;
+        let request = openai::ChatRequest {
+            model: resolved.model.clone(),
+            messages,
+            max_tokens: resolved.max_tokens,
+            temperature: resolved.temperature,
+        };
+        let spinner = if cli.no_spinner {
+            spinner::Spinner::disabled()
+        } else if batches.len() > 1 {
+            spinner::Spinner::start(&format!(
+                "asking {} ({}/{} slices)...",
+                resolved.model,
+                i + 1,
+                batches.len()
+            ))
+        } else {
+            spinner::Spinner::start(&format!("asking {}...", resolved.model))
+        };
+        let reply = client.chat(&request).await;
+        spinner.stop();
+        replies.push(reply?);
+    }
+    let reply = if replies.len() > 1 {
+        replies.join("\n")
     } else {
-        spinner::Spinner::start(&format!("asking {}...", resolved.model))
+        replies.into_iter().next().unwrap_or_default()
     };
-    let reply = client.chat(&request).await;
-    spinner.stop();
-    let reply = reply?;
 
     if reply.trim().is_empty() {
         if matches!(

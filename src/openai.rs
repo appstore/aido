@@ -168,6 +168,18 @@ impl Client {
                 truncate_chars(&body, 300)
             );
         };
+        // A reply that hit a limit looks like a successful, merely short
+        // answer — surface it instead of silently losing the tail.
+        match choice.finish_reason.as_deref() {
+            Some("length") => eprintln!(
+                "warning: reply hit the token limit and was truncated; \
+                 raise --max-tokens / AIDO_MAX_TOKENS if text is missing"
+            ),
+            Some("content_filter") => {
+                eprintln!("warning: reply was cut short by the server's content filter");
+            }
+            _ => {}
+        }
         Ok(choice.message.content.unwrap_or_default())
     }
 }
@@ -190,6 +202,8 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

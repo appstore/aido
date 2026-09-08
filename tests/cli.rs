@@ -17,63 +17,16 @@ struct Server {
 impl Server {
     fn start(status: &str, body: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        // Poll for the connection instead of blocking in accept(), so a
-        // regression that makes aido exit before requesting fails the test
-        // instead of hanging it.
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let status = status.to_string();
         let body = body.to_string();
         let handle = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(conn) => break conn,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "aido never connected to the test server"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("accept failed: {e}"),
-                }
-            };
+            let mut stream = accept(&listener, deadline);
             stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .unwrap();
-            let mut raw = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = stream.read(&mut chunk).unwrap();
-                if n == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&chunk[..n]);
-                if let Some(pos) = find_sub(&raw, b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&raw[..pos]).to_lowercase();
-                    let len: usize = headers
-                        .lines()
-                        .find(|l| l.starts_with("content-length"))
-                        .and_then(|l| l.split(':').nth(1))
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    while raw.len() < pos + 4 + len {
-                        let n = stream.read(&mut chunk).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        raw.extend_from_slice(&chunk[..n]);
-                    }
-                    break;
-                }
-            }
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            let raw = read_request(&mut stream);
+            write_response(&mut stream, &status, &body);
             raw
         });
         Self { port, handle }
@@ -86,6 +39,103 @@ impl Server {
     fn request(self) -> Vec<u8> {
         self.handle.join().unwrap()
     }
+}
+
+/// Serves one canned reply per request for `bodies.len()` sequential
+/// requests, recording every raw request.
+struct MultiServer {
+    port: u16,
+    handle: JoinHandle<Vec<Vec<u8>>>,
+}
+
+impl MultiServer {
+    fn start(bodies: &[&str]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Vec<String> = bodies.iter().map(|s| s.to_string()).collect();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut requests = Vec::new();
+            for body in &bodies {
+                let mut stream = accept(&listener, deadline);
+                stream.set_nonblocking(false).unwrap();
+                requests.push(read_request(&mut stream));
+                write_response(&mut stream, "200 OK", body);
+            }
+            requests
+        });
+        Self { port, handle }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn requests(self) -> Vec<Vec<u8>> {
+        self.handle.join().unwrap()
+    }
+}
+
+/// Accept one connection before `deadline`, polling instead of blocking in
+/// accept() so a regression that makes aido exit before requesting fails
+/// the test instead of hanging it.
+fn accept(listener: &TcpListener, deadline: std::time::Instant) -> std::net::TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "aido never connected to the test server"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+}
+
+/// Read one full HTTP request (headers plus the content-length body).
+fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_sub(&raw, b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&raw[..pos]).to_lowercase();
+            let len: usize = headers
+                .lines()
+                .find(|l| l.starts_with("content-length"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while raw.len() < pos + 4 + len {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            break;
+        }
+    }
+    raw
+}
+
+fn write_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
 
 fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1051,4 +1101,139 @@ fn invalid_env_number_fails() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("AIDO_MAX_TOKENS"), "stderr was: {err}");
+}
+
+/// A solid image taller than the split threshold; every row is quiet, so
+/// the seam lands exactly on the target slice height (2000).
+fn tall_png(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([255u8, 255, 255, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    png
+}
+
+fn image_part_dims(req: &serde_json::Value) -> (u32, u32) {
+    let content = &req["messages"][1]["content"];
+    let url = content[content.as_array().unwrap().len() - 1]["image_url"]["url"]
+        .as_str()
+        .unwrap();
+    let payload = url.strip_prefix("data:image/png;base64,").unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .unwrap();
+    let img = image::load_from_memory(&png).unwrap();
+    use image::GenericImageView as _;
+    img.dimensions()
+}
+
+#[test]
+fn tall_image_is_split_into_sequential_requests() {
+    let png = tall_png(64, 3200);
+    let file = temp_file("long.png", &png);
+    let server = MultiServer::start(&[
+        r#"{"choices":[{"message":{"content":"first half"}}]}"#,
+        r#"{"choices":[{"message":{"content":"second half"}}]}"#,
+    ]);
+    let out = run(
+        &[
+            "ocr",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // the replies concatenate in slice order
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first half\nsecond half\n"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("split into 2 slices"), "stderr was: {err}");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let first = request_json(&requests[0]);
+    let second = request_json(&requests[1]);
+    // one image per request, tiling the original exactly
+    assert_eq!(image_part_dims(&first), (64, 2000));
+    assert_eq!(image_part_dims(&second), (64, 1200));
+    // the follow-up request explains itself as a slice instead of
+    // reusing the default caption text
+    let first_text = first["messages"][1]["content"][0]["text"].as_str().unwrap();
+    let second_text = second["messages"][1]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!first_text.contains("slice"), "was: {first_text}");
+    assert!(second_text.contains("slice"), "was: {second_text}");
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn no_split_flag_sends_the_whole_image() {
+    let png = tall_png(64, 3200);
+    let file = temp_file("long.png", &png);
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"whole"}}]}"#);
+    let out = run(
+        &[
+            "ocr",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--no-split",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = request_json(&server.request());
+    let content = &req["messages"][1]["content"];
+    assert_eq!(content.as_array().unwrap().len(), 2);
+    // PNG bytes pass through untouched, exactly as before
+    let url = content[1]["image_url"]["url"].as_str().unwrap();
+    let payload = url.strip_prefix("data:image/png;base64,").unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap(),
+        png
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[test]
+fn truncated_reply_warns() {
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#,
+    );
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[],
+    );
+    // the (partial) content is still emitted; truncation only warns
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "partial\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("truncated"), "stderr was: {err}");
+    assert!(err.contains("--max-tokens"), "stderr was: {err}");
 }

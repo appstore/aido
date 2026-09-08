@@ -81,6 +81,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_spinner: bool,
 
+    /// Send tall images whole instead of slicing them into
+    /// legibility-sized requests
+    #[arg(long)]
+    pub no_split: bool,
+
     /// List available presets and exit (same as `aido list`)
     #[arg(long)]
     pub list_presets: bool,
