@@ -7,7 +7,7 @@ pub enum ClipboardContent {
 
 pub fn read() -> Result<ClipboardContent> {
     let mut cb = arboard::Clipboard::new().map_err(|e| {
-        anyhow!("cannot access the clipboard: {e}; hint: pipe text instead, e.g. `echo hello | aiclip`")
+        anyhow!("cannot access the clipboard: {e}; hint: pipe text instead, e.g. `echo hello | aido`")
     })?;
     // A clipboard holding an image makes get_text() fail on most platforms,
     // so a text error is only fatal if the image read fails too; keep it for

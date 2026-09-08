@@ -49,22 +49,22 @@ pub fn config_path() -> Option<PathBuf> {
 }
 
 fn env_config_path() -> Option<PathBuf> {
-    std::env::var("AICLIP_CONFIG")
+    std::env::var("AIDO_CONFIG")
         .ok()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("aiclip").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("aido").join("config.toml"))
 }
 
 pub fn load() -> Result<Config> {
-    // An explicitly given AICLIP_CONFIG must exist; a typo in the path
+    // An explicitly given AIDO_CONFIG must exist; a typo in the path
     // should be an error, not a silent fall back to the built-in defaults.
     if let Some(path) = env_config_path() {
         if !path.exists() {
-            bail!("AICLIP_CONFIG points to a missing file: {}", path.display());
+            bail!("AIDO_CONFIG points to a missing file: {}", path.display());
         }
         return parse_config(&path);
     }
@@ -82,7 +82,7 @@ fn parse_config(path: &Path) -> Result<Config> {
         .with_context(|| format!("failed to read config {}", path.display()))?;
     let cfg: Config = toml::from_str(&raw).with_context(|| {
         format!(
-            "failed to parse config {} (run `aiclip --init` for a valid sample)",
+            "failed to parse config {} (run `aido --init` for a valid sample)",
             path.display()
         )
     })?;
@@ -93,7 +93,7 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
     let profile_name = cli
         .profile
         .clone()
-        .or_else(|| env_nonempty("AICLIP_PROFILE"))
+        .or_else(|| env_nonempty("AIDO_PROFILE"))
         .or_else(|| cfg.default_profile.clone())
         .unwrap_or_else(|| "default".to_string());
 
@@ -102,7 +102,7 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
         Some(p) => p,
         None => {
             let explicit = cli.profile.is_some()
-                || env_nonempty("AICLIP_PROFILE").is_some()
+                || env_nonempty("AIDO_PROFILE").is_some()
                 || cfg.default_profile.is_some();
             if explicit {
                 let available = if cfg.profiles.is_empty() {
@@ -116,11 +116,11 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
         }
     };
 
-    let env_base = env_nonempty("AICLIP_BASE_URL").or_else(|| env_nonempty("OPENAI_BASE_URL"));
-    let env_key = env_nonempty("AICLIP_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"));
-    let env_model = env_nonempty("AICLIP_MODEL");
-    let env_max_tokens = parse_env_number::<u64>("AICLIP_MAX_TOKENS")?;
-    let env_temperature = parse_env_number::<f32>("AICLIP_TEMPERATURE")?;
+    let env_base = env_nonempty("AIDO_BASE_URL").or_else(|| env_nonempty("OPENAI_BASE_URL"));
+    let env_key = env_nonempty("AIDO_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"));
+    let env_model = env_nonempty("AIDO_MODEL");
+    let env_max_tokens = parse_env_number::<u64>("AIDO_MAX_TOKENS")?;
+    let env_temperature = parse_env_number::<f32>("AIDO_TEMPERATURE")?;
 
     let raw_base = cli
         .base_url
@@ -188,7 +188,7 @@ pub fn init() -> Result<()> {
     std::fs::write(&path, SAMPLE_CONFIG)
         .with_context(|| format!("failed to write {}", path.display()))?;
     println!("sample config written to: {}", path.display());
-    println!("edit it to add your providers; set API keys via AICLIP_API_KEY / OPENAI_API_KEY");
+    println!("edit it to add your providers; set API keys via AIDO_API_KEY / OPENAI_API_KEY");
     Ok(())
 }
 
@@ -206,10 +206,10 @@ where
         .transpose()
 }
 
-const SAMPLE_CONFIG: &str = r#"# aiclip configuration
+const SAMPLE_CONFIG: &str = r#"# aido configuration
 # Precedence: CLI flags > environment variables > profile > defaults.
 
-# Profile used when --profile / AICLIP_PROFILE is not given.
+# Profile used when --profile / AIDO_PROFILE is not given.
 default_profile = "default"
 
 [settings]
@@ -220,7 +220,7 @@ default_profile = "default"
 [profiles.default]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
-# api_key = "sk-..."       # prefer env vars: OPENAI_API_KEY / AICLIP_API_KEY
+# api_key = "sk-..."       # prefer env vars: OPENAI_API_KEY / AIDO_API_KEY
 
 # Local LLM (vLLM / SGLang / llama.cpp / Ollama / LM Studio)
 # [profiles.local]

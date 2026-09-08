@@ -22,10 +22,10 @@ impl std::fmt::Display for OutputMode {
 /// Send clipboard or piped stdin content to an OpenAI-compatible model.
 #[derive(Debug, Parser)]
 #[command(
-    name = "aiclip",
+    name = "aido",
     version,
     about = "Send clipboard or piped stdin content to an OpenAI-compatible model",
-    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aiclip \"clean up this text\" --copy\n  aiclip --preset ocr --copy          # screenshot -> OCR -> clipboard\n  git diff | aiclip --preset code-review\n  echo hi | aiclip --base-url http://localhost:30000 -m qwen3"
+    after_help = "Input priority: piped stdin > clipboard (text, or an image for vision models).\n\nExamples:\n  aido \"clean up this text\" --copy\n  aido --preset ocr --copy          # screenshot -> OCR -> clipboard\n  git diff | aido --preset code-review\n  echo hi | aido --base-url http://localhost:30000 -m qwen3"
 )]
 pub struct Cli {
     /// System instructions for the model (the input text is sent as the user message)
@@ -52,7 +52,7 @@ pub struct Cli {
     #[arg(long)]
     pub base_url: Option<String>,
 
-    /// API key (prefer the AICLIP_API_KEY / OPENAI_API_KEY env vars)
+    /// API key (prefer the AIDO_API_KEY / OPENAI_API_KEY env vars)
     #[arg(long)]
     pub api_key: Option<String>,
 

@@ -104,7 +104,7 @@ impl Client {
     pub fn new(resolved: &Resolved) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(resolved.timeout_secs))
-            .user_agent(concat!("aiclip/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("aido/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {

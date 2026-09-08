@@ -8,7 +8,7 @@ pub enum UserContent {
 }
 
 /// Piped stdin wins over the clipboard; binary PNG/JPEG on stdin is treated
-/// as an image so `aiclip < shot.png --preset ocr` works headless.
+/// as an image so `aido < shot.png --preset ocr` works headless.
 pub fn gather() -> Result<UserContent> {
     if !std::io::stdin().is_terminal() {
         let mut buf = Vec::new();

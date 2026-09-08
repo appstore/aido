@@ -4,10 +4,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-const EXE: &str = env!("CARGO_BIN_EXE_aiclip");
+const EXE: &str = env!("CARGO_BIN_EXE_aido");
 
 /// A one-shot HTTP server that records the raw request and replies with a
-/// canned body, so tests can assert on the exact JSON aiclip sends.
+/// canned body, so tests can assert on the exact JSON aido sends.
 struct Server {
     port: u16,
     handle: JoinHandle<Vec<u8>>,
@@ -17,7 +17,7 @@ impl Server {
     fn start(status: &str, body: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         // Poll for the connection instead of blocking in accept(), so a
-        // regression that makes aiclip exit before requesting fails the test
+        // regression that makes aido exit before requesting fails the test
         // instead of hanging it.
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -31,7 +31,7 @@ impl Server {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             std::time::Instant::now() < deadline,
-                            "aiclip never connected to the test server"
+                            "aido never connected to the test server"
                         );
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
@@ -94,12 +94,12 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// An empty but valid config, so tests never read the developer's real
-/// ~/.config/aiclip/config.toml (AICLIP_CONFIG must point at an existing
+/// ~/.config/aido/config.toml (AIDO_CONFIG must point at an existing
 /// file, hence a temp file rather than a nonexistent path).
 fn empty_config() -> std::path::PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir()
-        .join(format!("aiclip-test-empty-{}-{n}.toml", std::process::id()));
+        .join(format!("aido-test-empty-{}-{n}.toml", std::process::id()));
     std::fs::write(&path, "").unwrap();
     path
 }
@@ -111,19 +111,19 @@ fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> std::process:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("AICLIP_CONFIG", &config)
+        .env("AIDO_CONFIG", &config)
         // Point the preset dir at a nonexistent path so the developer's own
         // custom presets cannot override the built-ins under test.
-        .env("AICLIP_PRESETS_DIR", "/nonexistent/aiclip-test-presets");
+        .env("AIDO_PRESETS_DIR", "/nonexistent/aido-test-presets");
     for var in [
         "OPENAI_API_KEY",
-        "AICLIP_API_KEY",
+        "AIDO_API_KEY",
         "OPENAI_BASE_URL",
-        "AICLIP_BASE_URL",
-        "AICLIP_MODEL",
-        "AICLIP_PROFILE",
-        "AICLIP_MAX_TOKENS",
-        "AICLIP_TEMPERATURE",
+        "AIDO_BASE_URL",
+        "AIDO_MODEL",
+        "AIDO_PROFILE",
+        "AIDO_MAX_TOKENS",
+        "AIDO_TEMPERATURE",
     ] {
         cmd.env_remove(var);
     }
@@ -292,7 +292,7 @@ fn list_presets_shows_builtins() {
 
 #[test]
 fn profile_from_config_is_used() {
-    let dir = std::env::temp_dir().join(format!("aiclip-test-profile-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("aido-test-profile-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"from-local"}}]}"#);
     let cfg_path = dir.join("config.toml");
@@ -305,7 +305,7 @@ fn profile_from_config_is_used() {
     let out = run(
         &["--no-spinner"],
         b"hi\n",
-        &[("AICLIP_CONFIG", cfg_path.to_str().unwrap())],
+        &[("AIDO_CONFIG", cfg_path.to_str().unwrap())],
     );
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "from-local\n");
@@ -318,17 +318,17 @@ fn profile_from_config_is_used() {
 
 #[test]
 fn init_writes_sample_config_once() {
-    let dir = std::env::temp_dir().join(format!("aiclip-test-init-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("aido-test-init-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg_path = dir.join("config.toml");
 
-    let out = run(&["--init"], b"", &[("AICLIP_CONFIG", cfg_path.to_str().unwrap())]);
+    let out = run(&["--init"], b"", &[("AIDO_CONFIG", cfg_path.to_str().unwrap())]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let content = std::fs::read_to_string(&cfg_path).unwrap();
     assert!(content.contains("[profiles.default]"));
 
     // A second --init must refuse to clobber the existing file.
-    let out2 = run(&["--init"], b"", &[("AICLIP_CONFIG", cfg_path.to_str().unwrap())]);
+    let out2 = run(&["--init"], b"", &[("AIDO_CONFIG", cfg_path.to_str().unwrap())]);
     assert!(!out2.status.success());
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -351,10 +351,10 @@ fn base_url_without_scheme_fails() {
 
 #[test]
 fn explicit_missing_config_fails() {
-    let out = run(&[], b"hi\n", &[("AICLIP_CONFIG", "/nonexistent/aiclip/config.toml")]);
+    let out = run(&[], b"hi\n", &[("AIDO_CONFIG", "/nonexistent/aido/config.toml")]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("AICLIP_CONFIG"), "stderr was: {err}");
+    assert!(err.contains("AIDO_CONFIG"), "stderr was: {err}");
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn env_vars_fill_unset_flags() {
     run(
         &["--base-url", server.url().as_str(), "--no-spinner"],
         b"x\n",
-        &[("AICLIP_MAX_TOKENS", "77"), ("AICLIP_TEMPERATURE", "0.3")],
+        &[("AIDO_MAX_TOKENS", "77"), ("AIDO_TEMPERATURE", "0.3")],
     );
     let req = request_json(&server.request());
     assert_eq!(req["max_tokens"], 77);
@@ -398,9 +398,9 @@ fn invalid_env_number_fails() {
     let out = run(
         &["--base-url", "http://127.0.0.1:1", "--no-spinner"],
         b"x\n",
-        &[("AICLIP_MAX_TOKENS", "not-a-number")],
+        &[("AIDO_MAX_TOKENS", "not-a-number")],
     );
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("AICLIP_MAX_TOKENS"), "stderr was: {err}");
+    assert!(err.contains("AIDO_MAX_TOKENS"), "stderr was: {err}");
 }

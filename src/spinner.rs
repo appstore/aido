@@ -6,7 +6,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthStr as _;
 
 /// A minimal stderr spinner. Only runs when stderr is a TTY so that
-/// `aiclip ... 2>log` stays clean.
+/// `aido ... 2>log` stays clean.
 pub struct Spinner {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,

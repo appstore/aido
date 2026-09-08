@@ -16,12 +16,12 @@ const BUILTIN: &[(&str, &str)] = &[
 ];
 
 pub fn user_preset_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AICLIP_PRESETS_DIR") {
+    if let Ok(p) = std::env::var("AIDO_PRESETS_DIR") {
         if !p.trim().is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    dirs::config_dir().map(|d| d.join("aiclip").join("presets"))
+    dirs::config_dir().map(|d| d.join("aido").join("presets"))
 }
 
 pub fn load_all() -> Result<BTreeMap<String, Preset>> {

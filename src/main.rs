@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// `aiclip | head` should die silently like any other unix tool, not panic.
+/// `aido | head` should die silently like any other unix tool, not panic.
 #[cfg(unix)]
 fn restore_sigpipe() {
     unsafe {
