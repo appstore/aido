@@ -176,7 +176,7 @@ base_url = "https://open.bigmodel.cn/api/paas/v4"
 model = "glm-4.6"
 ```
 
-取值优先级：**命令行参数 > 环境变量 > profile > 默认值**。
+取值优先级：**命令行参数 > preset 自带参数 > 环境变量 > profile > 默认值**（preset 自带参数见下文 Presets 一节）。
 
 ## 环境变量
 
@@ -212,12 +212,34 @@ system = """
 
 使用：`aido polish --copy`。
 
+### preset 专属 API 参数
+
+preset 除了 system 指令，还可以为**该 action 单独指定** API 参数，适合“某个 action 固定要用某个模型/服务商”的场景。例如视觉 OCR 专用 preset `vision.toml`：
+
+```toml
+system = "提取图片中的文字，只输出文字本身。"
+model = "glm-4.6v"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+# api_key = "..."      # 同样支持 api_key / max_tokens / temperature
+```
+
+之后 `aido vision --copy` 就自动走这套配置，不用每次敲 `--base-url` / `-m`。
+
+取值优先级：**命令行参数 > preset > 环境变量 > profile > 默认值**。preset 排在环境变量之前，因为 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 往往是为其他工具导出的，不应悄悄盖掉 action 里写明的配置；命令行 flag 永远保留最终决定权。
+
+注意事项：
+
+- 支持的字段与 profile 相同：`base_url` / `api_key` / `model` / `max_tokens` / `temperature`（`max_tokens = 0` 表示请求里不带该字段）。字段按条独立生效：preset 里没写的字段继续走环境变量 → profile → 默认值。
+- `aido list` 会用 `[api_key, model]` 这样的标签标注带参数的 preset——只列字段名，不显示值，避免 key 泄漏到终端。
+- ⚠️ `api_key` 会明文保存在 preset 文件里，注意文件权限；更稳妥的做法是省略该字段、走环境变量。
+
 写 preset 的要点：
 
 - preset 就是 **system 指令**，剪贴板/管道/文件内容永远是 user 消息——写“要求模型做什么”，待处理内容不要写进去。
 - 指令末尾加一条“只输出 X、不加解释”之类的收尾约束，能显著减少模型废话。
 - 多行文本用 TOML 三引号字符串 `"""..."""`，内容中不能出现连续三个双引号。
 - 与内置 preset 同名的文件会覆盖它，如自定义 `translate.toml` 即可修改默认翻译目标语言。
+- preset 可自带 `model` / `base_url` / `api_key` 等参数，仅对该 action 生效（见上节）。
 - 文件名即 action 名（`aido polish`），因此 `list` / `help` / `last` 是保留名，且不能以 `-` 开头。
 - 格式非法的文件只会在 stderr 给一条 warning 并被忽略，不影响其他 preset。
 - `aido list` 可随时核对最终生效的完整列表。

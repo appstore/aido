@@ -470,6 +470,185 @@ fn custom_preset_dir_actions_work() {
 }
 
 #[test]
+fn preset_overrides_profile_for_api_params() {
+    // A preset acts as a profile scoped to its action: base_url, model,
+    // api_key, max_tokens and temperature all win over the config profile.
+    let dir = std::env::temp_dir().join(format!("aido-test-preset-ovr-{}", std::process::id()));
+    let presets_dir = dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    std::fs::write(
+        presets_dir.join("special.toml"),
+        format!(
+            "system = \"be brief\"\nbase_url = \"{}/preset\"\nmodel = \"preset-model\"\n\
+             api_key = \"preset-key\"\nmax_tokens = 555\ntemperature = 0.4\n",
+            server.url()
+        ),
+    )
+    .unwrap();
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[profiles.default]\nbase_url = \"{}/profile\"\nmodel = \"profile-model\"\n\
+             api_key = \"profile-key\"\n",
+            server.url()
+        ),
+    )
+    .unwrap();
+
+    let out = run(
+        &["special", "--no-spinner"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg_path.to_str().unwrap()),
+            ("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let raw = server.request();
+    assert_eq!(request_path(&raw), "POST /preset/chat/completions HTTP/1.1");
+    let req = request_json(&raw);
+    assert_eq!(req["model"], "preset-model");
+    assert_eq!(req["max_tokens"], 555);
+    assert_eq!(req["temperature"], 0.4);
+    let raw_text = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(raw_text.contains("bearer preset-key"), "was: {raw_text}");
+    assert!(!raw_text.contains("profile-key"), "was: {raw_text}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn preset_params_beat_env_flags_still_win() {
+    // Preset overrides outrank env vars (OPENAI_* vars often belong to
+    // other tools), while CLI flags outrank everything.
+    let dir = std::env::temp_dir().join(format!("aido-test-preset-env-{}", std::process::id()));
+    let presets_dir = dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    std::fs::write(
+        presets_dir.join("special.toml"),
+        "system = \"be brief\"\nmodel = \"preset-model\"\n",
+    )
+    .unwrap();
+    let cfg_path = dir.join("config.toml");
+    // AIDO_CONFIG must point at an existing file; an empty one means "no
+    // profiles defined", keeping the preset as the only config layer here.
+    std::fs::write(&cfg_path, "").unwrap();
+    let common: &[(&str, &str)] = &[
+        ("AIDO_CONFIG", cfg_path.to_str().unwrap()),
+        ("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap()),
+    ];
+
+    // the preset's model wins over AIDO_MODEL ...
+    let out = run(
+        &[
+            "special",
+            "--no-spinner",
+            "--base-url",
+            server.url().as_str(),
+        ],
+        b"hi\n",
+        &[common[0], common[1], ("AIDO_MODEL", "env-model")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(request_json(&server.request())["model"], "preset-model");
+
+    // ... but an explicit CLI flag wins over the preset
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &[
+            "special",
+            "--no-spinner",
+            "--base-url",
+            server.url().as_str(),
+            "-m",
+            "flag-model",
+        ],
+        b"hi\n",
+        common,
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(request_json(&server.request())["model"], "flag-model");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn env_beats_profile() {
+    // Below the preset layer the shipped chain is unchanged: env vars
+    // override the config profile.
+    let dir = std::env::temp_dir().join(format!("aido-test-env-profile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[profiles.default]\nbase_url = \"{}\"\nmodel = \"profile-model\"\n",
+            server.url()
+        ),
+    )
+    .unwrap();
+
+    let out = run(
+        &["--no-spinner"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg_path.to_str().unwrap()),
+            ("AIDO_MODEL", "env-model"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(request_json(&server.request())["model"], "env-model");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn list_marks_presets_with_api_overrides() {
+    // Presets carrying API params are tagged with the overridden field
+    // names (values are never shown, so keys stay off the terminal).
+    let dir = std::env::temp_dir().join(format!("aido-test-preset-list-{}", std::process::id()));
+    let presets_dir = dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+    std::fs::write(
+        presets_dir.join("special.toml"),
+        "system = \"be brief\"\nmodel = \"m\"\napi_key = \"k\"\n",
+    )
+    .unwrap();
+    let out = run(
+        &["list"],
+        b"",
+        &[("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("special"), "stdout was:\n{stdout}");
+    assert!(stdout.contains("[api_key, model]"), "stdout was:\n{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn png_stdin_becomes_vision_message() {
     let img = image::RgbaImage::from_pixel(3, 3, image::Rgba([200u8, 10, 10, 255]));
     let mut png = Vec::new();

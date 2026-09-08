@@ -53,25 +53,18 @@ async fn main() -> Result<()> {
     }
 
     let config = config::load()?;
-    let resolved = config::resolve(&cli, &config)?;
 
-    let system = if let Some(name) = &cli.preset {
-        let all = presets::load_all()?;
-        match all.get(name) {
-            Some(p) => p.system.clone(),
-            None => {
-                let names: Vec<&str> = all.keys().map(String::as_str).collect();
-                let hint = presets::closest(name, &names)
-                    .map(|best| format!(" (did you mean '{best}'?)"))
-                    .unwrap_or_default();
-                bail!(
-                    "unknown preset '{name}'; available: {}{hint} (see `aido list`)",
-                    names.join(", ")
-                )
-            }
-        }
-    } else {
-        cli.prompt.clone().unwrap_or_default()
+    // The preset is loaded before resolving so its API overrides take part
+    // in the merge (CLI flags > preset > env vars > profile > defaults).
+    let preset = match &cli.preset {
+        Some(name) => Some(presets::get(name)?),
+        None => None,
+    };
+    let resolved = config::resolve(&cli, &config, preset.as_ref())?;
+
+    let system = match &preset {
+        Some(p) => p.system.clone(),
+        None => cli.prompt.clone().unwrap_or_default(),
     };
 
     let user = input::gather(&cli.files)?;

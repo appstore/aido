@@ -1,5 +1,6 @@
 use crate::cli::{Cli, OutputMode};
 use crate::history;
+use crate::presets::Preset;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -34,7 +35,8 @@ pub struct Settings {
 }
 
 /// Effective values after merging CLI flags, environment variables,
-/// the selected profile and global defaults.
+/// the selected preset's API overrides, the selected profile and
+/// global defaults.
 #[derive(Debug)]
 pub struct Resolved {
     pub base_url: String,
@@ -93,7 +95,11 @@ fn parse_config(path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
+/// `preset` (the action's TOML) acts as a profile scoped to one action:
+/// its overrides come right after CLI flags, ahead of env vars and the
+/// config profile, so `aido ocr` can pin a vision model even in shells
+/// where OPENAI_* vars are exported for other tools.
+pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resolved> {
     let profile_name = cli
         .profile
         .clone()
@@ -129,6 +135,7 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
     let raw_base = cli
         .base_url
         .clone()
+        .or_else(|| preset.and_then(|p| p.base_url.clone()))
         .or(env_base)
         .or(profile.base_url.clone())
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -136,6 +143,7 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
     let api_key = cli
         .api_key
         .clone()
+        .or_else(|| preset.and_then(|p| p.api_key.clone()))
         .or(env_key)
         .or(profile.api_key.clone())
         .filter(|k| !k.trim().is_empty());
@@ -143,11 +151,17 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
     let model = cli
         .model
         .clone()
+        .or_else(|| preset.and_then(|p| p.model.clone()))
         .or(env_model)
         .or(profile.model.clone())
         .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
-    let max_tokens = match cli.max_tokens.or(env_max_tokens).or(profile.max_tokens) {
+    let max_tokens = match cli
+        .max_tokens
+        .or_else(|| preset.and_then(|p| p.max_tokens))
+        .or(env_max_tokens)
+        .or(profile.max_tokens)
+    {
         Some(0) => None, // explicit "don't send"
         Some(t) => Some(t),
         // Generous enough not to clip dense OCR output or long rewrites;
@@ -173,7 +187,11 @@ pub fn resolve(cli: &Cli, cfg: &Config) -> Result<Resolved> {
         api_key,
         model,
         max_tokens,
-        temperature: cli.temperature.or(env_temperature).or(profile.temperature),
+        temperature: cli
+            .temperature
+            .or_else(|| preset.and_then(|p| p.temperature))
+            .or(env_temperature)
+            .or(profile.temperature),
         output,
         timeout_secs: cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120),
         hold_secs: cfg.settings.hold_secs.unwrap_or(45),
@@ -217,7 +235,10 @@ where
 }
 
 const SAMPLE_CONFIG: &str = r#"# aido configuration
-# Precedence: CLI flags > environment variables > profile > defaults.
+# Precedence: CLI flags > preset > environment variables > profile > defaults.
+# A preset (see `aido list`) may pin base_url / model / api_key / max_tokens /
+# temperature for its own action; those beat env vars and the profile, while
+# CLI flags beat the preset.
 
 # Profile used when --profile / AIDO_PROFILE is not given.
 default_profile = "default"
