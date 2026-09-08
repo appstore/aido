@@ -107,7 +107,11 @@ pub fn list() -> Result<()> {
 }
 
 fn first_line(s: &str) -> String {
-    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     if line.chars().count() > 64 {
         let head: String = line.chars().take(64).collect();
         format!("{head}...")

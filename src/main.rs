@@ -1,5 +1,5 @@
-mod clipboard;
 mod cli;
+mod clipboard;
 mod config;
 mod input;
 mod openai;
@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
                 let hint = presets::closest(name, &names)
                     .map(|best| format!(" (did you mean '{best}'?)"))
                     .unwrap_or_default();
-                bail!("unknown preset '{name}'; available: {}{hint} (see `aido list`)", names.join(", "))
+                bail!(
+                    "unknown preset '{name}'; available: {}{hint} (see `aido list`)",
+                    names.join(", ")
+                )
             }
         }
     } else {
@@ -68,7 +71,10 @@ async fn main() -> Result<()> {
     let reply = reply?;
 
     if reply.trim().is_empty() {
-        if matches!(resolved.output, cli::OutputMode::Clipboard | cli::OutputMode::Both) {
+        if matches!(
+            resolved.output,
+            cli::OutputMode::Clipboard | cli::OutputMode::Both
+        ) {
             // Writing an empty string would destroy whatever the user copied
             // (the OCR input itself, typically) — fail instead.
             bail!("model returned empty content; clipboard left untouched");
@@ -141,9 +147,10 @@ fn run_hold(secs: u64) -> Result<()> {
     std::io::stdin().read_to_string(&mut text)?;
     // Errors propagate to stderr (the child inherits it), so a failed hold
     // is visible instead of silently losing the clipboard contents.
-    let mut cb = arboard::Clipboard::new()
-        .map_err(|e| anyhow!("cannot access the clipboard: {e}"))?;
-    cb.set_text(text).map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
+    let mut cb =
+        arboard::Clipboard::new().map_err(|e| anyhow!("cannot access the clipboard: {e}"))?;
+    cb.set_text(text)
+        .map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
     std::thread::sleep(std::time::Duration::from_secs(secs));
     Ok(())
 }

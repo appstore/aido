@@ -7,7 +7,9 @@ pub enum ClipboardContent {
 
 pub fn read() -> Result<ClipboardContent> {
     let mut cb = arboard::Clipboard::new().map_err(|e| {
-        anyhow!("cannot access the clipboard: {e}; hint: pipe text instead, e.g. `echo hello | aido`")
+        anyhow!(
+            "cannot access the clipboard: {e}; hint: pipe text instead, e.g. `echo hello | aido`"
+        )
     })?;
     // A clipboard holding an image makes get_text() fail on most platforms,
     // so a text error is only fatal if the image read fails too; keep it for
@@ -44,7 +46,8 @@ fn rgba_to_png(img: arboard::ImageData) -> Result<Vec<u8>> {
 
 pub fn write_text(text: &str, hold_secs: u64) -> Result<()> {
     {
-        let mut cb = arboard::Clipboard::new().map_err(|e| anyhow!("cannot access the clipboard: {e}"))?;
+        let mut cb =
+            arboard::Clipboard::new().map_err(|e| anyhow!("cannot access the clipboard: {e}"))?;
         cb.set_text(text.to_string())
             .map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
     }
@@ -68,7 +71,9 @@ fn spawn_holder(text: &str, hold_secs: u64) {
     if hold_secs == 0 {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Ok(mut child) = Command::new(exe)
         .arg("__hold")
         .arg(hold_secs.to_string())

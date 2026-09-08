@@ -35,11 +35,17 @@ impl Spinner {
             let _ = write!(err, "\r{}\r", " ".repeat(msg.width() + 2));
             let _ = err.flush();
         });
-        Self { stop, handle: Some(handle) }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     pub fn disabled() -> Self {
-        Self { stop: Arc::new(AtomicBool::new(true)), handle: None }
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
     }
 
     pub fn stop(mut self) {

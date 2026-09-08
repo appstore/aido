@@ -12,7 +12,9 @@ pub enum UserContent {
 pub fn gather() -> Result<UserContent> {
     if !std::io::stdin().is_terminal() {
         let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf).context("failed to read stdin")?;
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("failed to read stdin")?;
         if !buf.is_empty() {
             if buf.starts_with(b"\x89PNG\r\n\x1a\n") {
                 return Ok(UserContent::Png(buf));
