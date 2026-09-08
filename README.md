@@ -16,7 +16,7 @@ git diff | aido code-review
 
 从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包，解压即用（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。
 
-或从源码构建（需要 Rust 1.75+）：
+或从源码构建（需要 Rust 1.88+）：
 
 ```bash
 cargo install --path .
