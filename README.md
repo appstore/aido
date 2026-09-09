@@ -82,6 +82,9 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 
 # 流式输出（SSE，长回复实时可见，不用干等）
 aido -p "帮我写一版周报" --stream
+
+# Quicker 弹框等不渲染 markdown 的场景：去掉 **、# 等符号，输出干净纯文本
+aido summarize --copy --plain
 ```
 
 > **Action 语法**：preset 名直接作为第一个参数（`aido ocr`），等价于 `aido --preset ocr`，后面可接任意
@@ -118,6 +121,7 @@ aido -p "帮我写一版周报" --stream
 | `--timeout <SECS>` | 请求超时，默认 120 秒；流式下作用于首包等待和相邻数据间隔，不限制整条回复时长 |
 | `--no-spinner` | 关闭 stderr 上的等待动画 |
 | `--stream` / `--no-stream` | 流式输出（SSE）：token 实时写到 stdout；默认关闭，只作用于含 stdout 的输出 |
+| `--plain` / `--no-plain` | 去掉 markdown 符号（加粗、标题、代码围栏、列表标记、链接、表格线等）输出纯文本；`--save` 与 `aido last` 留底的是同一份干净文本 |
 | `--no-split` | 长图不切片，整张发送（默认自动切） |
 | `--list-presets` | 列出所有 preset（同 `aido list`） |
 | `--init` | 生成示例配置文件 |
@@ -125,6 +129,8 @@ aido -p "帮我写一版周报" --stream
 结果只写 stdout；进度、警告、错误一律走 stderr，退出码非 0 表示失败——可以放心接管道。
 
 `--stream` 开启后改走 SSE 流式请求：token 一到就实时写到 stdout（第一个 token 到达时 stderr 的 spinner 自动让位），长回复不再干等；`both` 模式下剪贴板仍在结束时一次性写入，接管道时最终字节与不开流式完全一致。该模式只对含 stdout 的输出生效，纯 `--copy` 运行自动退回一次性请求（stderr 有一条提示）。`--timeout` 在流式下的语义是「等待响应头」和「相邻两次数据的间隔」，而非整条回复的总时长——慢模型的长回复不会被中途掐断。
+
+`--plain` 对**最终结果**做一次 markdown 清理，stdout / 剪贴板 / `--save` / 结果留底拿到的都是同一份无符号文本，适合 Quicker 弹框这类不渲染 markdown 的展示场景。清理范围：`**` 加粗、`~~` 删除线、`#` 标题、`>` 引用、围栏代码块的围栏行、行内反引号、`-`/`*` 列表标记（缩进保留，有序列表编号本就是普通文本）、`[文字](链接)` 与图片转为文字、表格压成制表符分隔、水平分隔线整行去掉。清理是保守的：单个 `*` / `_` 斜体与词内 `__` 不会被动（避免误伤 `2*3*4`、`__init__`），代码块与行内代码里的字符原样保留。开启方式：`--plain` 命令行标志、preset 里 `plain = true`（弹框类 action 一次配好）、config 里 `settings.plain = true`，优先级同样为 CLI > preset > settings。开启后流式自动退回一次性输出（stderr 有提示），因为剥离需要完整回复。
 
 模型返回空内容时：`stdout` 模式只输出一条警告；`clipboard` / `both` 模式直接失败退出，**不会**用空串覆盖剪贴板里的原始内容。
 
@@ -166,6 +172,7 @@ default_profile = "default"
 [settings]
 # output = "clipboard"      # stdout | clipboard | both
 # stream = false             # SSE 流式输出到 stdout（--stream / --no-stream 可覆盖）
+# plain = false               # 去掉结果中的 markdown 符号（--plain / --no-plain 可覆盖）
 # timeout_secs = 120
 # hold_secs = 45             # Linux: 写入剪贴板后保活秒数
 # history_keep = 50          # 磁盘留底条数（0 关闭），见「结果留底」
@@ -236,8 +243,8 @@ base_url = "https://open.bigmodel.cn/api/paas/v4"
 
 注意事项：
 
-- 支持的字段与 profile 相同：`base_url` / `api_key` / `model` / `max_tokens` / `temperature`（`max_tokens = 0` 表示请求里不带该字段）。字段按条独立生效：preset 里没写的字段继续走环境变量 → profile → 默认值。
-- `aido list` 会用 `[api_key, model]` 这样的标签标注带参数的 preset——只列字段名，不显示值，避免 key 泄漏到终端。
+- 支持的字段与 profile 相同：`base_url` / `api_key` / `model` / `max_tokens` / `temperature`（`max_tokens = 0` 表示请求里不带该字段）；另有 `plain = true` 让该 action 直接输出无 markdown 符号的纯文本（见上文 `--plain`），适合 Quicker 弹框这类展示场景。字段按条独立生效：preset 里没写的字段继续走环境变量 → profile → 默认值。
+- `aido list` 会用 `[api_key, model]` 这样的标签标注带参数或 `plain` 的 preset——只列字段名，不显示值，避免 key 泄漏到终端。
 - ⚠️ `api_key` 会明文保存在 preset 文件里，注意文件权限；更稳妥的做法是省略该字段、走环境变量。
 
 写 preset 的要点：

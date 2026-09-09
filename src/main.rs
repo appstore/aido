@@ -5,6 +5,7 @@ mod history;
 mod input;
 mod openai;
 mod output;
+mod plain;
 mod presets;
 mod spinner;
 mod split;
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     let client = openai::Client::new(&resolved)?;
     // Streaming shows live output only when stdout carries the reply; a
     // clipboard has no "partial" state, so those runs stay buffered.
-    let stream = resolved.stream
+    let mut stream = resolved.stream
         && matches!(
             resolved.output,
             cli::OutputMode::Stdout | cli::OutputMode::Both
@@ -85,6 +86,12 @@ async fn main() -> Result<()> {
         eprintln!(
             "note: streaming shows output on stdout only; clipboard results are written in one piece"
         );
+    }
+    // Stripping needs the finished reply — deltas already printed can't
+    // be un-marked-down — so plain runs go out in one piece.
+    if resolved.plain && stream {
+        stream = false;
+        eprintln!("note: plain output strips the finished reply, so streaming is off for this run");
     }
 
     let mut replies: Vec<String> = Vec::with_capacity(batches.len());
@@ -142,6 +149,13 @@ async fn main() -> Result<()> {
         replies.join("\n")
     } else {
         replies.into_iter().next().unwrap_or_default()
+    };
+    // One strip pass over the joined reply: stdout, clipboard, --save and
+    // the history entry all hand back the same clean text.
+    let reply = if resolved.plain {
+        plain::strip(&reply)
+    } else {
+        reply
     };
 
     if reply.trim().is_empty() {

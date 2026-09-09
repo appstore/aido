@@ -101,6 +101,17 @@ pub struct Cli {
     #[arg(long)]
     pub no_split: bool,
 
+    /// Strip markdown decoration (bold, headings, code fences, list
+    /// markers, links, tables) so popup-style surfaces get clean text;
+    /// code content is kept verbatim
+    #[arg(long, overrides_with = "no_plain")]
+    pub plain: bool,
+
+    /// Keep the reply as-is (overrides --plain / preset plain /
+    /// settings.plain)
+    #[arg(long, overrides_with = "plain")]
+    pub no_plain: bool,
+
     /// List available presets and exit (same as `aido list`)
     #[arg(long)]
     pub list_presets: bool,

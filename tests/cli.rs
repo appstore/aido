@@ -1977,3 +1977,188 @@ fn streamed_slices_are_separated_like_the_buffered_join() {
     assert_eq!(request_json(&requests[1])["stream"], true);
     std::fs::remove_file(&file).ok();
 }
+
+#[test]
+fn plain_flag_strips_markdown_from_stdout() {
+    let server = Server::start(
+        "200 OK",
+        r##"{"choices":[{"message":{"content":"# Title\n- item\n**bold** text"}}]}"##,
+    );
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--plain",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Title\nitem\nbold text\n"
+    );
+}
+
+#[test]
+fn settings_plain_applies_and_no_plain_overrides() {
+    let cfg = settings_config("[settings]\nplain = true\nhistory_keep = 0\n");
+
+    // settings.plain alone strips the reply
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"**bold**"}}]}"#,
+    );
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bold\n");
+
+    // ... but --no-plain keeps the reply as-is
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"**bold**"}}]}"#,
+    );
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--no-plain",
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "**bold**\n");
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
+fn preset_plain_strips_and_is_listed() {
+    let dir = std::env::temp_dir().join(format!("aido-test-preset-plain-{}", std::process::id()));
+    let presets_dir = dir.join("presets");
+    std::fs::create_dir_all(&presets_dir).unwrap();
+    std::fs::write(
+        presets_dir.join("special.toml"),
+        "system = \"be brief\"\nplain = true\n",
+    )
+    .unwrap();
+
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"**bold**"}}]}"#,
+    );
+    let out = run(
+        &[
+            "special",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+        ],
+        b"hi\n",
+        &[("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bold\n");
+
+    // `aido list` tags the preset with the plain override
+    let out = run(
+        &["list"],
+        b"",
+        &[("AIDO_PRESETS_DIR", presets_dir.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[plain]"), "stdout was:\n{stdout}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn plain_disables_streaming_with_a_note() {
+    // Stripping needs the finished reply, so --plain runs buffered even
+    // with --stream: one buffered request, a note on stderr, clean stdout.
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"**bold**"}}]}"#,
+    );
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+            "--plain",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(request_json(&server.request()).get("stream").is_none());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bold\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("note: plain"), "stderr was: {err}");
+}
+
+#[test]
+fn plain_history_stores_stripped_text() {
+    // `aido last --copy` re-pastes into the same popup, so the history
+    // entry is the cleaned text, not the raw markdown.
+    let dir = temp_history_dir();
+    let cfg = settings_config("[settings]\nhistory_keep = 5\n");
+    let server = Server::start(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"**bold** text"}}]}"#,
+    );
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--plain",
+        ],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let files = history_files(&dir);
+    assert_eq!(files.len(), 1);
+    assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "bold text");
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}

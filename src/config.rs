@@ -32,6 +32,8 @@ pub struct Settings {
     pub hold_secs: Option<u64>,
     /// Stream the reply to stdout as it is generated (SSE)
     pub stream: Option<bool>,
+    /// Strip markdown decoration from the result (see --plain)
+    pub plain: Option<bool>,
     /// How many results to keep on disk (0 disables history)
     pub history_keep: Option<usize>,
 }
@@ -51,6 +53,7 @@ pub struct Resolved {
     pub hold_secs: u64,
     pub history_keep: usize,
     pub stream: bool,
+    pub plain: bool,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -208,6 +211,18 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
         } else {
             cfg.settings.stream.unwrap_or(false)
         },
+        // Same pair for --plain / --no-plain, with the preset's own
+        // plain = true in between (an action pins its popup formatting).
+        plain: if cli.no_plain {
+            false
+        } else if cli.plain {
+            true
+        } else {
+            preset
+                .and_then(|p| p.plain)
+                .or(cfg.settings.plain)
+                .unwrap_or(false)
+        },
     })
 }
 
@@ -258,6 +273,7 @@ default_profile = "default"
 [settings]
 # output = "stdout"        # stdout | clipboard | both
 # stream = false           # stream replies to stdout as they are generated (SSE)
+# plain = false            # strip markdown from results (--plain; see also preset plain)
 # timeout_secs = 120
 # hold_secs = 45           # Linux: seconds to keep the clipboard alive after writing
 # history_keep = 50        # results kept on disk; 0 disables, see `aido last`

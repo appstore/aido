@@ -16,6 +16,9 @@ pub struct Preset {
     pub model: Option<String>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f32>,
+    /// Strip markdown decoration from this action's result (see --plain),
+    /// for popup-style surfaces that cannot render markdown.
+    pub plain: Option<bool>,
 }
 
 impl Preset {
@@ -37,6 +40,9 @@ impl Preset {
         }
         if self.temperature.is_some() {
             keys.push("temperature");
+        }
+        if self.plain == Some(true) {
+            keys.push("plain");
         }
         keys
     }
