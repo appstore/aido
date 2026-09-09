@@ -11,6 +11,7 @@ mod split;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use std::io::Write as _;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,6 +74,19 @@ async fn main() -> Result<()> {
     let batches = split::expand(user, !cli.no_split)?;
 
     let client = openai::Client::new(&resolved)?;
+    // Streaming shows live output only when stdout carries the reply; a
+    // clipboard has no "partial" state, so those runs stay buffered.
+    let stream = resolved.stream
+        && matches!(
+            resolved.output,
+            cli::OutputMode::Stdout | cli::OutputMode::Both
+        );
+    if resolved.stream && !stream {
+        eprintln!(
+            "note: streaming shows output on stdout only; clipboard results are written in one piece"
+        );
+    }
+
     let mut replies: Vec<String> = Vec::with_capacity(batches.len());
     for (i, batch) in batches.iter().enumerate() {
         let messages = openai::build_messages(Some(&system), batch)?;
@@ -81,6 +95,7 @@ async fn main() -> Result<()> {
             messages,
             max_tokens: resolved.max_tokens,
             temperature: resolved.temperature,
+            stream,
         };
         let spinner = if cli.no_spinner {
             spinner::Spinner::disabled()
@@ -94,8 +109,33 @@ async fn main() -> Result<()> {
         } else {
             spinner::Spinner::start(&format!("asking {}...", resolved.model))
         };
-        let reply = client.chat(&request).await;
-        spinner.stop();
+        let reply = if stream {
+            // Batches are separated by the same "\n" the buffered path
+            // builds with join("\n"); the spinner yields to the live
+            // output at the first token.
+            if i > 0 {
+                println!();
+                let _ = std::io::stdout().flush();
+            }
+            let mut spinner = Some(spinner);
+            let reply = client
+                .chat_stream(&request, |delta| {
+                    if let Some(s) = spinner.take() {
+                        s.stop();
+                    }
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                })
+                .await;
+            if let Some(s) = spinner.take() {
+                s.stop();
+            }
+            reply
+        } else {
+            let reply = client.chat(&request).await;
+            spinner.stop();
+            reply
+        };
         replies.push(reply?);
     }
     let reply = if replies.len() > 1 {
@@ -116,12 +156,26 @@ async fn main() -> Result<()> {
         eprintln!("warning: model returned empty content");
     }
     history::record(&reply, resolved.history_keep);
-    output::emit(
-        &reply,
-        resolved.output,
-        resolved.hold_secs,
-        cli.save.as_deref(),
-    )?;
+    if stream {
+        // The deltas already went to stdout: just close the line, then run
+        // the clipboard / --save half of emit.
+        if !reply.is_empty() {
+            println!();
+        }
+        output::finish(
+            &reply,
+            resolved.output,
+            resolved.hold_secs,
+            cli.save.as_deref(),
+        )?;
+    } else {
+        output::emit(
+            &reply,
+            resolved.output,
+            resolved.hold_secs,
+            cli.save.as_deref(),
+        )?;
+    }
     Ok(())
 }
 

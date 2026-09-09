@@ -142,6 +142,63 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Serves one canned close-delimited response per request (no
+/// Content-Length: the body ends with the connection), recording every raw
+/// request. Used for SSE replies, which have no fixed length.
+struct SseServer {
+    port: u16,
+    handle: JoinHandle<Vec<Vec<u8>>>,
+}
+
+impl SseServer {
+    fn start(responses: &[String]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses: Vec<String> = responses.to_vec();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut requests = Vec::new();
+            for response in &responses {
+                let mut stream = accept(&listener, deadline);
+                stream.set_nonblocking(false).unwrap();
+                requests.push(read_request(&mut stream));
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        Self { port, handle }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn requests(self) -> Vec<Vec<u8>> {
+        self.handle.join().unwrap()
+    }
+}
+
+/// A full raw HTTP response carrying `deltas` as SSE `data:` events,
+/// followed by `finish_reason` and the `data: [DONE]` sentinel.
+fn sse_response(deltas: &[&str], finish_reason: &str) -> String {
+    let mut body = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+    );
+    body.push_str("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+    for delta in deltas {
+        let text = serde_json::to_string(delta).unwrap();
+        body.push_str(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{text}}}}}]}}\n\n"
+        ));
+    }
+    body.push_str(&format!(
+        "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\n"
+    ));
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
 static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// An empty but valid config, so tests never read the developer's real
@@ -282,6 +339,7 @@ fn text_input_stdout_output() {
     assert_eq!(req["messages"][0]["content"], "hello\n");
     assert_eq!(req["max_tokens"], 8192);
     assert!(req.get("temperature").is_none());
+    assert!(req.get("stream").is_none());
     assert!(!String::from_utf8_lossy(&raw)
         .to_lowercase()
         .contains("authorization"));
@@ -1745,4 +1803,177 @@ fn empty_reply_is_not_recorded() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("warning"));
     assert!(history_files(&dir).is_empty());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stream_flag_prints_deltas_and_sends_stream_true() {
+    let server = SseServer::start(&[sse_response(&["Hello", ", ", "世界"], "stop")]);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // deltas arrive concatenated, closed by one trailing newline
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello, 世界\n");
+    assert_eq!(request_json(&server.requests().remove(0))["stream"], true);
+}
+
+#[test]
+fn settings_stream_enables_streaming() {
+    let server = SseServer::start(&[sse_response(&["from config"], "stop")]);
+    let cfg = settings_config("[settings]\nstream = true\n");
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from config\n");
+    assert_eq!(request_json(&server.requests().remove(0))["stream"], true);
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
+fn no_stream_flag_overrides_settings() {
+    // settings.stream = true, but the CLI pair wins: --no-stream turns it off
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let cfg = settings_config("[settings]\nstream = true\n");
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--no-stream",
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(request_json(&server.request()).get("stream").is_none());
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
+fn stream_error_payload_fails_the_run() {
+    // Some gateways report failures inside the stream despite HTTP 200.
+    let body = concat!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        "data: {\"error\":{\"message\":\"model overloaded\"}}\n\n",
+    );
+    let server = SseServer::start(&[body.to_string()]);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("model overloaded"), "stderr was: {err}");
+}
+
+#[test]
+fn streamed_truncated_reply_warns() {
+    let server = SseServer::start(&[sse_response(&["partial"], "length")]);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+        ],
+        b"hi\n",
+        &[],
+    );
+    // the (partial) content is still emitted; truncation only warns
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "partial\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("truncated"), "stderr was: {err}");
+}
+
+#[test]
+fn stream_with_clipboard_output_stays_buffered() {
+    // Streaming shows nothing for a clipboard-only run: the request must
+    // stay buffered and a note explains why. The clipboard write itself
+    // fails on a headless Linux box but succeeds on macOS/Windows, so the
+    // exit status is deliberately not asserted here.
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+            "--copy",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert!(request_json(&server.request()).get("stream").is_none());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("note: streaming"), "stderr was: {err}");
+}
+
+#[test]
+fn streamed_slices_are_separated_like_the_buffered_join() {
+    let png = tall_png(64, 3200);
+    let file = temp_file("long.png", &png);
+    let server = SseServer::start(&[
+        sse_response(&["first half"], "stop"),
+        sse_response(&["second half"], "stop"),
+    ]);
+    let out = run(
+        &[
+            "ocr",
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--stream",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // slice replies concatenate in order, joined by exactly one "\n"
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first half\nsecond half\n"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(request_json(&requests[0])["stream"], true);
+    assert_eq!(request_json(&requests[1])["stream"], true);
+    std::fs::remove_file(&file).ok();
 }

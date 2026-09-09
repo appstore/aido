@@ -25,7 +25,7 @@ impl std::fmt::Display for OutputMode {
     name = "aido",
     version,
     about = "Send clipboard, piped stdin, or file content to an OpenAI-compatible model",
-    after_help = "Input priority: files > piped stdin > clipboard (text, or images for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  aido ocr screenshot.png        # file input: text or image files\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido list                      # show available actions\n  aido last                      # re-print the most recent result\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
+    after_help = "Input priority: files > piped stdin > clipboard (text, or images for vision models).\n\nExamples:\n  aido ocr --copy                # preset action: name first\n  aido ocr screenshot.png        # file input: text or image files\n  git diff | aido code-review\n  aido -p \"clean up this text\" --copy\n  aido -p \"write a haiku\" --stream  # stream the reply as it generates\n  aido list                      # show available actions\n  aido last                      # re-print the most recent result\n  echo hi | aido --base-url http://localhost:30000 -m qwen3\n\nActions are presets: aido ocr ... == aido --preset ocr ..."
 )]
 pub struct Cli {
     /// System instructions for the model (the input text is sent as the user message)
@@ -77,13 +77,24 @@ pub struct Cli {
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Request timeout in seconds (default 120)
+    /// Request timeout in seconds (default 120); with --stream this bounds
+    /// the wait for the response headers and each gap between bytes
     #[arg(long)]
     pub timeout: Option<u64>,
 
     /// Disable the progress spinner
     #[arg(long)]
     pub no_spinner: bool,
+
+    /// Stream the reply to stdout as it is generated (SSE); has no effect
+    /// when the result goes only to the clipboard
+    #[arg(long, overrides_with = "no_stream")]
+    pub stream: bool,
+
+    /// Send one buffered request instead of streaming (overrides
+    /// --stream / settings.stream)
+    #[arg(long, overrides_with = "stream")]
+    pub no_stream: bool,
 
     /// Send tall images whole instead of slicing them into
     /// legibility-sized requests
