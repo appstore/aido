@@ -30,7 +30,7 @@ pub struct Settings {
     pub output: Option<OutputMode>,
     pub timeout_secs: Option<u64>,
     pub hold_secs: Option<u64>,
-    /// Stream the reply to stdout as it is generated (SSE)
+    /// Stream the reply as it is generated (SSE); on by default
     pub stream: Option<bool>,
     /// How many results to keep on disk (0 disables history)
     pub history_keep: Option<usize>,
@@ -200,13 +200,13 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
         hold_secs: cfg.settings.hold_secs.unwrap_or(45),
         history_keep: cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP),
         // CLI pair --stream / --no-stream: last one given wins; neither
-        // falls back to settings.stream.
+        // falls back to settings.stream, whose own default is streaming.
         stream: if cli.no_stream {
             false
         } else if cli.stream {
             true
         } else {
-            cfg.settings.stream.unwrap_or(false)
+            cfg.settings.stream.unwrap_or(true)
         },
     })
 }
@@ -257,7 +257,7 @@ default_profile = "default"
 
 [settings]
 # output = "stdout"        # stdout | clipboard | both
-# stream = false           # stream replies to stdout as they are generated (SSE)
+# stream = true            # SSE streaming (the default); false = one buffered request
 # timeout_secs = 120
 # hold_secs = 45           # Linux: seconds to keep the clipboard alive after writing
 # history_keep = 50        # results kept on disk; 0 disables, see `aido last`

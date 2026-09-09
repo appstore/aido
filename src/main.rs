@@ -74,18 +74,15 @@ async fn main() -> Result<()> {
     let batches = split::expand(user, !cli.no_split)?;
 
     let client = openai::Client::new(&resolved)?;
-    // Streaming shows live output only when stdout carries the reply; a
-    // clipboard has no "partial" state, so those runs stay buffered.
-    let stream = resolved.stream
-        && matches!(
-            resolved.output,
-            cli::OutputMode::Stdout | cli::OutputMode::Both
-        );
-    if resolved.stream && !stream {
-        eprintln!(
-            "note: streaming shows output on stdout only; clipboard results are written in one piece"
-        );
-    }
+    // Streaming is the default for every output mode: a clipboard-only
+    // run streams silently — the clipboard has no "partial" state — so
+    // long generations are bounded by idle gaps, not a total request
+    // timeout. Deltas print live only where stdout carries the reply.
+    let stream = resolved.stream;
+    let live = matches!(
+        resolved.output,
+        cli::OutputMode::Stdout | cli::OutputMode::Both
+    );
 
     let mut replies: Vec<String> = Vec::with_capacity(batches.len());
     for (i, batch) in batches.iter().enumerate() {
@@ -112,19 +109,28 @@ async fn main() -> Result<()> {
         let reply = if stream {
             // Batches are separated by the same "\n" the buffered path
             // builds with join("\n"); the spinner yields to the live
-            // output at the first token.
-            if i > 0 {
+            // output at the first token. A clipboard-only run prints
+            // nothing and keeps its spinner until the end.
+            if live && i > 0 {
                 println!();
                 let _ = std::io::stdout().flush();
             }
             let mut spinner = Some(spinner);
+            // A clipboard-only run has no live output; the spinner line
+            // instead counts the chars received so far.
+            let mut seen = 0u64;
             let reply = client
                 .chat_stream(&request, |delta| {
-                    if let Some(s) = spinner.take() {
-                        s.stop();
+                    if live {
+                        if let Some(s) = spinner.take() {
+                            s.stop();
+                        }
+                        print!("{delta}");
+                        let _ = std::io::stdout().flush();
+                    } else if let Some(s) = spinner.as_ref() {
+                        seen += delta.chars().count() as u64;
+                        s.set_progress(seen);
                     }
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
                 })
                 .await;
             if let Some(s) = spinner.take() {
@@ -156,7 +162,7 @@ async fn main() -> Result<()> {
         eprintln!("warning: model returned empty content");
     }
     history::record(&reply, resolved.history_keep);
-    if stream {
+    if stream && live {
         // The deltas already went to stdout: just close the line, then run
         // the clipboard / --save half of emit.
         if !reply.is_empty() {
