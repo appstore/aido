@@ -31,7 +31,7 @@ const SLICE_NOTE: &str = "This image is one slice of a taller image that was \
 /// Anything that needs no slicing stays exactly as it was (a single
 /// request with all images, today's behavior).
 pub fn expand(user: UserContent, enabled: bool) -> Result<Vec<UserContent>> {
-    if !enabled || user.images.is_empty() {
+    if !enabled || user.images.is_empty() || !user.audios.is_empty() {
         return Ok(vec![user]);
     }
 
@@ -59,6 +59,7 @@ pub fn expand(user: UserContent, enabled: bool) -> Result<Vec<UserContent>> {
                 images.extend(untouched.iter().cloned());
             }
             batches.push(UserContent {
+                audios: Vec::new(),
                 text: if first {
                     text.take()
                 } else {
@@ -275,6 +276,7 @@ mod tests {
     fn short_images_pass_through_untouched() {
         let png = solid_png(100, 500);
         let user = UserContent {
+            audios: Vec::new(),
             text: Some("hi".into()),
             images: vec![png.clone()],
         };
@@ -287,6 +289,7 @@ mod tests {
     #[test]
     fn disabled_passes_everything_through() {
         let user = UserContent {
+            audios: Vec::new(),
             text: None,
             images: vec![striped_png(100, 3200)],
         };
@@ -301,6 +304,7 @@ mod tests {
         // so the cut should land on the blank row closest to it (1699) and
         // the two slices should tile the image exactly.
         let user = UserContent {
+            audios: Vec::new(),
             text: None,
             images: vec![band_png(100, 3300, 1500..1700)],
         };
@@ -320,6 +324,7 @@ mod tests {
         // No blank rows anywhere: the fallback cut re-shows a thin band so
         // the line it cuts through survives whole in one of the slices.
         let user = UserContent {
+            audios: Vec::new(),
             text: None,
             images: vec![striped_png(100, 3200)],
         };
@@ -333,6 +338,7 @@ mod tests {
     #[test]
     fn untouched_images_travel_with_the_first_slice() {
         let user = UserContent {
+            audios: Vec::new(),
             text: None,
             images: vec![solid_png(100, 500), striped_png(100, 3200)],
         };

@@ -1,0 +1,4 @@
+adapter = "openai-images"
+input_modes = ["text"]
+required_inputs = ["text"]
+output_modes = ["image"]

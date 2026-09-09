@@ -34,16 +34,59 @@ pub fn record(text: &str, keep: usize) {
 }
 
 /// Read the most recent saved result, if there is one.
-pub fn last() -> Result<Option<String>> {
+pub fn last_result() -> Result<Option<crate::api::GenerateResult>> {
     let Some(dir) = history_dir() else {
         return Ok(None);
     };
     let Some(path) = entries(&dir)?.pop() else {
         return Ok(None);
     };
-    std::fs::read_to_string(&path)
-        .map(Some)
-        .with_context(|| format!("failed to read {}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if path.extension().is_some_and(|e| e == "json") {
+        let result: crate::api::GenerateResult =
+            serde_json::from_str(&text).context("invalid media history entry")?;
+        for artifact in &result.artifacts {
+            artifact.validate()?;
+        }
+        Ok(Some(result))
+    } else {
+        Ok(Some(crate::api::GenerateResult {
+            text,
+            ..Default::default()
+        }))
+    }
+}
+
+pub fn record_result(result: &crate::api::GenerateResult, keep: usize) {
+    if result.artifacts.is_empty() {
+        record(&result.text, keep);
+        return;
+    }
+    if keep == 0 {
+        return;
+    }
+    let Some(dir) = history_dir() else {
+        eprintln!("warning: cannot determine history directory");
+        return;
+    };
+    let save = || -> Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        set_mode(&dir, 0o700);
+        let path = next_entry_path(&dir).with_extension("json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(result)?)?;
+        #[cfg(unix)]
+        set_mode(&tmp, 0o600);
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    };
+    if let Err(error) = save() {
+        eprintln!("warning: failed to save the result to history: {error:#}");
+        return;
+    }
+    prune(&dir, keep);
 }
 
 fn save_entry(dir: &Path, text: &str) -> Result<()> {
@@ -113,7 +156,7 @@ fn next_entry_path(dir: &Path) -> PathBuf {
         .unwrap_or_default();
     loop {
         let path = dir.join(format!("{}.txt", stamp(elapsed)));
-        if !path.exists() {
+        if !path.exists() && !path.with_extension("json").exists() {
             return path;
         }
         // Two runs within the same millisecond would overwrite each
@@ -129,7 +172,10 @@ fn is_entry(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let Some(stem) = name.strip_suffix(".txt") else {
+    let Some(stem) = name
+        .strip_suffix(".txt")
+        .or_else(|| name.strip_suffix(".json"))
+    else {
         return false;
     };
     let b = stem.as_bytes();

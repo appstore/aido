@@ -1,0 +1,4 @@
+adapter = "openai-transcription"
+input_modes = ["audio"]
+required_inputs = ["audio"]
+output_modes = ["text"]

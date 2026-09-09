@@ -87,3 +87,42 @@ fn spawn_holder(text: &str, hold_secs: u64) {
         let _ = stdin.write_all(text.as_bytes());
     }
 }
+
+pub fn set_image(cb: &mut arboard::Clipboard, bytes: &[u8]) -> Result<()> {
+    let rgba = image::load_from_memory(bytes)
+        .context("failed to decode clipboard image")?
+        .into_rgba8();
+    cb.set_image(arboard::ImageData {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+    })
+    .context("failed to write image to clipboard")
+}
+
+pub fn write_image(bytes: &[u8], hold_secs: u64) -> Result<()> {
+    let mut cb = arboard::Clipboard::new().context("cannot access the clipboard")?;
+    set_image(&mut cb, bytes)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if hold_secs > 0 {
+            let mut child = Command::new(std::env::current_exe()?)
+                .arg("__hold")
+                .arg(hold_secs.to_string())
+                .arg("--image")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .context("clipboard holder stdin unavailable")?
+                .write_all(bytes)?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = hold_secs;
+    Ok(())
+}

@@ -120,6 +120,11 @@ aido -p "帮我写一版周报"
 | `--no-spinner` | 关闭 stderr 上的等待动画 |
 | `--stream` / `--no-stream` | 流式输出（SSE，**默认开启**）：token 实时写到 stdout；纯剪贴板输出时静默流式，不实时打印 |
 | `--no-split` | 长图不切片，整张发送（默认自动切） |
+| `--adapter <NAME>` | 协议适配器，通常在 Profile 中配置 |
+| `--input-mode` / `--output-mode` | 输入类型约束 / 期望输出类型，支持逗号分隔 |
+| `--option KEY=VALUE` | 协议专有参数，可重复传入 |
+| `--text <TEXT>` | 显式文字输入 |
+| `--save-dir <DIR>` | 保存多个输出产物 |
 | `--list-presets` | 列出所有 preset（同 `aido list`） |
 | `--init` | 生成示例配置文件 |
 
@@ -187,11 +192,106 @@ model = "glm-4.6"
 
 取值优先级：**命令行参数 > preset 自带参数 > 环境变量 > profile > 默认值**（preset 自带参数见下文 Presets 一节）。
 
+## Profile、适配器与多模态输出
+
+Profile 是完整的调用配置，包含服务地址、协议适配器、模型、认证及默认模式。
+省略 `adapter` 时仍使用 `openai-chat`，原有配置和文本命令继续有效。
+
+| adapter | 输入类型 | 可请求的输出类型 | 默认输出 |
+|---|---|---|---|
+| `openai-chat` | text、image，可组合 | text | text |
+| `openai-responses` | text、image，可组合 | text、image，可组合 | text |
+| `openai-speech` | text | audio | audio |
+| `openai-transcription` | 单个 audio | text | text |
+| `openai-images` | text | image，可有多张 | image |
+
+表格表示适配器已实现的能力，具体服务和模型还必须支持所选模式。
+Responses 的 image 输出会启用并选择 `image_generation` 工具；不会自动切换协议。
+Responses 显式发送 `store: false`，本地历史仍由 `history_keep` 控制。
+Chat/Responses 支持文本流式输出；图片在完整产物到达后保存。独立媒体适配器使用缓冲请求；显式 `--stream` 会报错，默认的流式设置不会影响它们。
+
+```toml
+[profiles.general]
+base_url = "https://api.openai.com/v1"
+adapter = "openai-responses"
+model = "gpt-4o-mini"
+
+[profiles.speech]
+adapter = "openai-speech"
+model = "tts-1"
+[profiles.speech.options]
+voice = "alloy"
+format = "mp3"
+
+[profiles.transcription]
+adapter = "openai-transcription"
+model = "whisper-1"
+
+[profiles.images]
+adapter = "openai-images"
+model = "gpt-image-1"
+```
+
+认证继续使用 `AIDO_API_KEY` / `OPENAI_API_KEY`，也可在 Profile 中设置 `api_key`。
+使用媒体任务时选择对应 Profile，避免继承文本模型的配置：
+
+```bash
+aido ocr scan.png --profile general
+echo "你好" | aido tts --profile speech --save hello.mp3
+aido transcribe meeting.m4a --profile transcription | aido summarize
+aido image --profile images --text "一只柴犬" --save dog.png
+
+# 不用任务预设也可以调用
+echo "你好" | aido --profile speech --output-mode audio --save hello.mp3
+
+# 多张图片保存到目录
+aido image --profile images --text "一只柴犬" --option n=2 --save-dir dogs
+
+# Responses 同时生成文本和图片；需选择支持图片工具的模型
+aido --profile general -m gpt-4.1 --text "画一只柴犬并简要说明" \
+  --output-mode text,image --save-dir dog-result
+
+# 恢复最近一次媒体结果，无需重新调用模型
+aido --save-dir recovered last
+```
+
+- `--input-mode text,image`：约束允许的输入类型，可重复传入；不进行类型转换。默认按内容检测文本、PNG/JPEG/WebP 图片及 WAV/MP3/FLAC/Ogg/M4A/WebM 音频容器。原始 PCM 输入暂不支持；音频容器检测不保证其中的编解码器受到远端支持。
+- `--output-mode text,image`：请求生成的类型，可重复传入；省略时使用 Preset / Profile / Adapter 默认值。
+- `--option KEY=VALUE`：适配器参数。值可为字符串或 JSON 标量，例如 `voice=alloy`、`speed=1.2`、`n=2`。不支持的参数会在请求前报错。
+- `--text TEXT`：显式输入文字，优先于管道和剪贴板，与文件输入互斥。
+- `--save FILE`：保存一个产物；媒体格式由 `--option format=...` 选择，文件扩展名必须匹配，不自动转码。
+- `--save-dir DIR`：保存多产物，命名为 `text.txt`、`image-1.png`、`audio-1.mp3` 等；同名文件会覆盖，建议每次使用独立目录。
+- `--output stdout|clipboard|both` 仍表示输出去向。单个图片可写入剪贴板；音频或混合产物不能写入剪贴板。向管道输出单个媒体产物时使用原始字节，不附加换行；同时指定保存路径时，stdout 只输出文本。终端不会直接打印二进制。
+- 文本历史保持 `.txt` 格式；含媒体的历史使用 `.json` 保存内容、base64 媒体和状态，共享保留条数限制。失败和无终态的流不会入库；服务明确报告截断时保留已有结果并警告。单条响应最多 128 MiB，单个输入文件或 stdin 最多 32 MiB。
+
+任务由 Preset 组合上述配置；不需要为任务名增加执行分支。例如自定义 `read-image.toml`：
+
+```toml
+profile = "general"
+input_modes = ["image", "text"]
+required_inputs = ["image"]
+output_modes = ["text"]
+system = "识别图片中的文字，保留段落。"
+```
+
+`input_modes` 是允许集合，`required_inputs` 是必须出现的类型，`output_modes` 是期望输出。
+原有 OCR 预设保持其兼容行为；需要强制图片输入时使用上面的声明。
+`system` 可省略，因此 TTS / STT 等预设无需伪造系统提示词。Preset 也可设置 `adapter` 及 `[options]`。
+
+Profile 选择优先级：**`--profile` > Preset.profile > AIDO_PROFILE > default_profile > default**。
+字段优先级保持 **CLI > Preset > 环境变量 > 已选 Profile > 默认值**。
+模式列表整体覆盖；`options` 按参数名合并。`AIDO_ADAPTER` 可覆盖 Profile 的 adapter。
+内置 `tts` / `transcribe` / `image` 预设指定适配器和模式；如需改用其他协议，可使用 `--adapter` 或自定义预设。
+
+适配器选项：speech 支持 `voice`、`format`、`speed`；transcription 支持 `language`；images 支持 `format`、`size`、`quality`、`background`、`n`；Responses 图片工具支持 `format`、`size`、`quality`、`background`。
+图像格式为 png/jpeg/webp，音频格式为 mp3/opus/aac/flac/wav/pcm；模型不一定支持所有选项。
+
 ## 环境变量
 
 | 变量 | 说明 |
 |---|---|
 | `AIDO_CONFIG` | 配置文件路径（必须指向已存在的文件） |
+| `AIDO_ADAPTER` | 协议适配器名称 |
 | `AIDO_PROFILE` | 默认 profile |
 | `AIDO_BASE_URL` / `OPENAI_BASE_URL` | 接口地址 |
 | `AIDO_API_KEY` / `OPENAI_API_KEY` | API key |
@@ -238,13 +338,13 @@ base_url = "https://open.bigmodel.cn/api/paas/v4"
 
 注意事项：
 
-- 支持的字段与 profile 相同：`base_url` / `api_key` / `model` / `max_tokens` / `temperature`（`max_tokens = 0` 表示请求里不带该字段）。字段按条独立生效：preset 里没写的字段继续走环境变量 → profile → 默认值。
+- 调用字段包括 `adapter` / `base_url` / `api_key` / `model` / `max_tokens` / `temperature`，以及模式和 `options`；Preset 还可通过 `profile` 引用调用配置（`max_tokens = 0` 表示请求里不带该字段）。字段按条独立生效：preset 里没写的字段继续走环境变量 → profile → 默认值。
 - `aido list` 会用 `[api_key, model]` 这样的标签标注带参数的 preset——只列字段名，不显示值，避免 key 泄漏到终端。
 - ⚠️ `api_key` 会明文保存在 preset 文件里，注意文件权限；更稳妥的做法是省略该字段、走环境变量。
 
 写 preset 的要点：
 
-- preset 就是 **system 指令**，剪贴板/管道/文件内容永远是 user 消息——写“要求模型做什么”，待处理内容不要写进去。
+- 生成文本的 preset 用 **system 指令**描述处理要求，剪贴板/管道/文件提供待处理内容；媒体 preset 也可只声明调用配置和模式。
 - 指令末尾加一条“只输出 X、不加解释”之类的收尾约束，能显著减少模型废话。
 - 多行文本用 TOML 三引号字符串 `"""..."""`，内容中不能出现连续三个双引号。
 - 与内置 preset 同名的文件会覆盖它，如自定义 `translate.toml` 即可修改默认翻译目标语言。

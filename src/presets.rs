@@ -6,7 +6,15 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Preset {
+    #[serde(default)]
     pub system: String,
+    pub profile: Option<String>,
+    pub adapter: Option<crate::api::Adapter>,
+    pub input_modes: Option<Vec<crate::api::MediaMode>>,
+    pub required_inputs: Option<Vec<crate::api::MediaMode>>,
+    pub output_modes: Option<Vec<crate::api::MediaMode>>,
+    #[serde(default)]
+    pub options: BTreeMap<String, serde_json::Value>,
     /// Optional per-action API overrides. They rank just below CLI flags and
     /// above env vars / the config profile (see config::resolve): a preset can
     /// pin the model/endpoint its action needs even in shells where OPENAI_*
@@ -15,7 +23,7 @@ pub struct Preset {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub max_tokens: Option<u64>,
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
 }
 
 impl Preset {
@@ -23,6 +31,24 @@ impl Preset {
     /// are deliberately not shown (the api key must not leak).
     pub fn override_keys(&self) -> Vec<&'static str> {
         let mut keys = Vec::new();
+        if self.profile.is_some() {
+            keys.push("profile");
+        }
+        if self.adapter.is_some() {
+            keys.push("adapter");
+        }
+        if self.input_modes.is_some() {
+            keys.push("input_modes");
+        }
+        if self.required_inputs.is_some() {
+            keys.push("required_inputs");
+        }
+        if self.output_modes.is_some() {
+            keys.push("output_modes");
+        }
+        if !self.options.is_empty() {
+            keys.push("options");
+        }
         if self.base_url.is_some() {
             keys.push("base_url");
         }
@@ -61,6 +87,9 @@ pub fn get(name: &str) -> Result<Preset> {
 }
 
 const BUILTIN: &[(&str, &str)] = &[
+    ("tts", include_str!("../presets/tts.toml")),
+    ("transcribe", include_str!("../presets/transcribe.toml")),
+    ("image", include_str!("../presets/image.toml")),
     ("code-review", include_str!("../presets/code-review.toml")),
     ("ocr", include_str!("../presets/ocr.toml")),
     ("summarize", include_str!("../presets/summarize.toml")),
