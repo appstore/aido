@@ -163,25 +163,16 @@ impl Client {
         if !status.is_success() {
             return Err(api_error(status, &body));
         }
-
-        let parsed: ChatCompletion = serde_json::from_str(&body).with_context(|| {
-            format!("unexpected response format: {}", truncate_chars(&body, 300))
-        })?;
-        let Some(choice) = parsed.choices.into_iter().next() else {
-            bail!(
-                "response contains no choices: {}",
-                truncate_chars(&body, 300)
-            );
-        };
-        warn_finish_reason(choice.finish_reason.as_deref());
-        Ok(choice.message.content.unwrap_or_default())
+        parse_completion(&body)
     }
 
     /// Like [`Client::chat`] with `stream: true`: every content delta goes
     /// to `on_delta` as it arrives, and the full reply is also returned.
     /// The timeout bounds the wait for the response headers and each gap
     /// between bytes — never the whole reply, which may legitimately take
-    /// longer than the total limit.
+    /// longer than the total limit. A response that is not an event
+    /// stream — a server that ignored `stream: true` — is parsed as an
+    /// ordinary completion and delivered to `on_delta` in one piece.
     pub async fn chat_stream(
         &self,
         request: &ChatRequest,
@@ -209,6 +200,23 @@ impl Client {
         }
 
         let idle = Duration::from_secs(self.timeout_secs);
+        // The decoder would drop a non-`data:` line, so a server that
+        // ignored `stream: true` must be parsed as an ordinary completion.
+        if !is_event_stream(&resp) {
+            let body = match tokio::time::timeout(idle, resp.text()).await {
+                Err(_) => bail!(
+                    "timed out after {}s reading response body",
+                    self.timeout_secs
+                ),
+                Ok(r) => r.context("failed to read response body")?,
+            };
+            let content = parse_completion(&body)?;
+            if !content.is_empty() {
+                on_delta(&content);
+            }
+            return Ok(content);
+        }
+
         let mut decoder = SseDecoder::new();
         let mut text = String::new();
         let mut finish_reason: Option<String> = None;
@@ -240,6 +248,29 @@ impl Client {
         warn_finish_reason(finish_reason.as_deref());
         Ok(text)
     }
+}
+
+/// Parse an ordinary (non-streamed) chat completion body into its text.
+fn parse_completion(body: &str) -> Result<String> {
+    let parsed: ChatCompletion = serde_json::from_str(body)
+        .with_context(|| format!("unexpected response format: {}", truncate_chars(body, 300)))?;
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        bail!(
+            "response contains no choices: {}",
+            truncate_chars(body, 300)
+        );
+    };
+    warn_finish_reason(choice.finish_reason.as_deref());
+    Ok(choice.message.content.unwrap_or_default())
+}
+
+/// Whether a response is `text/event-stream` (parameters after `;`
+/// tolerated), i.e. what `stream: true` should produce.
+fn is_event_stream(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
 }
 
 /// Fail a broken stream, telling the user how much already arrived.

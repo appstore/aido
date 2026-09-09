@@ -339,7 +339,8 @@ fn text_input_stdout_output() {
     assert_eq!(req["messages"][0]["content"], "hello\n");
     assert_eq!(req["max_tokens"], 8192);
     assert!(req.get("temperature").is_none());
-    assert!(req.get("stream").is_none());
+    // streaming is the default now
+    assert_eq!(req["stream"], true);
     assert!(!String::from_utf8_lossy(&raw)
         .to_lowercase()
         .contains("authorization"));
@@ -1872,6 +1873,62 @@ fn no_stream_flag_overrides_settings() {
 }
 
 #[test]
+fn default_run_streams() {
+    // No flags, no settings: the reply arrives as live deltas.
+    let server = SseServer::start(&[sse_response(&["Hello", ", ", "world"], "stop")]);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello, world\n");
+    assert_eq!(request_json(&server.requests().remove(0))["stream"], true);
+}
+
+#[test]
+fn settings_stream_false_opts_out_of_the_default() {
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+    let cfg = settings_config("[settings]\nstream = false\n");
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    assert!(request_json(&server.request()).get("stream").is_none());
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
+fn default_stream_tolerates_a_server_that_ignores_stream() {
+    // The default run sends stream: true; a server that ignores it and
+    // answers with an ordinary JSON completion still gets its reply out.
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"plain"}}]}"#);
+    let out = run(
+        &["--base-url", server.url().as_str(), "--no-spinner"],
+        b"hi\n",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "plain\n");
+    assert_eq!(request_json(&server.request())["stream"], true);
+}
+
+#[test]
 fn stream_error_payload_fails_the_run() {
     // Some gateways report failures inside the stream despite HTTP 200.
     let body = concat!(
@@ -1919,26 +1976,52 @@ fn streamed_truncated_reply_warns() {
 }
 
 #[test]
-fn stream_with_clipboard_output_stays_buffered() {
-    // Streaming shows nothing for a clipboard-only run: the request must
-    // stay buffered and a note explains why. The clipboard write itself
-    // fails on a headless Linux box but succeeds on macOS/Windows, so the
-    // exit status is deliberately not asserted here.
-    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+fn stream_with_clipboard_output_prints_nothing() {
+    // A clipboard-only run still streams — the timeout semantics are the
+    // point — but the deltas have nowhere to go: stdout stays empty and no
+    // note is printed. The clipboard write itself fails on a headless
+    // Linux box but succeeds on macOS/Windows, so the exit status is
+    // deliberately not asserted here.
+    let server = SseServer::start(&[sse_response(&["ok"], "stop")]);
     let out = run(
         &[
             "--base-url",
             server.url().as_str(),
             "--no-spinner",
-            "--stream",
             "--copy",
         ],
         b"hi\n",
         &[],
     );
-    assert!(request_json(&server.request()).get("stream").is_none());
+    assert_eq!(request_json(&server.requests().remove(0))["stream"], true);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("note: streaming"), "stderr was: {err}");
+    assert!(!err.contains("note"), "stderr was: {err}");
+}
+
+#[test]
+fn stream_with_both_output_prints_live_and_copies() {
+    // `both` + streaming: deltas go to stdout as they arrive, then the
+    // clipboard half runs once at the end. The write itself fails on a
+    // headless Linux box but succeeds on macOS/Windows, so only the
+    // attempt (not its success) is asserted here — either way stderr
+    // mentions the clipboard.
+    let server = SseServer::start(&[sse_response(&["Hello", " ", "world"], "stop")]);
+    let out = run(
+        &[
+            "--base-url",
+            server.url().as_str(),
+            "--no-spinner",
+            "--output",
+            "both",
+        ],
+        b"hi\n",
+        &[],
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello world\n");
+    assert_eq!(request_json(&server.requests().remove(0))["stream"], true);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("clipboard"), "stderr was: {err}");
 }
 
 #[test]

@@ -80,8 +80,8 @@ aido < screenshot.png ocr --copy
 # 指定完整 prompt
 pbpaste | aido -p "改成正式商务邮件语气" --copy
 
-# 流式输出（SSE，长回复实时可见，不用干等）
-aido -p "帮我写一版周报" --stream
+# 流式输出（默认开启，长回复实时可见；--no-stream 改回一次性请求）
+aido -p "帮我写一版周报"
 ```
 
 > **Action 语法**：action（即 preset 名，`aido list` 查看）直接作为第一个参数，`aido ocr` 等价于
@@ -118,14 +118,14 @@ aido -p "帮我写一版周报" --stream
 | `--temperature <T>` | 采样温度 |
 | `--timeout <SECS>` | 请求超时，默认 120 秒；流式下作用于首包等待和相邻数据间隔，不限制整条回复时长 |
 | `--no-spinner` | 关闭 stderr 上的等待动画 |
-| `--stream` / `--no-stream` | 流式输出（SSE）：token 实时写到 stdout；默认关闭，只作用于含 stdout 的输出 |
+| `--stream` / `--no-stream` | 流式输出（SSE，**默认开启**）：token 实时写到 stdout；纯剪贴板输出时静默流式，不实时打印 |
 | `--no-split` | 长图不切片，整张发送（默认自动切） |
 | `--list-presets` | 列出所有 preset（同 `aido list`） |
 | `--init` | 生成示例配置文件 |
 
 结果只写 stdout；进度、警告、错误一律走 stderr，退出码非 0 表示失败——可以放心接管道。
 
-`--stream` 开启后改走 SSE 流式请求：token 一到就实时写到 stdout（第一个 token 到达时 stderr 的 spinner 自动让位），长回复不再干等；`both` 模式下剪贴板仍在结束时一次性写入，接管道时最终字节与不开流式完全一致。该模式只对含 stdout 的输出生效，纯 `--copy` 运行自动退回一次性请求（stderr 有一条提示）。`--timeout` 在流式下的语义是「等待响应头」和「相邻两次数据的间隔」，而非整条回复的总时长——慢模型的长回复不会被中途掐断。
+请求默认走 SSE 流式：token 一到就实时写到 stdout（第一个 token 到达时 stderr 的 spinner 自动让位），长回复不再干等；`both` 模式下剪贴板仍在结束时一次性写入，接管道时最终字节与一次性请求完全一致。纯 `--copy` 运行同样走流式，但不实时打印——stderr 的 spinner 会就地更新已收字数（`⠙ asking glm-4.6... 1,204 chars`），推理类模型在输出正文前计数保持不动。`--timeout` 在流式下的语义是「等待响应头」和「相邻两次数据的间隔」，而非整条回复的总时长——慢模型的长回复不会被中途掐断。个别服务端会忽略 `stream: true` 而直接回普通 JSON，aido 会照常解析。要改回一次性请求：`--no-stream` 或配置 `stream = false`。
 
 模型返回空内容时：`stdout` 模式只输出一条警告；`clipboard` / `both` 模式直接失败退出，**不会**用空串覆盖剪贴板里的原始内容。
 
@@ -166,7 +166,7 @@ default_profile = "default"
 
 [settings]
 # output = "stdout"        # stdout | clipboard | both
-# stream = false             # SSE 流式输出到 stdout（--stream / --no-stream 可覆盖）
+# stream = true              # SSE 流式请求（默认开启）；false = 一次性缓冲请求
 # timeout_secs = 120
 # hold_secs = 45             # Linux: 写入剪贴板后保活秒数
 # history_keep = 50          # 磁盘留底条数（0 关闭），见「结果留底」
@@ -270,4 +270,4 @@ push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workfl
 ## 已知限制 / Roadmap
 
 - 部分 OpenAI 新模型不接受 `max_tokens` 参数名，需要 `--max-tokens 0` 略过
-- 可选方向：shell 补全、`--profile` 列表查看、热键常驻模式、纯剪贴板输出的流式进度提示
+- 可选方向：shell 补全、`--profile` 列表查看、热键常驻模式
