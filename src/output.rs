@@ -24,7 +24,7 @@ pub fn finish(result: &str, mode: OutputMode, hold_secs: u64, save: Option<&Path
         // A trailing newline in the clipboard is almost never wanted when pasting.
         let text = result.trim_end();
         clipboard::write_text(text, hold_secs)?;
-        eprintln!("✓ copied {} chars to clipboard", text.chars().count());
+        eprintln!("copied {} chars to clipboard", text.chars().count());
     }
     Ok(())
 }
@@ -38,6 +38,6 @@ pub fn save_to_file(result: &str, path: &Path) -> Result<()> {
         }
     }
     std::fs::write(path, result).with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("✓ saved result to {}", path.display());
+    eprintln!("saved result to {}", path.display());
     Ok(())
 }

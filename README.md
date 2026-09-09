@@ -84,9 +84,10 @@ pbpaste | aido -p "改成正式商务邮件语气" --copy
 aido -p "帮我写一版周报" --stream
 ```
 
-> **Action 语法**：preset 名直接作为第一个参数（`aido ocr`），等价于 `aido --preset ocr`，后面可接任意
-> flags 和文件路径。注意 action 名必须最先出现——`aido --copy ocr` 会把 `ocr` 当成文件名，报错并提示
-> action 应放在最前。临时指令一律用 `-p/--prompt` 传递。
+> **Action 语法**：action（即 preset 名，`aido list` 查看）直接作为第一个参数，`aido ocr` 等价于
+> `aido --preset ocr`，后面可接任意 flags 和文件路径。action 名必须最先出现——只有当它不方便
+> 放第一位时才需要显式写 `--preset`（如 `aido --no-spinner --preset ocr`）。`aido --copy ocr`
+> 会把 `ocr` 当成文件名，报错并提示 action 应放在最前。临时指令一律用 `-p/--prompt` 传递。
 
 > **关于图片输入**：图片以 `image_url`（base64 PNG）形式发送，必须搭配支持视觉的模型
 > （如 gpt-4o、glm-4.6v、qwen2.5-vl），纯文本模型无法处理图片。剪贴板中的图片自动走此
@@ -102,10 +103,10 @@ aido -p "帮我写一版周报" --stream
 
 | 参数 | 说明 |
 |---|---|
-| `<ACTION>` | 第一个参数位：运行一个 preset（如 `aido ocr`），等价于 `--preset`；action 名必须最先出现 |
+| `<ACTION>` | 第一个参数位：运行一个 action（preset 名，`aido list` 查看），如 `aido ocr`；action 名必须最先出现 |
 | `<FILE>...` | 输入文件（须搭配 action 或 `-p`，位置任意）：文本原样发送，PNG/JPEG 图片走 vision 模型，可一次传多个混用；单个文件超过 32 MB 直接报错 |
 | `-p, --prompt <PROMPT>` | system 指令（临时任务用这个）；输入内容作为 user 消息发送 |
-| `--preset <NAME>` | 使用 prompt 预设（`aido list` 查看），与 `<ACTION>` 写法等价 |
+| `--preset <NAME>` | 显式指定 action，等价于把名字放第一位；仅当 action 名不便最先出现时需要（如 `aido --no-spinner --preset ocr`），与 `-p` 互斥 |
 | `--profile <NAME>` | 使用配置文件中的 profile |
 | `-m, --model <MODEL>` | 模型名 |
 | `--base-url <URL>` | 接口地址；无路径时自动补 `/v1` |
@@ -164,7 +165,7 @@ aido -p "帮我写一版周报" --stream
 default_profile = "default"
 
 [settings]
-# output = "clipboard"      # stdout | clipboard | both
+# output = "stdout"        # stdout | clipboard | both
 # stream = false             # SSE 流式输出到 stdout（--stream / --no-stream 可覆盖）
 # timeout_secs = 120
 # hold_secs = 45             # Linux: 写入剪贴板后保活秒数
@@ -173,6 +174,7 @@ default_profile = "default"
 [profiles.default]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
+# api_key = "sk-..."       # 建议走环境变量 AIDO_API_KEY / OPENAI_API_KEY
 
 [profiles.local]
 base_url = "http://localhost:30000"
