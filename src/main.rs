@@ -294,7 +294,7 @@ fn run_last(copy: bool, hold_secs: u64, save: Option<&std::path::Path>) -> Resul
         // Same trailing-newline trim as a normal clipboard write.
         let text = text.trim_end();
         clipboard::write_text(text, hold_secs)?;
-        eprintln!("✓ copied {} chars to clipboard", text.chars().count());
+        eprintln!("copied {} chars to clipboard", text.chars().count());
     } else {
         println!("{text}");
     }
