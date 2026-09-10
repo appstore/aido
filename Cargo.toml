@@ -1,10 +1,10 @@
 [package]
 name = "aido"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # 依赖下限：image 0.25 与 reqwest 传递引入的 icu_* 系列声明 1.88；CI 的 msrv job 验证
 rust-version = "1.88"
-description = "Send clipboard or piped stdin content to any OpenAI-compatible model; write the result to stdout or back to the clipboard"
+description = "Send material to an AI task (OCR, translate, TTS, images, ...) and deliver the result to stdout, files or the clipboard"
 
 [dependencies]
 anyhow = "1"
@@ -16,11 +16,18 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 toml = "0.8"
 unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
 [profile.release]

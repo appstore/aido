@@ -1,0 +1,6 @@
+operation = "transcribe"
+input_types = ["audio"]
+required_types = ["audio"]
+# The transcription route accepts exactly one audio input.
+max_inputs = 1
+output_types = ["text"]

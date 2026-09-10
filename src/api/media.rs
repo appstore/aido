@@ -1,43 +1,53 @@
 //! Buffered media protocols. Generation options are serialized structurally,
 //! never interpolated into JSON templates.
-use super::{Adapter, Artifact, GenerateRequest, GenerateResult, MediaMode};
+use super::{merged_text, single_audio, GenerateRequest, GenerateResult};
+use crate::domain::{Artifact, MediaKind};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-pub(super) fn text<'a>(spec: &'a GenerateRequest<'_>) -> Result<&'a str> {
-    spec.user
-        .text
-        .as_deref()
-        .filter(|t| !t.trim().is_empty())
-        .context("this adapter requires text input")
-}
-
-pub(super) fn encode(adapter: Adapter, spec: &GenerateRequest<'_>) -> Result<Value> {
-    let input = text(spec)?;
-    let mut body = match adapter {
-        Adapter::Speech => {
-            json!({"model": spec.model, "input": input, "voice": "alloy", "response_format": "mp3"})
-        }
-        Adapter::Images => {
-            let prompt = match spec.system.filter(|s| !s.trim().is_empty()) {
-                Some(system) => format!("{system}\n\n{input}"),
-                None => input.to_owned(),
-            };
-            let mut body = json!({"model": spec.model, "prompt": prompt});
-            if spec.model.starts_with("dall-e-") {
-                body["response_format"] = json!("b64_json");
-            }
-            body
-        }
-        _ => bail!("not a media generation adapter"),
-    };
-    if adapter == Adapter::Speech && spec.system.is_some_and(|s| !s.trim().is_empty()) {
-        body["instructions"] = json!(spec.system.unwrap());
+/// Speech: the material is the text to read; the instruction channel
+/// (task direction and -p) goes to `instructions`, never into the speech.
+pub(super) fn encode_speech(spec: &GenerateRequest<'_>) -> Result<Value> {
+    let input = merged_text(spec.inputs)?;
+    let mut body = json!({
+        "model": spec.model,
+        "input": input,
+        "response_format": "mp3",
+    });
+    let instructions = spec.instruction_channel();
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
     }
     for (key, value) in spec.options {
         let key = match key.as_str() {
-            "format" if adapter == Adapter::Speech => "response_format",
+            "format" => "response_format",
+            other => other,
+        };
+        body[key] = value.clone();
+    }
+    Ok(body)
+}
+
+/// Image generation: the prompt is the instruction channel plus the text
+/// material — the protocol has no separate instruction field.
+pub(super) fn encode_images(spec: &GenerateRequest<'_>) -> Result<Value> {
+    let instructions = spec.instruction_channel();
+    // The description is the text material when there is any; otherwise the
+    // instruction alone drives the generation (`ask -p "draw a dog"`).
+    let material = merged_text(spec.inputs).unwrap_or_default();
+    let prompt = match (instructions.is_empty(), material.is_empty()) {
+        (false, false) => format!("{instructions}\n\n{material}"),
+        (false, true) => instructions,
+        (true, false) => material,
+        (true, true) => bail!("image generation needs a description (--text or -p)"),
+    };
+    let mut body = json!({"model": spec.model, "prompt": prompt});
+    if spec.model.starts_with("dall-e-") {
+        body["response_format"] = json!("b64_json");
+    }
+    for (key, value) in spec.options {
+        let key = match key.as_str() {
             "format" => "output_format",
             other => other,
         };
@@ -47,19 +57,22 @@ pub(super) fn encode(adapter: Adapter, spec: &GenerateRequest<'_>) -> Result<Val
 }
 
 pub(super) fn transcription(spec: &GenerateRequest<'_>) -> Result<reqwest::multipart::Form> {
-    if spec.user.audios.len() != 1 {
-        bail!("openai-transcription requires exactly one audio input");
-    }
-    let audio = &spec.user.audios[0];
-    let part = reqwest::multipart::Part::bytes(audio.bytes.clone())
-        .file_name(audio.filename.clone())
+    let audio = single_audio(spec.inputs)?;
+    let bytes = match &audio.content {
+        crate::domain::InputContent::Media(b) => b.clone(),
+        _ => bail!("transcription input must be audio"),
+    };
+    let extension = audio.mime.rsplit('/').next().unwrap_or("bin");
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(format!("input.{extension}"))
         .mime_str(&audio.mime)?;
     let mut form = reqwest::multipart::Form::new()
         .text("model", spec.model.to_owned())
         .text("response_format", "json")
         .part("file", part);
-    if let Some(system) = spec.system.filter(|s| !s.trim().is_empty()) {
-        form = form.text("prompt", system.to_owned());
+    let prompt = spec.instruction_channel();
+    if !prompt.is_empty() {
+        form = form.text("prompt", prompt);
     }
     if let Some(language) = spec.options.get("language").and_then(Value::as_str) {
         form = form.text("language", language.to_owned());
@@ -75,10 +88,7 @@ pub(super) fn parse_transcription(body: &str) -> Result<GenerateResult> {
     let text = body["text"]
         .as_str()
         .context("transcription response is missing text")?;
-    Ok(GenerateResult {
-        text: text.into(),
-        ..Default::default()
-    })
+    Ok(GenerateResult::complete_with_text(text))
 }
 
 pub(super) fn image(encoded: &str) -> Result<Artifact> {
@@ -100,10 +110,12 @@ pub(super) fn image_bytes(bytes: Vec<u8>) -> Result<Artifact> {
     // Validate decoded pixels before saving a success/history entry.
     image::load_from_memory(&bytes).context("invalid generated image")?;
     Ok(Artifact {
-        mode: MediaMode::Image,
+        id: String::new(), // assigned by the runner
+        kind: MediaKind::Image,
         mime: mime.into(),
         format: format.into(),
         bytes,
+        provenance: crate::domain::Provenance::Restored,
     })
 }
 
@@ -153,11 +165,14 @@ pub(super) fn speech(bytes: Vec<u8>, format: &str, content_type: &str) -> Result
         bail!("speech response has no recognizable '{format}' header");
     }
     Ok(GenerateResult {
+        status: crate::domain::GenerationStatus::Complete,
         artifacts: vec![Artifact {
-            mode: MediaMode::Audio,
+            id: String::new(),
+            kind: MediaKind::Audio,
             mime: mime.into(),
             format: format.into(),
             bytes,
+            provenance: crate::domain::Provenance::Restored,
         }],
         ..Default::default()
     })

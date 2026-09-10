@@ -1,0 +1,5 @@
+operation = "image"
+input_types = ["text"]
+required_types = ["text"]
+output_types = ["image"]
+params = ["count", "size"]

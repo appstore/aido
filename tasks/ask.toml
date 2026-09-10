@@ -1,0 +1,6 @@
+# The ad-hoc task: whatever -p asks for, over any material given.
+operation = "generate"
+input_types = ["text", "image"]
+output_types = ["text"]
+# ask runs on the instruction alone when no material is given.
+requires_material = false

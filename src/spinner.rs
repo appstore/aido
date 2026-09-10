@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr as _;
 pub struct Spinner {
     stop: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
+    message: Arc<std::sync::Mutex<String>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -20,9 +21,10 @@ impl Spinner {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
+        let message = Arc::new(std::sync::Mutex::new(msg.to_string()));
         let flag = stop.clone();
         let counter = progress.clone();
-        let msg = msg.to_string();
+        let shared_msg = message.clone();
         let handle = std::thread::spawn(move || {
             const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
@@ -31,6 +33,7 @@ impl Spinner {
             // what the previous one printed instead of overwriting in place.
             let mut last_width = 0usize;
             while !flag.load(Ordering::Relaxed) {
+                let msg = shared_msg.lock().map(|m| m.clone()).unwrap_or_default();
                 let line = spinner_line(
                     FRAMES[i % FRAMES.len()],
                     &msg,
@@ -50,6 +53,7 @@ impl Spinner {
         Self {
             stop,
             progress,
+            message,
             handle: Some(handle),
         }
     }
@@ -58,6 +62,7 @@ impl Spinner {
         Self {
             stop: Arc::new(AtomicBool::new(true)),
             progress: Arc::new(AtomicU64::new(0)),
+            message: Arc::new(std::sync::Mutex::new(String::new())),
             handle: None,
         }
     }
@@ -67,6 +72,13 @@ impl Spinner {
     /// look like a stuck zero.
     pub fn set_progress(&self, chars: u64) {
         self.progress.store(chars, Ordering::Relaxed);
+    }
+
+    /// Replace the message line (per-request labels during multi-request runs).
+    pub fn set_message(&self, msg: &str) {
+        if let Ok(mut message) = self.message.lock() {
+            *message = msg.to_string();
+        }
     }
 
     pub fn stop(mut self) {

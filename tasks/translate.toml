@@ -1,0 +1,15 @@
+operation = "generate"
+instruction = """
+Translate the user's text.
+- Keep markdown structure and formatting intact. Never translate or alter code inside fenced code blocks.
+- Output only the translation, no explanations.
+"""
+# The target language arrives as a `Target language:` line after the
+# instruction; `--to` sets it ("auto" = English to Simplified Chinese,
+# any other language to English).
+input_types = ["text"]
+output_types = ["text"]
+params = ["to"]
+
+[defaults]
+to = "auto"

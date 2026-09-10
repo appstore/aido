@@ -1,189 +1,589 @@
-use crate::cli::OutputMode;
+//! Delivery: one artifact set, four destination kinds, one report.
+//!
+//! Order of operations (contract §step 7): validate every artifact, then
+//! commit files and directories (atomic, no-clobber by default), then the
+//! clipboard. A failure in one destination keeps earlier successes and
+//! fails the run with exit code 5; the result itself stays recoverable in
+//! history.
+
 use crate::clipboard;
-use anyhow::{Context, Result};
-use std::path::Path;
+use crate::domain::{
+    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, MediaKind,
+};
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
-pub fn emit(result: &str, mode: OutputMode, hold_secs: u64, save: Option<&Path>) -> Result<()> {
-    if matches!(mode, OutputMode::Stdout | OutputMode::Both) {
-        println!("{result}");
-    }
-    finish(result, mode, hold_secs, save)
+/// Everything delivery needs to know about a finished generation.
+pub struct DeliverArgs<'a> {
+    pub artifacts: &'a [Artifact],
+    /// Kinds the run asked to produce; extra kinds stay in history but are
+    /// not delivered.
+    pub produce: &'a [MediaKind],
+    pub destinations: &'a [Destination],
+    pub overwrite: bool,
+    /// Live streaming already printed the text (only the final newline may
+    /// still be missing).
+    pub live_stdout: bool,
+    pub hold_secs: u64,
+    pub quiet: bool,
+    pub json: bool,
+    pub run_id: &'a str,
+    pub task: Option<&'a str>,
 }
 
-/// The clipboard / `--save` half of [`emit`], for callers that already
-/// streamed the result to stdout themselves.
-pub fn finish(result: &str, mode: OutputMode, hold_secs: u64, save: Option<&Path>) -> Result<()> {
-    if let Some(path) = save {
-        // An empty reply saves nothing (main already warned): an empty file
-        // would read as saved content.
-        if !result.trim().is_empty() {
-            save_to_file(result, path)?;
-        }
-    }
-    if matches!(mode, OutputMode::Clipboard | OutputMode::Both) {
-        // A trailing newline in the clipboard is almost never wanted when pasting.
-        let text = result.trim_end();
-        clipboard::write_text(text, hold_secs)?;
-        eprintln!("copied {} chars to clipboard", text.chars().count());
-    }
-    Ok(())
+pub struct DeliveryOutcome {
+    pub states: Vec<DeliveryState>,
+    /// artifact id → absolute saved path (for the JSON report).
+    pub saved: BTreeMap<String, PathBuf>,
 }
 
-/// Write the result to an explicit `--save` path, creating parent dirs.
-pub fn save_to_file(result: &str, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
+/// Deliver everywhere the plan says. Returns per-destination states; on any
+/// failure the run exits 5 — with successes kept — via the returned error.
+pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
+    let delivered: Vec<&Artifact> = args
+        .artifacts
+        .iter()
+        .filter(|a| args.produce.contains(&a.kind))
+        .collect();
+    if delivered.is_empty() {
+        return Err(AppError::generation(
+            "nothing to deliver: the run produced none of the requested kinds",
+        ));
     }
-    std::fs::write(path, result).with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("saved result to {}", path.display());
-    Ok(())
-}
 
-/// Validate the intended sink before making a potentially expensive request.
-pub fn validate_destination(
-    modes: &[crate::api::MediaMode],
-    output: OutputMode,
-    save: Option<&Path>,
-    save_dir: Option<&Path>,
-) -> Result<()> {
-    use crate::api::MediaMode;
-    use std::io::IsTerminal;
-    if modes.contains(&MediaMode::Audio)
-        && matches!(output, OutputMode::Clipboard | OutputMode::Both)
-    {
-        anyhow::bail!("audio clipboard output is not supported; use --save or pipe stdout");
+    // Late re-validation: what came back must fit the destinations.
+    let has_stdout = args.destinations.contains(&Destination::Stdout);
+    if has_stdout && !args.json && delivered.len() > 1 {
+        return Err(AppError::generation(
+            "several artifacts cannot share bare stdout; use --out-dir",
+        ));
     }
-    if modes.contains(&MediaMode::Image)
-        && modes.contains(&MediaMode::Text)
-        && matches!(output, OutputMode::Clipboard | OutputMode::Both)
-    {
-        anyhow::bail!("mixed text/image clipboard output is ambiguous; use --save-dir");
+    let file_dest = args.destinations.iter().find_map(|d| match d {
+        Destination::File { path } => Some(path.clone()),
+        _ => None,
+    });
+    if let Some(path) = &file_dest {
+        if delivered.len() != 1 {
+            return Err(AppError::generation(format!(
+                "{} artifacts cannot go to one file ({}); use --out-dir",
+                delivered.len(),
+                path.display()
+            )));
+        }
+        let artifact = delivered[0];
+        if let Err(e) = check_extension(artifact, path) {
+            return Err(AppError::usage(e));
+        }
     }
-    if modes.iter().any(|m| *m != MediaMode::Text)
-        && matches!(output, OutputMode::Stdout | OutputMode::Both)
-        && save.is_none()
-        && save_dir.is_none()
-        && std::io::stdout().is_terminal()
-    {
-        anyhow::bail!("binary output needs --save / --save-dir or a stdout pipe");
+    let dir_dest = args.destinations.iter().find_map(|d| match d {
+        Destination::Directory { path } => Some(path.clone()),
+        _ => None,
+    });
+    if args.destinations.contains(&Destination::Clipboard) {
+        if delivered.len() != 1 {
+            return Err(AppError::delivery(
+                "the clipboard takes exactly one artifact; use --out-dir",
+            ));
+        }
+        if delivered[0].kind == MediaKind::Audio {
+            return Err(AppError::delivery(
+                "audio cannot go to the clipboard; use -o FILE",
+            ));
+        }
     }
-    if modes.contains(&MediaMode::Text)
-        && modes.iter().any(|m| *m != MediaMode::Text)
-        && save_dir.is_none()
-    {
-        anyhow::bail!("mixed output modes require --save-dir");
-    }
-    Ok(())
-}
 
-pub fn emit_result(
-    result: &crate::api::GenerateResult,
-    mode: OutputMode,
-    hold_secs: u64,
-    save: Option<&Path>,
-    save_dir: Option<&Path>,
-    text_streamed: bool,
-) -> Result<()> {
-    use crate::api::MediaMode;
-    use anyhow::bail;
-    use std::io::{IsTerminal, Write};
-    for artifact in &result.artifacts {
-        artifact.validate()?;
-    }
-    if result.artifacts.is_empty() && save_dir.is_none() {
-        return if text_streamed {
-            finish(&result.text, mode, hold_secs, save)
-        } else {
-            emit(&result.text, mode, hold_secs, save)
-        };
-    }
-    let has_text = !result.text.is_empty();
-    let count = result.artifacts.len() + usize::from(has_text);
-    if save.is_some() && count != 1 {
-        bail!("response has {count} outputs; use --save-dir instead of --save");
-    }
-    let copy = matches!(mode, OutputMode::Clipboard | OutputMode::Both);
-    if copy
-        && !result.artifacts.is_empty()
-        && (count != 1 || result.artifacts[0].mode != MediaMode::Image)
-    {
-        bail!("clipboard supports one text or image output; use --save-dir for this response");
-    }
-    let stdout = matches!(mode, OutputMode::Stdout | OutputMode::Both);
-    if stdout
-        && save.is_none()
-        && save_dir.is_none()
-        && !result.artifacts.is_empty()
-        && (count != 1 || std::io::stdout().is_terminal())
-    {
-        bail!("binary or mixed output needs --save / --save-dir, or pipe a single artifact");
-    }
-    if let Some(dir) = save_dir {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        if has_text {
-            save_to_file(&result.text, &dir.join("text.txt"))?;
-        }
-        for (index, artifact) in result.artifacts.iter().enumerate() {
-            save_bytes(
-                &artifact.bytes,
-                &dir.join(format!(
-                    "{}-{}.{}",
-                    artifact.mode,
-                    index + 1,
-                    artifact.format
-                )),
-            )?;
-        }
-    } else if let Some(path) = save {
-        if let Some(artifact) = result.artifacts.first() {
-            validate_extension(&artifact.format, path)?;
-            save_bytes(&artifact.bytes, path)?;
-        }
-    }
-    if copy {
-        if let Some(artifact) = result.artifacts.first() {
-            clipboard::write_image(&artifact.bytes, hold_secs)?;
-            eprintln!("copied image to clipboard");
-        } else {
-            clipboard::write_text(result.text.trim_end(), hold_secs)?;
-        }
-    }
-    if stdout {
-        if has_text && !text_streamed {
-            println!("{}", result.text);
-        } else if has_text && text_streamed {
-            println!();
-        }
-        if save.is_none() && save_dir.is_none() {
-            if let Some(artifact) = result.artifacts.first() {
-                std::io::stdout().write_all(&artifact.bytes)?;
+    let mut states: Vec<DeliveryState> = Vec::new();
+    let mut saved: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut failed: Option<AppError> = None;
+
+    // --- stdout (the body; the JSON report prints later, after paths exist)
+    if has_stdout && !args.json {
+        match stdout_body(&delivered, args.live_stdout) {
+            Ok(()) => states.push(DeliveryState {
+                destination: Destination::Stdout,
+                status: DeliveryStatus::Succeeded,
+            }),
+            Err(e) => {
+                failed = Some(AppError::delivery(format!("stdout: {}", e.chain())));
+                states.push(DeliveryState {
+                    destination: Destination::Stdout,
+                    status: DeliveryStatus::Failed { error: e.chain() },
+                });
             }
         }
     }
-    Ok(())
-}
 
-fn save_bytes(bytes: &[u8], path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("saved result to {}", path.display());
-    Ok(())
-}
-
-pub fn validate_extension(format: &str, path: &Path) -> Result<()> {
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        let extension = extension.to_ascii_lowercase();
-        if extension != format
-            && !(extension == "jpg" && format == "jpeg")
-            && !(extension == "ogg" && format == "opus")
-        {
-            anyhow::bail!("output format is '{format}', but --save has extension '{extension}'; select --option format=... or use the matching extension");
+    // --- single file
+    if let Some(path) = &file_dest {
+        let artifact = delivered[0];
+        match write_file_atomic(&artifact.bytes, path, args.overwrite) {
+            Ok(()) => {
+                if !args.quiet {
+                    eprintln!("saved result to {}", path.display());
+                }
+                saved.insert(artifact.id.clone(), absolute(path));
+                states.push(DeliveryState {
+                    destination: Destination::File { path: path.clone() },
+                    status: DeliveryStatus::Succeeded,
+                });
+            }
+            Err(e) => {
+                failed = failed.or(Some(AppError::delivery(format!(
+                    "{}: {}",
+                    path.display(),
+                    e.chain()
+                ))));
+                states.push(DeliveryState {
+                    destination: Destination::File { path: path.clone() },
+                    status: DeliveryStatus::Failed { error: e.chain() },
+                });
+            }
         }
     }
+
+    // --- directory with manifest
+    if let Some(dir) = &dir_dest {
+        match write_directory(
+            delivered.as_slice(),
+            dir,
+            args.run_id,
+            args.overwrite,
+            args.quiet,
+        ) {
+            Ok(paths) => {
+                for (id, path) in paths {
+                    saved.insert(id, path);
+                }
+                states.push(DeliveryState {
+                    destination: Destination::Directory { path: dir.clone() },
+                    status: DeliveryStatus::Succeeded,
+                });
+            }
+            Err(e) => {
+                failed = failed.or(Some(AppError::delivery(format!(
+                    "{}: {}",
+                    dir.display(),
+                    e.chain()
+                ))));
+                states.push(DeliveryState {
+                    destination: Destination::Directory { path: dir.clone() },
+                    status: DeliveryStatus::Failed { error: e.chain() },
+                });
+            }
+        }
+    }
+
+    // --- clipboard last
+    if args.destinations.contains(&Destination::Clipboard) {
+        let artifact = delivered[0];
+        let result = match artifact.kind {
+            MediaKind::Text => clipboard::write_text(
+                std::str::from_utf8(&artifact.bytes)
+                    .unwrap_or_default()
+                    .trim_end(),
+                args.hold_secs,
+            ),
+            _ => clipboard::write_image(&artifact.bytes, args.hold_secs),
+        };
+        match result {
+            Ok(()) => {
+                if !args.quiet {
+                    match artifact.kind {
+                        MediaKind::Text => eprintln!(
+                            "copied {} chars to clipboard",
+                            String::from_utf8_lossy(&artifact.bytes).chars().count()
+                        ),
+                        _ => eprintln!("copied image to clipboard"),
+                    }
+                }
+                states.push(DeliveryState {
+                    destination: Destination::Clipboard,
+                    status: DeliveryStatus::Succeeded,
+                });
+            }
+            Err(e) => {
+                failed = failed.or(Some(AppError::delivery(format!("clipboard: {e:#}"))));
+                states.push(DeliveryState {
+                    destination: Destination::Clipboard,
+                    status: DeliveryStatus::Failed {
+                        error: format!("{e:#}"),
+                    },
+                });
+            }
+        }
+    }
+
+    // --- the JSON report replaces the body on stdout
+    if args.json {
+        states.insert(
+            0,
+            DeliveryState {
+                destination: Destination::Stdout,
+                status: DeliveryStatus::Succeeded,
+            },
+        );
+        let report = json_report(args, &delivered, &states, &saved, failed.as_ref());
+        let mut out = std::io::stdout().lock();
+        let print = (|| {
+            serde_json::to_writer_pretty(&mut out, &report)
+                .map_err(|e| AppError::delivery(e.to_string()))?;
+            out.write_all(b"\n")
+                .map_err(|e| AppError::delivery(e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = print {
+            failed = failed.or(Some(e));
+            states[0] = DeliveryState {
+                destination: Destination::Stdout,
+                status: DeliveryStatus::Failed {
+                    error: "json report write failed".into(),
+                },
+            };
+        }
+    }
+
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(DeliveryOutcome { states, saved }),
+    }
+}
+
+fn stdout_body(delivered: &[&Artifact], live: bool) -> AppResult<()> {
+    let artifact = delivered[0];
+    let mut out = std::io::stdout().lock();
+    match artifact.kind {
+        MediaKind::Text => {
+            let text = std::str::from_utf8(&artifact.bytes)
+                .map_err(|_| AppError::generation("text artifact is not valid UTF-8"))?;
+            if live {
+                // Deltas already went out: close the line only.
+                if !text.is_empty() && !text.ends_with('\n') {
+                    out.write_all(b"\n")
+                        .map_err(|e| AppError::delivery(e.to_string()))?;
+                }
+            } else {
+                out.write_all(text.as_bytes())
+                    .map_err(|e| AppError::delivery(e.to_string()))?;
+                if !text.is_empty() && !text.ends_with('\n') {
+                    out.write_all(b"\n")
+                        .map_err(|e| AppError::delivery(e.to_string()))?;
+                }
+            }
+            out.flush().map_err(|e| AppError::delivery(e.to_string()))?;
+            Ok(())
+        }
+        _ => {
+            // Raw bytes, exactly one artifact, no trailing newline. The
+            // plan already refused this on a terminal stdout.
+            out.write_all(&artifact.bytes)
+                .map_err(|e| AppError::delivery(e.to_string()))?;
+            out.flush().map_err(|e| AppError::delivery(e.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return Ok(());
+    };
+    if artifact.kind == MediaKind::Text {
+        // Text has no container format; any extension is fine.
+        return Ok(());
+    }
+    let extension = extension.to_ascii_lowercase();
+    let format = &artifact.format;
+    let ok = extension == format.as_str()
+        || (extension == "jpg" && format == "jpeg")
+        || (extension == "ogg" && format == "opus")
+        || (extension == "txt" && artifact.kind == MediaKind::Text);
+    if !ok {
+        return Err(format!(
+            "output format is '{format}', but the file is named '.{extension}'; \
+             pick --format to match or rename the target"
+        ));
+    }
     Ok(())
+}
+
+/// Write bytes via a same-directory temp file, then commit without
+/// clobbering an existing target (hard link on Unix, exclusive create
+/// elsewhere). `--overwrite` swaps the commit for an atomic rename.
+pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) -> AppResult<()> {
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = parent {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AppError::delivery(format!("cannot create {}: {e}", dir.display())))?;
+    }
+    let temp = target.with_extension(format!(
+        "{}.aido-tmp-{}",
+        target
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let write_temp = || -> AppResult<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
+        file.write_all(bytes)
+            .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        file.sync_all()
+            .map_err(|e| AppError::delivery(format!("cannot flush {}: {e}", temp.display())))?;
+        Ok(())
+    };
+    write_temp()?;
+
+    let commit = || -> AppResult<()> {
+        if overwrite {
+            std::fs::rename(&temp, target).map_err(|e| {
+                AppError::delivery(format!("cannot replace {}: {e}", target.display()))
+            })
+        } else if target.exists() {
+            Err(AppError::delivery(format!(
+                "{} already exists; use --overwrite to replace it",
+                target.display()
+            )))
+        } else {
+            std::fs::rename(&temp, target)
+                .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", target.display())))
+        }
+    };
+    match commit() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e)
+        }
+    }
+}
+
+/// Directory delivery: artifact files first (each atomically committed),
+/// the manifest last — a directory without a manifest is an unfinished
+/// write, never a success story.
+fn write_directory(
+    artifacts: &[&Artifact],
+    dir: &Path,
+    run_id: &str,
+    overwrite: bool,
+    quiet: bool,
+) -> AppResult<Vec<(String, PathBuf)>> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| AppError::delivery(format!("cannot create {}: {e}", dir.display())))?;
+    let mut saved = Vec::new();
+    let mut names: Vec<serde_json::Value> = Vec::new();
+    for artifact in artifacts {
+        let name = artifact_file_name(artifact);
+        let path = dir.join(&name);
+        write_file_atomic(&artifact.bytes, &path, overwrite)
+            .map_err(|e| AppError::delivery(format!("{}: {}", path.display(), e.chain())))?;
+        if !quiet {
+            eprintln!("saved result to {}", path.display());
+        }
+        names.push(serde_json::json!({
+            "id": artifact.id,
+            "kind": artifact.kind.to_string(),
+            "mime": artifact.mime,
+            "file": name,
+            "size": artifact.bytes.len(),
+        }));
+        saved.push((artifact.id.clone(), absolute(&path)));
+    }
+    let manifest = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "artifacts": names,
+    });
+    let manifest_path = dir.join("manifest.json");
+    write_file_atomic(
+        serde_json::to_string_pretty(&manifest)
+            .unwrap_or_default()
+            .as_bytes(),
+        &manifest_path,
+        true, // the manifest is rewritten only by this run's commit
+    )?;
+    Ok(saved)
+}
+
+/// Program-generated names; a service-returned file name can never escape
+/// the target directory.
+fn artifact_file_name(artifact: &Artifact) -> String {
+    let extension = match artifact.kind {
+        MediaKind::Text => "txt",
+        _ => artifact.format.as_str(),
+    };
+    // Service-generated ids never choose the path: keep it a single name.
+    let safe: String = artifact
+        .id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{}.{}", safe.trim_matches('-'), extension)
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn json_report(
+    args: &DeliverArgs<'_>,
+    delivered: &[&Artifact],
+    states: &[DeliveryState],
+    saved: &BTreeMap<String, PathBuf>,
+    error: Option<&AppError>,
+) -> serde_json::Value {
+    let artifacts: Vec<serde_json::Value> = delivered
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "kind": a.kind.to_string(),
+                "mime": a.mime,
+                "format": a.format,
+                "size": a.bytes.len(),
+                "path": saved.get(&a.id).map(|p| p.display().to_string()),
+            })
+        })
+        .collect();
+    let deliveries: Vec<serde_json::Value> = states
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "destination": s.destination.to_string(),
+                "status": match &s.status {
+                    DeliveryStatus::Pending => "pending".to_string(),
+                    DeliveryStatus::Succeeded => "succeeded".to_string(),
+                    DeliveryStatus::Failed { error } => format!("failed: {error}"),
+                },
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "run_id": args.run_id,
+        "task": args.task,
+        "artifacts": artifacts,
+        "deliveries": deliveries,
+        "error": error.map(|e| serde_json::json!({
+            "kind": match e.kind {
+                crate::domain::ErrorKind::Usage => "usage",
+                crate::domain::ErrorKind::Service => "service",
+                crate::domain::ErrorKind::Generation => "generation",
+                crate::domain::ErrorKind::Delivery => "delivery",
+            },
+            "message": e.chain(),
+        })),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_artifact(id: &str, text: &str) -> Artifact {
+        Artifact {
+            id: id.into(),
+            kind: MediaKind::Text,
+            mime: "text/plain".into(),
+            format: "text".into(),
+            bytes: text.as_bytes().to_vec(),
+            provenance: crate::domain::Provenance::Request { index: 0 },
+        }
+    }
+
+    #[test]
+    fn stdout_only_delivery_prints_body_with_one_newline() {
+        let artifact = text_artifact("text", "hello");
+        let args = DeliverArgs {
+            artifacts: &[artifact],
+            produce: &[MediaKind::Text],
+            destinations: &[Destination::Stdout],
+            overwrite: false,
+            live_stdout: false,
+            hold_secs: 0,
+            quiet: true,
+            json: false,
+            run_id: "t",
+            task: Some("t"),
+        };
+        // Deliver to a real stdout is awkward in-process; the states tell
+        // the story.
+        let outcome = deliver(&args).unwrap();
+        assert_eq!(outcome.states.len(), 1);
+        assert!(outcome.states[0].status.is_succeeded());
+    }
+
+    #[test]
+    fn existing_file_is_not_clobbered() {
+        let dir = std::env::temp_dir().join(format!("aido-out-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.txt");
+        std::fs::write(&target, "original").unwrap();
+        let err = write_file_atomic(b"new", &target, false).unwrap_err();
+        assert!(err.chain().contains("already exists"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        write_file_atomic(b"new", &target, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_gets_files_then_manifest() {
+        let dir = std::env::temp_dir().join(format!("aido-out-dir-{}", std::process::id()));
+        let artifact = text_artifact("text", "body");
+        let saved = write_directory(&[&artifact], &dir, "run-1", false, true).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(dir.join("text.txt").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["run_id"], "run-1");
+        assert_eq!(manifest["artifacts"][0]["file"], "text.txt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extension_mismatch_is_rejected() {
+        let artifact = Artifact {
+            id: "image-1".into(),
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            format: "png".into(),
+            bytes: vec![1],
+            provenance: crate::domain::Provenance::Request { index: 0 },
+        };
+        assert!(check_extension(&artifact, Path::new("a.png")).is_ok());
+        assert!(check_extension(&artifact, Path::new("a.jpg")).is_err());
+        assert!(check_extension(&artifact, Path::new("a")).is_ok());
+    }
+
+    #[test]
+    fn file_names_cannot_escape_the_directory() {
+        let artifact = Artifact {
+            id: "../evil".into(),
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            format: "png".into(),
+            bytes: vec![1],
+            provenance: crate::domain::Provenance::Request { index: 0 },
+        };
+        let name = artifact_file_name(&artifact);
+        assert!(!name.contains(".."), "{name}");
+        assert!(!name.contains('/'), "{name}");
+    }
 }

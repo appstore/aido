@@ -1,5 +1,4 @@
 use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
-use crate::config::Resolved;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::time::Duration;
@@ -58,6 +57,15 @@ pub fn normalize_base_url(input: &str) -> Result<String> {
     Ok(url.into())
 }
 
+/// Everything the client needs to reach a service. Credentials are
+/// resolved by the caller at send time and never logged.
+pub struct Connection {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub timeout: Duration,
+    pub adapter: Adapter,
+}
+
 pub struct Client {
     http: reqwest::Client,
     base_url: reqwest::Url,
@@ -67,16 +75,16 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(resolved: &Resolved) -> Result<Self> {
+    pub fn new(conn: &Connection) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("aido/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .context("failed to build HTTP client")?,
-            base_url: reqwest::Url::parse(&resolved.base_url)?,
-            api_key: resolved.api_key.clone(),
-            timeout: Duration::from_secs(resolved.timeout_secs),
-            adapter: resolved.adapter,
+            base_url: reqwest::Url::parse(&conn.base_url)?,
+            api_key: conn.api_key.clone(),
+            timeout: conn.timeout,
+            adapter: conn.adapter,
         })
     }
 
@@ -95,7 +103,8 @@ impl Client {
             Adapter::Chat => req.json(&chat::encode(request, stream)?),
             Adapter::Responses => req.json(&responses::encode(request, stream)?),
             Adapter::Transcription => req.multipart(media::transcription(request)?),
-            _ => req.json(&media::encode(self.adapter, request)?),
+            Adapter::Speech => req.json(&media::encode_speech(request)?),
+            Adapter::Images => req.json(&media::encode_images(request)?),
         };
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -154,7 +163,7 @@ impl Client {
         if items.is_empty() {
             bail!("image response contains no images");
         }
-        let mut result = GenerateResult::default();
+        let mut result = GenerateResult::complete();
         for item in items {
             let artifact = if let Some(encoded) = item["b64_json"].as_str() {
                 media::image(encoded)?

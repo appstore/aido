@@ -1,6 +1,9 @@
-system = """
+operation = "generate"
+instruction = """
 Summarize the user's text concisely.
 - Respond in the same language as the input.
 - Start with a one-sentence summary, then 3-6 bullet points of key facts.
 - Output only the summary.
 """
+input_types = ["text"]
+output_types = ["text"]

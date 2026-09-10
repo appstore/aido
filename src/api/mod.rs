@@ -5,11 +5,13 @@ mod responses;
 mod sse;
 mod transport;
 
-use crate::input::UserContent;
+use crate::domain::{Artifact, GenerationStatus, InputPart, MediaKind};
 use anyhow::{bail, Result};
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
-pub use transport::{normalize_base_url, Client};
+use serde::Deserialize;
+pub use transport::{normalize_base_url, Client, Connection};
+
+pub type MediaMode = MediaKind;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -44,166 +46,23 @@ impl std::fmt::Display for Adapter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum MediaMode {
-    Text,
-    Image,
-    Audio,
-}
-
-impl std::fmt::Display for MediaMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Text => "text",
-            Self::Image => "image",
-            Self::Audio => "audio",
-        })
-    }
-}
-
-/// Allowed input types and required members are separate contracts. An omitted
-/// allow-list accepts every type supported by the adapter, not every type known
-/// to the application. CLI input modes constrain detected data; they never cast it.
-#[derive(Debug)]
-pub struct Modes {
-    pub inputs: Option<Vec<MediaMode>>,
-    pub required: Vec<MediaMode>,
-    pub outputs: Vec<MediaMode>,
-}
-
-impl Modes {
-    pub fn validate(&self, adapter: Adapter) -> Result<()> {
-        if self.inputs.as_ref().is_some_and(Vec::is_empty) || self.outputs.is_empty() {
-            bail!("input_modes and output_modes must not be empty");
-        }
-        for mode in self.inputs.iter().flatten().chain(&self.required) {
-            if !adapter.inputs().contains(mode) {
-                bail!("adapter '{adapter}' does not support input mode '{mode}'");
-            }
-        }
-        for mode in &self.outputs {
-            if !adapter.outputs().contains(mode) {
-                bail!("adapter '{adapter}' does not support output mode '{mode}'");
-            }
-        }
-        for mode in &self.required {
-            if self
-                .inputs
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(mode))
-            {
-                bail!("required input '{mode}' is excluded by input_modes / --input-mode");
-            }
-        }
-        Ok(())
-    }
-
-    pub fn validate_input(&self, user: &UserContent, adapter: Adapter) -> Result<()> {
-        let mut present = Vec::new();
-        if user.text.is_some() {
-            present.push(MediaMode::Text);
-        }
-        if !user.images.is_empty() {
-            present.push(MediaMode::Image);
-        }
-        if !user.audios.is_empty() {
-            present.push(MediaMode::Audio);
-        }
-        if present.is_empty()
-            || (user.images.is_empty()
-                && user.audios.is_empty()
-                && user.text.as_ref().is_some_and(|s| s.trim().is_empty()))
-        {
-            bail!("no input content to send");
-        }
-        for mode in &present {
-            if !adapter.inputs().contains(mode) {
-                bail!("adapter '{adapter}' does not support input mode '{mode}'");
-            }
-            if self
-                .inputs
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(mode))
-            {
-                bail!("input contains '{mode}', which is excluded by input_modes / --input-mode");
-            }
-        }
-        for mode in &self.required {
-            if !present.contains(mode) {
-                bail!("required input '{mode}' is missing");
-            }
-        }
-        Ok(())
-    }
-}
-
-pub struct GenerateRequest<'a> {
-    pub system: Option<&'a str>,
-    pub user: &'a UserContent,
-    pub model: &'a str,
-    pub max_tokens: Option<u64>,
-    pub temperature: Option<f64>,
-    pub outputs: &'a [MediaMode],
-    pub options: &'a std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompletionStatus {
-    #[default]
-    Complete,
-    Incomplete {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct GenerateResult {
-    pub text: String,
-    #[serde(default)]
-    pub artifacts: Vec<Artifact>,
-    pub status: CompletionStatus,
-    pub warnings: Vec<String>,
-}
-
-impl GenerateResult {
-    pub fn diagnostics(&self) -> Vec<String> {
-        let mut warnings = self.warnings.clone();
-        if let CompletionStatus::Incomplete { reason } = &self.status {
-            warnings.push(match reason.as_str() {
-                "length" | "max_output_tokens" => "reply hit the token limit and was truncated; raise --max-tokens / AIDO_MAX_TOKENS if text is missing".into(),
-                "content_filter" => "reply was cut short by the server's content filter".into(),
-                _ => format!("reply is incomplete: {reason}"),
-            });
-        }
-        warnings
-    }
-}
-
 impl Adapter {
-    pub fn inputs(self) -> &'static [MediaMode] {
-        use MediaMode::*;
+    pub fn inputs(self) -> &'static [MediaKind] {
+        use MediaKind::*;
         match self {
             Self::Chat | Self::Responses => &[Text, Image],
             Self::Speech | Self::Images => &[Text],
             Self::Transcription => &[Audio],
         }
     }
-    pub fn outputs(self) -> &'static [MediaMode] {
-        use MediaMode::*;
+    pub fn outputs(self) -> &'static [MediaKind] {
+        use MediaKind::*;
         match self {
             Self::Chat | Self::Transcription => &[Text],
             Self::Responses => &[Text, Image],
             Self::Speech => &[Audio],
             Self::Images => &[Image],
         }
-    }
-    pub fn default_outputs(self) -> Vec<MediaMode> {
-        vec![match self {
-            Self::Speech => MediaMode::Audio,
-            Self::Images => MediaMode::Image,
-            _ => MediaMode::Text,
-        }]
     }
     pub fn default_model(self) -> &'static str {
         match self {
@@ -263,38 +122,204 @@ impl Adapter {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Artifact {
-    pub mode: MediaMode,
-    pub mime: String,
-    pub format: String,
-    #[serde(with = "encoded_bytes")]
-    pub bytes: Vec<u8>,
+/// One request to one adapter. `instruction` is the task's fixed direction,
+/// `requirement` is this run's -p; they stay separate until the adapter
+/// maps them onto whatever instruction channel the protocol has.
+pub struct GenerateRequest<'a> {
+    pub instruction: Option<&'a str>,
+    pub requirement: Option<&'a str>,
+    pub inputs: &'a [InputPart],
+    pub model: &'a str,
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub outputs: &'a [MediaKind],
+    pub options: &'a std::collections::BTreeMap<String, serde_json::Value>,
 }
-mod encoded_bytes {
-    use base64::Engine as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .map_err(serde::de::Error::custom)
+
+impl GenerateRequest<'_> {
+    /// The full instruction channel content (fixed direction + -p), for
+    /// protocols with a single instructions field.
+    pub fn instruction_channel(&self) -> String {
+        [self.instruction, self.requirement]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
-impl Artifact {
-    pub fn validate(&self) -> Result<()> {
-        let formats: &[&str] = match self.mode {
-            MediaMode::Image => &["png", "jpeg", "webp"],
-            MediaMode::Audio => &["mp3", "opus", "aac", "flac", "wav", "pcm"],
-            MediaMode::Text => bail!("text must not be stored as a binary artifact"),
-        };
-        if !formats.contains(&self.format.as_str()) || self.bytes.is_empty() {
-            bail!("invalid {} artifact format or empty data", self.mode);
+/// One adapter response, in domain terms. Text is not an artifact yet —
+/// the runner promotes it when the run's artifacts are assembled. The
+/// default status is Complete because every parse path that keeps the
+/// default produced a fully-formed reply.
+#[derive(Debug, Default)]
+pub struct GenerateResult {
+    pub text: String,
+    pub artifacts: Vec<Artifact>,
+    pub status: GenerationStatus,
+    pub warnings: Vec<String>,
+}
+
+impl GenerateResult {
+    pub fn complete() -> Self {
+        Self {
+            status: GenerationStatus::Complete,
+            ..Default::default()
         }
-        Ok(())
+    }
+
+    pub fn complete_with_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            status: GenerationStatus::Complete,
+            ..Default::default()
+        }
+    }
+}
+
+impl GenerateResult {
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut warnings = self.warnings.clone();
+        if let GenerationStatus::Incomplete { reason } = &self.status {
+            warnings.push(match reason.as_str() {
+                "length" | "max_output_tokens" => {
+                    "reply hit the token limit and was truncated; set --max-tokens \
+                     higher if text is missing"
+                        .into()
+                }
+                "content_filter" => "reply was cut short by the server's content filter".into(),
+                _ => format!("reply is incomplete: {reason}"),
+            });
+        }
+        warnings
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared input helpers
+// ---------------------------------------------------------------------------
+
+/// Every text part in order, file-sourced ones labeled so the model can
+/// tell them apart. A lone file text is passed through untouched (old
+/// behavior); labels appear as soon as there is more than one text part
+/// or any media next to it.
+pub(crate) fn labeled_texts(inputs: &[InputPart]) -> Vec<String> {
+    let text_count = inputs.iter().filter(|p| p.kind == MediaKind::Text).count();
+    inputs
+        .iter()
+        .filter(|p| p.kind == MediaKind::Text)
+        .map(|p| {
+            let raw = p.text().unwrap_or_default();
+            let is_file = matches!(
+                p.source,
+                crate::domain::InputSource::File(_) | crate::domain::InputSource::Stdin
+            );
+            if is_file && (text_count > 1 || inputs.len() > 1) {
+                format!("--- {} ---\n\n{raw}", p.name)
+            } else {
+                raw.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Text-field routes (speech, image prompts) take one string: text parts
+/// in order, joined with a blank line.
+pub(crate) fn merged_text(inputs: &[InputPart]) -> Result<String> {
+    let parts = labeled_texts(inputs);
+    if parts.is_empty() {
+        bail!("this operation requires text material");
+    }
+    Ok(parts.join("\n\n"))
+}
+
+/// Image parts as PNG bytes (the only encoding the chat/responses routes
+/// send); non-PNG inputs are re-encoded here, at the adapter boundary.
+pub(crate) fn image_as_png(part: &InputPart) -> Result<Vec<u8>> {
+    let bytes = match &part.content {
+        crate::domain::InputContent::Media(b) => b,
+        _ => bail!("'{}' is not an image", part.name),
+    };
+    if part.mime == "image/png" {
+        return Ok(bytes.clone());
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("failed to decode image '{}': {e}", part.name))?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("failed to re-encode image '{}': {e}", part.name))?;
+    Ok(png)
+}
+
+pub(crate) fn single_audio(inputs: &[InputPart]) -> Result<&InputPart> {
+    let audios: Vec<&InputPart> = inputs
+        .iter()
+        .filter(|p| p.kind == MediaKind::Audio)
+        .collect();
+    match audios.len() {
+        1 => Ok(audios[0]),
+        0 => bail!("this operation requires exactly one audio input; none given"),
+        n => bail!("this operation requires exactly one audio input; {n} given"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{InputContent, InputSource};
+
+    fn text(name: &str, source: InputSource, s: &str) -> InputPart {
+        InputPart {
+            id: 0,
+            source,
+            name: name.into(),
+            kind: MediaKind::Text,
+            mime: "text/plain".into(),
+            content: InputContent::Text(s.into()),
+        }
+    }
+
+    #[test]
+    fn single_text_stays_raw() {
+        let parts = vec![text("a.txt", InputSource::File("a.txt".into()), "alpha\n")];
+        assert_eq!(labeled_texts(&parts), vec!["alpha\n"]);
+    }
+
+    #[test]
+    fn multiple_texts_are_labeled_in_order() {
+        let parts = vec![
+            text("a.txt", InputSource::File("a.txt".into()), "alpha\n"),
+            text("--text #1", InputSource::Literal, "literal\n"),
+            text("stdin", InputSource::Stdin, "piped\n"),
+        ];
+        let labeled = labeled_texts(&parts);
+        assert!(labeled[0].contains("--- a.txt ---"));
+        assert_eq!(labeled[1], "literal\n");
+        assert!(labeled[2].contains("piped\n"));
+    }
+
+    #[test]
+    fn merged_text_joins_with_blank_line() {
+        let parts = vec![
+            text("a.txt", InputSource::File("a.txt".into()), "alpha"),
+            text("b.txt", InputSource::File("b.txt".into()), "beta"),
+        ];
+        assert!(merged_text(&parts).unwrap().contains("\n\n"));
+    }
+
+    #[test]
+    fn instruction_channel_joins_both_parts() {
+        let req = GenerateRequest {
+            instruction: Some("be brief"),
+            requirement: Some("in english"),
+            inputs: &[],
+            model: "m",
+            max_tokens: None,
+            temperature: None,
+            outputs: &[],
+            options: &Default::default(),
+        };
+        assert_eq!(req.instruction_channel(), "be brief\n\nin english");
     }
 }

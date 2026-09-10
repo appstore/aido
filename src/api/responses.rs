@@ -1,26 +1,42 @@
-use super::{chat::png_data_url, CompletionStatus, GenerateRequest, GenerateResult};
+use super::chat::png_data_url;
+use super::{image_as_png, GenerateRequest, GenerateResult};
+use crate::domain::{GenerationStatus, MediaKind};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub(super) fn encode(spec: &GenerateRequest<'_>, stream: bool) -> Result<Value> {
-    if spec.user.text.is_none() && spec.user.images.is_empty() {
-        bail!("no input content to send");
-    }
     let mut parts = Vec::new();
-    if let Some(text) = &spec.user.text {
-        parts.push(json!({"type": "input_text", "text": text}));
+    for part in spec.inputs {
+        match part.kind {
+            MediaKind::Text => parts.push(json!({
+                "type": "input_text",
+                "text": part.text().unwrap_or_default()
+            })),
+            MediaKind::Image => parts.push(json!({
+                "type": "input_image",
+                "image_url": png_data_url(&image_as_png(part)?)
+            })),
+            MediaKind::Audio => bail!("the responses adapter does not take audio input"),
+        }
     }
-    for png in &spec.user.images {
-        parts.push(json!({"type": "input_image", "image_url": png_data_url(png)}));
+    if parts.is_empty() {
+        // An instruction-only run (`ask -p ...` with no material) is a
+        // valid request: the instruction is the whole user turn.
+        let instructions = spec.instruction_channel();
+        if instructions.is_empty() {
+            bail!("no input content to send");
+        }
+        parts.push(json!({"type": "input_text", "text": instructions}));
     }
     let mut body = json!({
         "model": spec.model,
         "input": [{"role": "user", "content": parts}],
         "store": false,
     });
-    if let Some(system) = spec.system.filter(|s| !s.trim().is_empty()) {
-        body["instructions"] = json!(system);
+    let instructions = spec.instruction_channel();
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
     }
     if let Some(tokens) = spec.max_tokens {
         body["max_output_tokens"] = json!(tokens);
@@ -28,7 +44,7 @@ pub(super) fn encode(spec: &GenerateRequest<'_>, stream: bool) -> Result<Value> 
     if let Some(temperature) = spec.temperature {
         body["temperature"] = json!(temperature);
     }
-    if spec.outputs.contains(&super::MediaMode::Image) {
+    if spec.outputs.contains(&MediaKind::Image) {
         let mut tool = json!({"type": "image_generation"});
         for (key, value) in spec.options {
             tool[if key == "format" {
@@ -75,16 +91,16 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
         serde_json::from_str(body).context("unexpected Responses response format")?;
     let mut result = GenerateResult::default();
     match response.status.as_str() {
-        "completed" => {}
+        "completed" => result.status = GenerationStatus::Complete,
         "incomplete" => {
-            result.status = CompletionStatus::Incomplete {
+            result.status = GenerationStatus::Incomplete {
                 reason: response
                     .incomplete_details
                     .as_ref()
                     .and_then(|d| d["reason"].as_str())
                     .unwrap_or("unknown")
                     .into(),
-            }
+            };
         }
         "failed" | "cancelled" => bail!(
             "Responses request {}: {}",
@@ -125,7 +141,7 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
             "image_generation_call" => {
                 if let Some(encoded) = item.result {
                     result.artifacts.push(super::media::image(&encoded)?);
-                } else if result.status == CompletionStatus::Complete {
+                } else if result.status == GenerationStatus::Complete {
                     bail!("image generation result is missing");
                 }
             }
@@ -215,6 +231,7 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn refusals_and_multiple_messages_preserve_text() {
         let body = json!({"status":"completed","output":[{"type":"reasoning"},{"type":"message","content":[{"type":"output_text","text":"one"},{"type":"refusal","refusal":"two"}]},{"type":"message","content":[{"type":"output_text","text":"three"}]}]});

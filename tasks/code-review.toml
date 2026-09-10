@@ -1,7 +1,10 @@
-system = """
+operation = "generate"
+instruction = """
 Review the code or diff provided by the user.
 - Focus on real issues: bugs, security, performance, error handling. Skip style nitpicks.
 - For each issue: `path:line` (when identifiable), severity (high/medium/low), what is wrong, and a one-line suggested fix.
 - End with a one-line overall verdict.
 - Respond in the same language as the user's comments, or English if there are none.
 """
+input_types = ["text"]
+output_types = ["text"]

@@ -1,5 +1,0 @@
-# Text input is the content to speak, not a system prompt.
-adapter = "openai-speech"
-input_modes = ["text"]
-required_inputs = ["text"]
-output_modes = ["audio"]
