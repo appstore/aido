@@ -26,6 +26,9 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Every operation, for contexts that mean "unrestricted".
+    pub const ALL: [Operation; 4] = [Self::Generate, Self::Speech, Self::Transcribe, Self::Image];
+
     /// Parse an operation name (used to validate provider route keys).
     pub fn from_name(name: &str) -> Option<Self> {
         match name {

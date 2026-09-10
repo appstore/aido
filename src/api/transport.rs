@@ -1,4 +1,6 @@
-use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
+use super::{
+    chat, edge, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::time::Duration;
@@ -58,32 +60,47 @@ pub fn normalize_base_url(input: &str) -> Result<String> {
 }
 
 /// Everything the client needs to reach a service. Credentials are
-/// resolved by the caller at send time and never logged.
+/// resolved by the caller at send time and never logged. `base_url` is
+/// `None` for adapters that own their endpoint (edge-tts).
 pub struct Connection {
-    pub base_url: String,
+    pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub timeout: Duration,
+    /// Whole-run budget. Consumed today only by the edge-tts adapter (it
+    /// bounds all chunks of one synthesis); HTTP adapters enforce only the
+    /// per-request `timeout`.
+    pub total_timeout: Option<Duration>,
     pub adapter: Adapter,
 }
 
 pub struct Client {
     http: reqwest::Client,
-    base_url: reqwest::Url,
+    base_url: Option<reqwest::Url>,
     api_key: Option<String>,
     timeout: Duration,
+    total_timeout: Option<Duration>,
     adapter: Adapter,
 }
 
 impl Client {
     pub fn new(conn: &Connection) -> Result<Self> {
+        let base_url = match conn.adapter {
+            Adapter::EdgeTts => None,
+            _ => Some(reqwest::Url::parse(
+                conn.base_url
+                    .as_deref()
+                    .context("provider has no base URL")?,
+            )?),
+        };
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("aido/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .context("failed to build HTTP client")?,
-            base_url: reqwest::Url::parse(&conn.base_url)?,
+            base_url,
             api_key: conn.api_key.clone(),
             timeout: conn.timeout,
+            total_timeout: conn.total_timeout,
             adapter: conn.adapter,
         })
     }
@@ -95,8 +112,13 @@ impl Client {
             Adapter::Speech => "audio/speech",
             Adapter::Transcription => "audio/transcriptions",
             Adapter::Images => "images/generations",
+            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
         };
-        let mut url = self.base_url.clone();
+        let base = self
+            .base_url
+            .as_ref()
+            .context("adapter has no HTTP base URL")?;
+        let mut url = base.clone();
         url.set_path(&format!("{}/{path}", url.path().trim_end_matches('/')));
         let req = self.http.post(url);
         let mut req = match self.adapter {
@@ -105,6 +127,7 @@ impl Client {
             Adapter::Transcription => req.multipart(media::transcription(request)?),
             Adapter::Speech => req.json(&media::encode_speech(request)?),
             Adapter::Images => req.json(&media::encode_images(request)?),
+            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
         };
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -122,6 +145,9 @@ impl Client {
     }
 
     pub async fn generate(&self, request: &GenerateRequest<'_>) -> Result<GenerateResult> {
+        if self.adapter == Adapter::EdgeTts {
+            return edge::synthesize(request, self.timeout, self.total_timeout).await;
+        }
         let resp = self
             .post(request, false)?
             .timeout(self.timeout)

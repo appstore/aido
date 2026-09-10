@@ -42,7 +42,8 @@ pub struct Resolved {
     pub profile_name: String,
     pub provider_name: String,
     pub adapter: Adapter,
-    pub base_url: String,
+    /// None for adapters that own their endpoint (edge-tts).
+    pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub model: String,
     pub model_source: ParamSource,
@@ -72,6 +73,27 @@ fn select_profile_name(cli: &Cli, task: &Task, cfg: &Config) -> Result<String> {
         .default_profile
         .clone()
         .unwrap_or_else(|| "default".to_string()))
+}
+
+/// The adapter an operation falls back to when the provider has no
+/// explicit route for it.
+fn conventional_adapter(operation: Operation) -> Adapter {
+    match operation {
+        Operation::Transcribe => Adapter::Transcription,
+        Operation::Generate => Adapter::Chat,
+        Operation::Speech => Adapter::Speech,
+        Operation::Image => Adapter::Images,
+    }
+}
+
+/// The adapter that would serve `operation` on `provider`: its explicit
+/// route, else the operation's conventional adapter.
+pub(super) fn effective_adapter(operation: Operation, provider: &Provider) -> Adapter {
+    provider
+        .routes
+        .get(&operation.to_string())
+        .copied()
+        .unwrap_or_else(|| conventional_adapter(operation))
 }
 
 pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
@@ -122,24 +144,19 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
                  which is not defined in the config"
             )
         })?;
-    let Some(raw_base) = provider
-        .base_url
-        .clone()
-        .or_else(|| (provider_name == "openai").then(|| "https://api.openai.com/v1".into()))
-    else {
-        bail!("provider '{provider_name}' has no base_url");
-    };
-
-    // The operation's route: explicit provider route, else the operation's
-    // conventional adapter.
-    let adapter = match provider.routes.get(&task.operation.to_string()) {
-        Some(adapter) => *adapter,
-        None => match task.operation {
-            Operation::Generate => Adapter::Chat,
-            Operation::Speech => Adapter::Speech,
-            Operation::Transcribe => Adapter::Transcription,
-            Operation::Image => Adapter::Images,
-        },
+    // The operation's route first: explicit provider route, else the
+    // operation's conventional adapter. It decides whether a base URL is
+    // required at all — the edge-tts adapter owns its endpoint.
+    let adapter = effective_adapter(task.operation, &provider);
+    let base_url = if adapter == Adapter::EdgeTts {
+        None
+    } else {
+        let raw = provider
+            .base_url
+            .clone()
+            .or_else(|| (provider_name == "openai").then(|| "https://api.openai.com/v1".into()))
+            .with_context(|| format!("provider '{provider_name}' has no base_url"))?;
+        Some(crate::api::normalize_base_url(&raw)?)
     };
 
     if let Some(ops) = &profile.operations {
@@ -273,8 +290,6 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         options.insert(key.into(), value);
     }
     adapter.validate_options(&options)?;
-
-    let base_url = crate::api::normalize_base_url(&raw_base)?;
 
     Ok(Resolved {
         profile_name,

@@ -12,6 +12,7 @@ pub use resolve::{resolve, ParamSource, Resolved};
 
 use crate::api::Adapter;
 use crate::domain::MediaKind;
+use crate::tasks::Operation;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -143,7 +144,10 @@ fn parse_config(path: &Path) -> Result<Config> {
 }
 
 /// A config with the built-in default provider: official OpenAI, key from
-/// AIDO_API_KEY / OPENAI_API_KEY. Keeps zero-config usage working.
+/// AIDO_API_KEY / OPENAI_API_KEY. Keeps zero-config usage working. Speech
+/// routes to the keyless Edge TTS adapter — the one operation that can run
+/// without any credentials, so the zero-config default makes it work
+/// instead of failing on a missing API key.
 pub fn default_config() -> Config {
     let mut cfg = Config::default();
     cfg.providers.insert(
@@ -151,7 +155,9 @@ pub fn default_config() -> Config {
         Provider {
             base_url: Some("https://api.openai.com/v1".into()),
             api_key_env: Some("AIDO_API_KEY".into()),
-            routes: BTreeMap::new(),
+            // The edge-tts adapter owns its endpoint and ignores this
+            // provider's connection entirely.
+            routes: BTreeMap::from([("speech".to_string(), crate::api::Adapter::EdgeTts)]),
         },
     );
     cfg.profiles.insert(
@@ -177,7 +183,16 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 "profile '{name}' references unknown provider '{provider_name}'"
             )),
             Some(provider) => {
-                if provider.base_url.is_none() {
+                // The edge-tts adapter owns its endpoint; base_url is only
+                // required when some operation the profile allows resolves
+                // to an adapter that does not own its endpoint. Unrouted
+                // operations fall back to conventional adapters, so an
+                // edge-only route table does not cover them.
+                let allowed = profile.operations.as_deref().unwrap_or(&Operation::ALL);
+                let needs_base = allowed
+                    .iter()
+                    .any(|&op| resolve::effective_adapter(op, provider) != Adapter::EdgeTts);
+                if needs_base && provider.base_url.is_none() {
                     issues.push(format!(
                         "provider '{provider_name}' (used by '{name}'): missing base_url"
                     ));
@@ -311,4 +326,21 @@ model = "YOUR_MODEL"
 # output_types = ["image"]
 #
 # Then: aido tts --text "hello" -o hello.mp3 --profile speech
+
+# Free speech synthesis via Microsoft Edge's Read Aloud protocol (no API
+# key, no base_url — the adapter owns its endpoint). Unofficial interface:
+# Microsoft rotates its DRM constants, so keep the kothok-edge-tts
+# dependency current.
+# [providers.edge]
+# routes = { speech = "edge-tts" }
+#
+# [profiles.edge]
+# provider = "edge"
+# model = "edge"
+# operations = ["speech"]
+# output_types = ["audio"]
+# [profiles.edge.options]
+# voice = "zh-CN-XiaoxiaoNeural"   # default; speed 0.25..4 via --speed
+#
+# Then: aido tts --text "你好" -o hello.mp3 --profile edge
 "#;

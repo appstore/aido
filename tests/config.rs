@@ -374,3 +374,145 @@ fn config_check_requires_the_default_profile_to_exist_with_providers() {
         out.stdout()
     );
 }
+
+#[test]
+fn zero_config_tts_defaults_to_keyless_edge_tts() {
+    // The built-in fallback config routes speech to the Edge adapter so
+    // `aido tts` works without any config file or API key. The dry-run
+    // must not claim a missing key would fail the request — none is sent.
+    let out = run_tty(&["tts", "--dry-run"], &[]);
+    assert!(out.ok(), "stderr: {}", out.stderr());
+    let stdout = out.stdout();
+    assert!(stdout.contains("(route: edge-tts)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("endpoint owned by the edge-tts adapter"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("credentials: none required"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn config_check_requires_base_url_when_an_operation_escapes_the_edge_route() {
+    // The speech route points at edge-tts (which owns its endpoint), but
+    // the profile also allows an unrouted operation whose conventional
+    // adapter still needs a base_url; check must flag it before a run does.
+    let cfg = settings_config(
+        "default_profile = \"x\"\n[settings]\nhistory_keep = 0\n\
+         [profiles.x]\nprovider = \"srv\"\nmodel = \"edge\"\noperations = [\"speech\", \"generate\"]\n\
+         [providers.srv]\n[providers.srv.routes]\nspeech = \"edge-tts\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stdout()
+            .contains("provider 'srv' (used by 'x'): missing base_url"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn config_check_accepts_a_base_url_free_edge_only_provider() {
+    // When every operation the profile allows is routed to edge-tts, the
+    // provider needs no base_url and check must not ask for one.
+    let cfg = settings_config(
+        "default_profile = \"x\"\n[settings]\nhistory_keep = 0\n\
+         [profiles.x]\nprovider = \"srv\"\nmodel = \"edge\"\noperations = [\"speech\"]\n\
+         [providers.srv]\n[providers.srv.routes]\nspeech = \"edge-tts\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("config ok"), "{}", out.stdout());
+}
+
+#[test]
+fn zero_config_text_tasks_still_default_to_openai() {
+    // Only speech gets the keyless default; text tasks still point at the
+    // OpenAI-compatible provider (they need a key to actually run).
+    let out = run_tty(&["ask", "--dry-run", "-p", "hi"], &[]);
+    assert!(out.ok(), "stderr: {}", out.stderr());
+    assert!(
+        out.stdout().contains("(route: openai-chat)"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn edge_tts_refuses_a_prompt_while_building_the_plan() {
+    // The adapter has no instruction channel; the plan builder refuses the
+    // run before anything executes, so even --dry-run reports it (exit 2,
+    // a usage error — not a mid-synthesis failure). The message names the
+    // source: here, -p.
+    let out = run_tty(
+        &[
+            "tts",
+            "--dry-run",
+            "--text",
+            "你好",
+            "-o",
+            "hello.mp3",
+            "-p",
+            "不要读这句",
+        ],
+        &[],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no instruction channel"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        out.stderr().contains("-p would have nowhere to go"),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn edge_tts_refuses_a_task_fixed_instruction_and_names_the_source() {
+    // A custom speech task may carry a fixed instruction; on the keyless
+    // zero-config edge route the plan refuses it even without -p, and the
+    // message points at the actual source instead of blanket "drop -p".
+    let tasks = temp_dir("edge-instruction-task");
+    std::fs::write(
+        tasks.join("briefing.toml"),
+        "operation = \"speech\"\n\
+         input_types = [\"text\"]\n\
+         required_types = [\"text\"]\n\
+         output_types = [\"audio\"]\n\
+         instruction = \"用轻快的语气朗读\"\n",
+    )
+    .unwrap();
+    let out = run_tty(
+        &[
+            "run",
+            "briefing",
+            "--dry-run",
+            "--text",
+            "你好",
+            "-o",
+            "hello.mp3",
+        ],
+        &[("AIDO_TASKS_DIR", tasks.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr()
+            .contains("the task's fixed instruction would have nowhere to go"),
+        "{}",
+        out.stderr()
+    );
+}

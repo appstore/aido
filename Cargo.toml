@@ -12,6 +12,12 @@ arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+# Edge TTS 适配器：非官方 Read Aloud 协议（DRM 常量会轮换，跟随 0.2.x 补丁更新）。
+# 已知代价：kothok 经由其 tokio-rustls 依赖的默认特性把 aws-lc-sys（源码构建
+# 需要 cmake）拉进依赖树，运行时 TLS 实际用 ring。上游修正特性声明后可移除，
+# CI 的依赖树检查会在 aws-lc-rs 消失时提醒。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+kothok-edge-tts = "0.2.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde = { version = "1", features = ["derive"] }

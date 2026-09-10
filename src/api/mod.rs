@@ -1,5 +1,6 @@
 //! Application-level generation contracts. Wire formats stay in adapters.
 mod chat;
+mod edge;
 mod media;
 mod responses;
 mod sse;
@@ -32,6 +33,9 @@ pub enum Adapter {
     #[serde(rename = "openai-images")]
     #[value(name = "openai-images")]
     Images,
+    #[serde(rename = "edge-tts")]
+    #[value(name = "edge-tts")]
+    EdgeTts,
 }
 
 impl std::fmt::Display for Adapter {
@@ -42,6 +46,7 @@ impl std::fmt::Display for Adapter {
             Self::Speech => "openai-speech",
             Self::Transcription => "openai-transcription",
             Self::Images => "openai-images",
+            Self::EdgeTts => "edge-tts",
         })
     }
 }
@@ -51,7 +56,7 @@ impl Adapter {
         use MediaKind::*;
         match self {
             Self::Chat | Self::Responses => &[Text, Image],
-            Self::Speech | Self::Images => &[Text],
+            Self::Speech | Self::EdgeTts | Self::Images => &[Text],
             Self::Transcription => &[Audio],
         }
     }
@@ -60,7 +65,7 @@ impl Adapter {
         match self {
             Self::Chat | Self::Transcription => &[Text],
             Self::Responses => &[Text, Image],
-            Self::Speech => &[Audio],
+            Self::Speech | Self::EdgeTts => &[Audio],
             Self::Images => &[Image],
         }
     }
@@ -69,6 +74,9 @@ impl Adapter {
             Self::Speech => "tts-1",
             Self::Transcription => "whisper-1",
             Self::Images => "gpt-image-1",
+            // Edge TTS ignores the model entirely; the profile slot accepts
+            // any placeholder without a `config check` warning.
+            Self::EdgeTts => "edge",
             _ => "gpt-4o-mini",
         }
     }
@@ -82,7 +90,7 @@ impl Adapter {
         let allowed: &[&str] = match self {
             Self::Chat => &[],
             Self::Responses => &["format", "size", "quality", "background"],
-            Self::Speech => &["voice", "format", "speed"],
+            Self::Speech | Self::EdgeTts => &["voice", "format", "speed"],
             Self::Transcription => &["language"],
             Self::Images => &["format", "size", "quality", "background", "n"],
         };
@@ -109,10 +117,11 @@ impl Adapter {
             }
         }
         if let Some(format) = options.get("format").and_then(|v| v.as_str()) {
-            let formats: &[&str] = if self == Self::Speech {
-                &["mp3", "opus", "aac", "flac", "wav", "pcm"]
-            } else {
-                &["png", "jpeg", "webp"]
+            let formats: &[&str] = match self {
+                Self::Speech => &["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                // The Edge endpoint emits exactly one output format.
+                Self::EdgeTts => &["mp3"],
+                _ => &["png", "jpeg", "webp"],
             };
             if !formats.contains(&format) {
                 bail!("unsupported format '{format}' for adapter '{self}'");
@@ -121,6 +130,12 @@ impl Adapter {
         Ok(())
     }
 }
+
+/// Shared refusal for the one adapter without an instruction channel: the
+/// plan-time check and the adapter's own send-time defense must stay worded
+/// identically.
+pub(crate) const EDGE_NO_INSTRUCTION_CHANNEL: &str =
+    "the 'edge-tts' adapter has no instruction channel";
 
 /// One request to one adapter. `instruction` is the task's fixed direction,
 /// `requirement` is this run's -p; they stay separate until the adapter

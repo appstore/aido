@@ -87,6 +87,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         base_url: plan.resolved.base_url.clone(),
         api_key,
         timeout: plan.timeout,
+        total_timeout: plan.total_timeout,
         adapter: plan.resolved.adapter,
     };
     let client = Client::new(&conn).map_err(AppError::from)?;

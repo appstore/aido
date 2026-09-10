@@ -111,6 +111,26 @@ pub fn build(
     )
     .map_err(|e| AppError::usage(e.to_string()))?;
     validate_inputs(task, &resolved, &inputs)?;
+    // Adapter capability: the edge-tts protocol has no instruction channel.
+    // Refusing at plan time (not just at send time) keeps --dry-run honest
+    // about a plan that could never execute.
+    if resolved.adapter == crate::api::Adapter::EdgeTts {
+        let from_task = !instruction.trim().is_empty();
+        let from_prompt = requirement.as_deref().is_some_and(|p| !p.trim().is_empty());
+        if from_task || from_prompt {
+            let source = match (from_task, from_prompt) {
+                (true, true) => "the task's fixed instruction and -p",
+                (true, false) => "the task's fixed instruction",
+                _ => "-p",
+            };
+            return Err(AppError::usage(format!(
+                "{}; {} would have nowhere to go — drop it, or use a provider \
+                 whose speech route has one",
+                crate::api::EDGE_NO_INSTRUCTION_CHANNEL,
+                source
+            )));
+        }
+    }
     let processor = select_processor(cli, task);
     let steps = processors::plan_steps(&inputs, processor, cli.quiet)
         .map_err(|e| AppError::usage(e.to_string()))?;
@@ -164,12 +184,18 @@ pub fn build(
         expected_counts.push((*kind, n));
     }
 
-    // Credential reference only: never the value.
-    let credentials_available = resolved.api_key_env.as_ref().map(|name| {
-        std::env::var(name)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-    });
+    // Credential reference only: never the value. Adapters that own their
+    // endpoint (edge-tts) take no credentials, so their plans report
+    // "none required" instead of pointing at a key that is never sent.
+    let credentials_available = if resolved.adapter == crate::api::Adapter::EdgeTts {
+        None
+    } else {
+        resolved.api_key_env.as_ref().map(|name| {
+            std::env::var(name)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+    };
 
     let param_sources = describe_param_sources(cli, task, &resolved);
 
@@ -594,11 +620,14 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         plan.task.operation
     ));
     out.push_str(&format!("profile:     {}\n", r.profile_name));
+    let shown_url = r
+        .base_url
+        .as_deref()
+        .map(redact_url)
+        .unwrap_or_else(|| "(endpoint owned by the edge-tts adapter)".to_string());
     out.push_str(&format!(
         "provider:    {} → {} (route: {})\n",
-        r.provider_name,
-        redact_url(&r.base_url),
-        r.adapter
+        r.provider_name, shown_url, r.adapter
     ));
     out.push_str(&format!("model:       {}\n", r.model));
     if !plan.instruction.is_empty() {

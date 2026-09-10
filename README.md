@@ -22,6 +22,8 @@ aido tts --text "你好" -o hello.mp3
 cargo install --path .
 ```
 
+> 源码构建需要系统装有 **cmake** 与 C 编译器：`tts` 的协议实现 `kothok-edge-tts` 经由其 `tokio-rustls` 依赖的默认特性引入了 `aws-lc-sys`（C 构建需要 cmake）。运行时 TLS 实际使用 ring，aws-lc 只是构建期的额外成本；上游修正特性声明后此要求即可移除（CI 的依赖树检查会在它消失时提醒）。
+
 ## 快速开始
 
 ```bash
@@ -34,6 +36,12 @@ export AIDO_API_KEY=sk-...
 # 3. 用起来
 aido ask -p "写一首秋天的诗"
 echo hello | aido translate
+```
+
+`tts` 无需任何配置和 key：只要运行时落到内置的 `openai` provider——完全没有配置文件时正属此类——语音合成默认走免费的 Edge TTS（微软非官方接口，输出 mp3）；文本类任务仍指向 OpenAI 兼容服务，需要 `AIDO_API_KEY`（或 `OPENAI_API_KEY`）。
+
+```bash
+aido tts --text "你好，世界" -o hello.mp3
 ```
 
 ## 命令结构
@@ -177,6 +185,30 @@ processor = "ocr-tiles"        # 或 "single"（默认）
 ```
 
 与管理命令（`tasks` / `profiles` / `config` / `history` / `last`）重名的任务用 `aido run NAME` 调用。未知字段会在报错里指出文件与字段名。
+
+## Edge TTS（免费语音合成）
+
+`tts` 任务除了 OpenAI 兼容的 speech 服务，还内置 `edge-tts` 适配器：走微软 Edge「大声朗读」的非官方接口，无需 API key。只要运行时落到内置的 `openai` provider（完全没有配置文件时正属此类），`aido tts` 默认就走这条免费路径；混用其他服务时也可以显式配置一个只有 speech 路由的 Provider（不需要 `base_url`，端点由适配器持有）：
+
+```toml
+[providers.edge]
+routes = { speech = "edge-tts" }
+
+[profiles.edge]
+provider = "edge"
+model = "edge"                  # 协议不使用模型名，占位即可
+operations = ["speech"]
+output_types = ["audio"]
+[profiles.edge.options]
+voice = "zh-CN-XiaoxiaoNeural"  # 默认音色，可省略
+```
+
+```bash
+aido tts --text "你好，世界" -o hello.mp3 --profile edge
+aido tts article.txt -o article.mp3 --profile edge --voice zh-CN-YunxiNeural --speed 1.2
+```
+
+输出固定为 mp3（24kHz），长文本按 ~4 KiB 转义预算自动分块、并发合成后按序拼接，整体受 `--total-timeout` 约束（未设置时以每个分块的单请求超时为界）。协议没有指令通道，带 `-p`（或任务的固定指令）的运行在生成执行计划时就会被拒绝，`--dry-run` 也会报告。注意：这是微软的非公开接口，DRM 常量随 Edge 版本轮换，接口可能随微软调整而失效（协议实现依赖 `kothok-edge-tts`，失效时跟随上游更新）。
 
 ## 长图 OCR
 
