@@ -207,6 +207,218 @@ fn history_list_and_show_work_on_recorded_runs() {
     assert_eq!(out.stdout(), "one\n");
 }
 
+/// A hand-written complete run record, for cases the live pipeline cannot
+/// produce on demand (fixed ids, a chosen prefix shape).
+fn fake_complete_run(dir: &std::path::Path, id: &str, text: &str) {
+    let run_dir = dir.join(id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("text.txt"), text).unwrap();
+    let manifest = format!(
+        r#"{{"version":1,"run_id":"{id}","task":"summarize","created_at":"2026-01-01T00:00:00Z","generation":{{"status":"complete"}},"artifacts":[{{"id":"text","kind":"text","mime":"text/plain","format":"text","file":"text.txt","size":{}}}]}}"#,
+        text.len()
+    );
+    std::fs::write(run_dir.join("manifest.json"), manifest).unwrap();
+}
+
+#[test]
+fn history_list_numbers_newest_first_and_show_takes_an_index() {
+    let dir = temp_dir("hist-index");
+    let envs = [("AIDO_HISTORY_DIR", dir.to_str().unwrap())];
+
+    // with no history at all, an index fails cleanly
+    let out = run(&["history", "show", "1"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no runs recorded"),
+        "stderr: {}",
+        out.stderr()
+    );
+
+    // two complete runs: "one" (older) then "two" (newest)
+    for text in ["one", "two"] {
+        let server = Server::json(chat_body(text));
+        let cfg = settings_config(&format!(
+            "[settings]\nhistory_keep = 5\n\
+             [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+             [providers.srv]\nbase_url = \"{}\"",
+            server.url()
+        ));
+        let out = run_with(
+            &["summarize", "--profile", "test"],
+            b"hi\n",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+            ],
+            cfg.to_str().unwrap(),
+        );
+        out.assert_code(0);
+    }
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 2);
+    let older = runs[0].file_name().unwrap().to_str().unwrap();
+    let newest = runs[1].file_name().unwrap().to_str().unwrap();
+
+    // the list is numbered newest first, and those numbers address `show`
+    let out = run(&["history", "list"], b"", &envs);
+    out.assert_code(0);
+    let lines: Vec<String> = out.stdout().lines().map(String::from).collect();
+    assert_eq!(lines.len(), 2, "{}", out.stdout());
+    assert!(lines[0].starts_with("1  "), "{}", out.stdout());
+    assert!(lines[0].contains(newest), "{}", out.stdout());
+    assert!(lines[1].starts_with("2  "), "{}", out.stdout());
+    assert!(lines[1].contains(older), "{}", out.stdout());
+
+    // `show 1` redelivers the newest run; delivery flags apply
+    let file = dir.join("out.txt");
+    let out = run(
+        &["history", "show", "1", "-o", file.to_str().unwrap()],
+        b"",
+        &envs,
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
+    let out = run(&["history", "show", "2"], b"", &envs);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "one\n");
+
+    // flags before the management word reach the restore too
+    let out = run(&["--json", "history", "show", "1"], b"", &envs);
+    out.assert_code(0);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("--json report: {e}; stdout: {}", out.stdout()));
+    assert_eq!(report["run_id"], newest);
+
+    // bad indexes
+    let out = run(&["history", "show", "0"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("start at 1"),
+        "stderr: {}",
+        out.stderr()
+    );
+    let out = run(&["history", "show", "3"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no run #3"),
+        "stderr: {}",
+        out.stderr()
+    );
+
+    // a number past usize overflows the parse into the same out-of-range
+    // message, quoting the digits as typed
+    let out = run(&["history", "show", "99999999999999999999999"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no run #99999999999999999999999"),
+        "stderr: {}",
+        out.stderr()
+    );
+    assert!(
+        out.stderr().contains("shows only 2"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn history_show_accepts_ids_and_unique_prefixes() {
+    let dir = temp_dir("hist-prefix");
+    let envs = [("AIDO_HISTORY_DIR", dir.to_str().unwrap())];
+    fake_complete_run(&dir, "20260101-000000.000", "A");
+    fake_complete_run(&dir, "20260101-000001.000", "B");
+
+    // the exact full id still works
+    let out = run(&["history", "show", "20260101-000000.000"], b"", &envs);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "A\n");
+
+    // a unique prefix resolves to its one run
+    let out = run(&["history", "show", "20260101-000000"], b"", &envs);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "A\n");
+
+    // an ambiguous prefix is refused with guidance (a pure-digit string
+    // would be an index, so the prefix keeps the '-')
+    let out = run(&["history", "show", "20260101-"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("ambiguous"),
+        "stderr: {}",
+        out.stderr()
+    );
+
+    // an unknown id is refused; digits stay index-only
+    let out = run(&["history", "show", "no-such-run"], b"", &envs);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no run 'no-such-run'"),
+        "stderr: {}",
+        out.stderr()
+    );
+
+    // index 1 is the newest of the two entries
+    let out = run(&["history", "show", "1"], b"", &envs);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "B\n");
+}
+
+#[test]
+fn history_show_on_an_incomplete_run_explains_and_points_to_last() {
+    let dir = temp_dir("hist-index-incomplete");
+    let envs = [("AIDO_HISTORY_DIR", dir.to_str().unwrap())];
+    let server = Server::json(chat_body("GOOD"));
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+
+    // then a truncated one: recorded, incomplete, exit 4
+    let server =
+        Server::json(r#"{"choices":[{"message":{"content":"CUT"},"finish_reason":"length"}]}"#);
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(4);
+
+    // index 1 is the literal newest entry, which is incomplete: explained,
+    // nothing delivered, and pointed at `last` / another index
+    let out = run(&["history", "show", "1"], b"", &envs);
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("incomplete"), "{stdout}");
+    assert!(stdout.contains("aido last"), "{stdout}");
+
+    // the older complete run is still addressable as #2
+    let out = run(&["history", "show", "2"], b"", &envs);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "GOOD\n");
+}
+
 #[test]
 fn retention_keeps_only_the_newest_runs() {
     let dir = temp_dir("hist-prune");

@@ -190,12 +190,14 @@ processor = "ocr-tiles"        # 或 "single"（默认）
 aido last                    # 重新输出最近一次完整结果
 aido last --copy             # 直接塞回剪贴板
 aido last --out-dir out/     # 落盘到目录
-aido history list            # 查看所有运行
-aido history show <RUN_ID>   # 输出某次运行
+aido history list            # 查看所有运行（最新在最前，带序号）
+aido history show 1          # 按序号输出某次运行（1 = 最新）
+aido history show 1 --copy   # 序号 + 交付旗标（-o / --out-dir / --json 同样适用）
+aido history show <RUN_ID>   # 也可以用完整 id，或能唯一确定的前缀
 aido ocr x.png --no-history  # 本次不留底
 ```
 
-`last` 只恢复**完整**生成；截断 / 失败的运行保留元数据用于诊断，但不当成可恢复结果。历史默认保留 50 条且总字节不超过 512 MiB（`history_keep` / `history_bytes`）。
+`last` 只恢复**完整**生成；截断 / 失败的运行保留元数据用于诊断，但不当成可恢复结果。`history show` 的序号按 `list` 显示顺序计数（包含不完整运行）：指向不完整运行时不交付，会提示换一个序号或用 `aido last`（它自动跳到最近的完整运行）。历史默认保留 50 条且总字节不超过 512 MiB（`history_keep` / `history_bytes`）。
 
 ## 解释与校验
 

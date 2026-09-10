@@ -687,10 +687,43 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum HistoryCmd {
-    /// List recorded runs
+    /// List recorded runs, newest first; the index addresses `show`
     List,
-    /// Show one run
-    Show { run_id: String },
+    /// Redeliver a recorded run
+    Show {
+        /// Which run: an index from `history list` (1 = newest), a run id,
+        /// or a unique prefix of one
+        #[arg(value_name = "RUN")]
+        target: String,
+
+        /// Save exactly one artifact to FILE ("-" for stdout)
+        #[arg(short = 'o', long, value_name = "FILE", conflicts_with = "out_dir")]
+        output: Option<PathBuf>,
+
+        /// Save the full artifact set plus a manifest into DIR
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
+
+        /// Write a single text or image artifact to the clipboard
+        #[arg(short = 'c', long)]
+        copy: bool,
+
+        /// Write the result body (or a single media artifact) to stdout
+        #[arg(long, conflicts_with = "json")]
+        stdout: bool,
+
+        /// Print a versioned run report on stdout instead of the body
+        #[arg(long)]
+        json: bool,
+
+        /// Replace an existing output file instead of failing
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Hide progress and success notes (errors still print)
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[cfg(test)]

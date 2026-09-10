@@ -15,6 +15,7 @@ use crate::tasks;
 use anyhow::Result;
 use clap::Parser as _;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Exit code for "the user pressed Ctrl+C".
@@ -106,7 +107,7 @@ async fn dispatch(
         Some(Commands::Tasks { cmd }) => return manage_tasks(cmd),
         Some(Commands::Profiles) => return manage_profiles(),
         Some(Commands::Config { cmd }) => return manage_config(cmd),
-        Some(Commands::History { cmd }) => return manage_history(cmd).await,
+        Some(Commands::History { cmd }) => return manage_history(&cli, cmd).await,
         Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs),
         None => {}
     }
@@ -317,6 +318,32 @@ fn print_help() {
 // Recovery
 // ---------------------------------------------------------------------------
 
+/// Output choices for redelivering a recorded run — the shared surface of
+/// `aido last` and `aido history show`.
+struct RestoreOptions {
+    output: Option<PathBuf>,
+    out_dir: Option<PathBuf>,
+    stdout: bool,
+    json: bool,
+    copy: bool,
+    overwrite: bool,
+    quiet: bool,
+}
+
+impl RestoreOptions {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            output: cli.output.clone(),
+            out_dir: cli.out_dir.clone(),
+            stdout: cli.stdout,
+            json: cli.json,
+            copy: cli.copy,
+            overwrite: cli.overwrite,
+            quiet: cli.quiet,
+        }
+    }
+}
+
 async fn run_last(cli: &Cli) -> AppResult<()> {
     let Some(record) = history::last_complete().map_err(|e| AppError::usage(format!("{e:#}")))?
     else {
@@ -324,10 +351,10 @@ async fn run_last(cli: &Cli) -> AppResult<()> {
             "no completed runs in history yet; only complete generations are recoverable",
         ));
     };
-    deliver_restored(cli, record).await
+    deliver_restored(&RestoreOptions::from_cli(cli), record).await
 }
 
-async fn manage_history(cmd: &HistoryCmd) -> AppResult<()> {
+async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
     match cmd {
         HistoryCmd::List => {
             let ids = history::list_ids().map_err(|e| AppError::usage(format!("{e:#}")))?;
@@ -335,42 +362,116 @@ async fn manage_history(cmd: &HistoryCmd) -> AppResult<()> {
                 println!("no runs recorded yet");
                 return Ok(());
             }
-            for id in ids.iter().rev() {
+            let width = ids.len().to_string().len();
+            // Newest first: the printed index is what `history show`
+            // takes as its operand.
+            for (n, id) in ids.iter().rev().enumerate() {
+                let n = n + 1;
                 match history::load(id) {
                     Ok(Some(record)) => println!(
-                        "{id}  {:<12} {}",
+                        "{n:>width$}  {id}  {:<12} {}",
                         record.task.as_deref().unwrap_or("-"),
                         generation_label(&record.generation)
                     ),
-                    Ok(None) => println!("{id}  (unreadable)"),
-                    Err(e) => println!("{id}  (error: {e:#})"),
+                    Ok(None) => println!("{n:>width$}  {id}  (unreadable)"),
+                    Err(e) => println!("{n:>width$}  {id}  (error: {e:#})"),
                 }
             }
             Ok(())
         }
-        HistoryCmd::Show { run_id } => {
-            let record = history::load(run_id).map_err(|e| AppError::usage(format!("{e:#}")))?;
-            let Some(record) = record else {
-                return Err(AppError::usage(format!("no run '{run_id}' in history")));
-            };
+        HistoryCmd::Show {
+            target,
+            output,
+            out_dir,
+            copy,
+            stdout,
+            json,
+            overwrite,
+            quiet,
+        } => {
+            let record = resolve_run(target)?;
             if !record.generation.is_complete() {
                 println!(
-                    "run {run_id}: generation {} — artifacts are not delivered \
-                     for incomplete runs",
+                    "run {}: generation {} — artifacts are not delivered for \
+                     incomplete runs; try another index, or `aido last` for \
+                     the newest complete run",
+                    record.run_id,
                     generation_label(&record.generation)
                 );
                 return Ok(());
             }
-            deliver_restored(&empty_cli_for_restore(), record).await
+            // The subcommand's own flags win; the same flags placed before
+            // the management word (`aido --copy history show 1`) count too.
+            let options = RestoreOptions {
+                output: output.clone().or_else(|| cli.output.clone()),
+                out_dir: out_dir.clone().or_else(|| cli.out_dir.clone()),
+                stdout: *stdout || cli.stdout,
+                json: *json || cli.json,
+                copy: *copy || cli.copy,
+                overwrite: *overwrite || cli.overwrite,
+                quiet: *quiet || cli.quiet,
+            };
+            deliver_restored(&options, record).await
         }
     }
 }
 
+/// Resolve a `history show` operand: a 1-based index into `history list`
+/// order (1 = the newest entry), a full run id, or a unique id prefix.
+/// Run ids always contain '-' and '.', so an all-digit operand can only
+/// be an index.
+fn resolve_run(target: &str) -> AppResult<RunRecord> {
+    let ids = history::list_ids().map_err(|e| AppError::usage(format!("{e:#}")))?;
+    if ids.is_empty() {
+        return Err(AppError::usage("no runs recorded yet"));
+    }
+    let id = if target.bytes().all(|b| b.is_ascii_digit()) {
+        let Ok(index) = target.parse::<usize>() else {
+            // Past usize is past any list length, so the same out-of-range
+            // answer applies, quoting what the user typed.
+            return Err(AppError::usage(format!(
+                "no run #{target}; `aido history list` shows only {}",
+                ids.len()
+            )));
+        };
+        if index == 0 {
+            return Err(AppError::usage(
+                "run indexes start at 1 (the newest); see `aido history list`",
+            ));
+        }
+        let Some(offset) = ids.len().checked_sub(index) else {
+            return Err(AppError::usage(format!(
+                "no run #{index}; `aido history list` shows only {}",
+                ids.len()
+            )));
+        };
+        ids[offset].clone()
+    } else if ids.iter().any(|id| id == target) {
+        target.to_string()
+    } else {
+        let matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(target)).collect();
+        match matches.as_slice() {
+            [] => return Err(AppError::usage(format!("no run '{target}' in history"))),
+            [only] => (*only).clone(),
+            many => {
+                return Err(AppError::usage(format!(
+                    "'{target}' is ambiguous: it prefixes {} runs; add characters \
+                     or see `aido history list`",
+                    many.len()
+                )));
+            }
+        }
+    };
+    history::load(&id)
+        .map_err(|e| AppError::usage(format!("{e:#}")))?
+        .ok_or_else(|| AppError::usage(format!("no run '{id}' in history")))
+}
+
 /// Restore delivers through the normal output system without touching the
 /// service (or credentials).
-async fn deliver_restored(cli: &Cli, record: RunRecord) -> AppResult<()> {
+async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppResult<()> {
     let produce: Vec<MediaKind> = record.artifacts.iter().map(|a| a.kind).collect();
-    let destinations: Vec<Destination> = restore_destinations(cli, &record)?;
+    let destinations = restore_destinations(options, &record)?;
     let hold_secs = config::load()
         .ok()
         .and_then(|c| c.settings.hold_secs)
@@ -379,33 +480,36 @@ async fn deliver_restored(cli: &Cli, record: RunRecord) -> AppResult<()> {
         artifacts: &record.artifacts,
         produce: &produce,
         destinations: &destinations,
-        overwrite: cli.overwrite,
+        overwrite: options.overwrite,
         live_stdout: false,
         hold_secs,
-        quiet: cli.quiet,
-        json: cli.json,
+        quiet: options.quiet,
+        json: options.json,
         run_id: &record.run_id,
         task: record.task.as_deref(),
     };
     output::deliver(&args).result().map(|_| ())
 }
 
-fn restore_destinations(cli: &Cli, record: &RunRecord) -> AppResult<Vec<Destination>> {
+fn restore_destinations(
+    options: &RestoreOptions,
+    record: &RunRecord,
+) -> AppResult<Vec<Destination>> {
     let mut destinations: Vec<Destination> = Vec::new();
-    if let Some(path) = &cli.output {
+    if let Some(path) = &options.output {
         if path.as_os_str() == "-" {
             destinations.push(Destination::Stdout);
         } else {
             destinations.push(Destination::File { path: path.clone() });
         }
     }
-    if let Some(dir) = &cli.out_dir {
+    if let Some(dir) = &options.out_dir {
         destinations.push(Destination::Directory { path: dir.clone() });
     }
-    if cli.stdout {
+    if options.stdout {
         destinations.push(Destination::Stdout);
     }
-    if cli.copy {
+    if options.copy {
         if record.artifacts.len() > 1 {
             return Err(AppError::usage(
                 "the clipboard takes one artifact; use --out-dir to restore this run",
@@ -425,11 +529,6 @@ fn restore_destinations(cli: &Cli, record: &RunRecord) -> AppResult<Vec<Destinat
         destinations.push(Destination::Stdout);
     }
     Ok(destinations)
-}
-
-/// A CLI with only defaults, for `history show` (no user flags reach it).
-fn empty_cli_for_restore() -> Cli {
-    Cli::try_parse_from(["aido"]).expect("an empty invocation always parses")
 }
 
 fn generation_label(status: &GenerationStatus) -> String {
