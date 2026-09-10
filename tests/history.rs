@@ -87,11 +87,56 @@ fn last_recovers_the_result_without_a_new_request() {
 
 #[test]
 fn failed_clipboard_delivery_stays_recoverable() {
-    // On a headless test host the clipboard write fails (exit 5) — the
-    // generation itself was saved before delivery, so `last` brings it
-    // back without a new request.
+    // Force a delivery failure on every platform by pointing --out-dir at
+    // a path below a regular file: the generation was saved before
+    // delivery, so `last` brings it back without a new request.
     let server = Server::json(chat_body("CLIPPED"));
     let dir = temp_dir("hist-clip");
+    let blocker = temp_file("blocker", b"x");
+    let bad_dir = blocker.join("sub");
+    let cfg = chat_cfg(&server.url());
+    let envs = [
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ];
+    let out = run_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--copy",
+            "--out-dir",
+            bad_dir.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &envs,
+        cfg.to_str().unwrap(),
+    );
+    assert_eq!(
+        out.code(),
+        5,
+        "delivery failure must exit 5; stderr: {}",
+        out.stderr()
+    );
+    assert!(out.stdout().is_empty());
+
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "CLIPPED\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn clipboard_write_failure_exits_five_and_stays_recoverable() {
+    // On the headless Linux CI host the clipboard write itself fails
+    // (exit 5) while the generation was saved first. macOS runners have a
+    // working clipboard, so this exact assertion is Linux-only.
+    let server = Server::json(chat_body("CLIPPED"));
+    let dir = temp_dir("hist-clip2");
     let cfg = chat_cfg(&server.url());
     let envs = [
         ("AIDO_CONFIG", cfg.to_str().unwrap()),
