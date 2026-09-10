@@ -277,6 +277,7 @@ fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> std::process:
         "OPENAI_BASE_URL",
         "AIDO_BASE_URL",
         "AIDO_MODEL",
+        "AIDO_ADAPTER",
         "AIDO_PROFILE",
         "AIDO_MAX_TOKENS",
         "AIDO_TEMPERATURE",
@@ -1053,7 +1054,7 @@ fn empty_file_fails_instead_of_falling_back() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("no text or image content"),
+        err.contains("no text, image or audio content"),
         "stderr was: {err}"
     );
     std::fs::remove_file(&file).ok();
@@ -2059,4 +2060,619 @@ fn streamed_slices_are_separated_like_the_buffered_join() {
     assert_eq!(request_json(&requests[0])["stream"], true);
     assert_eq!(request_json(&requests[1])["stream"], true);
     std::fs::remove_file(&file).ok();
+}
+
+fn response_body(text: &str) -> String {
+    serde_json::json!({"status":"completed","output":[{"type":"reasoning"},{"type":"message","content":[{"type":"output_text","text":text}]}]}).to_string()
+}
+
+#[test]
+fn responses_buffered_request_and_query_path() {
+    let server = Server::start("200 OK", &response_body("answer"));
+    let out = run(
+        &[
+            "--adapter",
+            "openai-responses",
+            "--base-url",
+            &format!("{}/proxy/?version=x", server.url()),
+            "--no-stream",
+            "-p",
+            "instructions",
+            "--max-tokens",
+            "123",
+        ],
+        b"question",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"answer\n");
+    let raw = server.request();
+    assert!(String::from_utf8_lossy(&raw).starts_with("POST /proxy/responses?version=x "));
+    let body = request_json(&raw);
+    assert_eq!(body["instructions"], "instructions");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["max_output_tokens"], 123);
+    assert_eq!(body["store"], false);
+    assert!(body.get("messages").is_none());
+    assert!(body.get("stream").is_none());
+}
+
+#[test]
+fn responses_image_input_uses_string_url() {
+    let server = Server::start("200 OK", &response_body("read"));
+    let png = tall_png(2, 2);
+    let out = run(
+        &[
+            "--adapter",
+            "openai-responses",
+            "--base-url",
+            &server.url(),
+            "--input-mode",
+            "image",
+            "--no-split",
+        ],
+        &png,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = request_json(&server.request());
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
+    assert!(body["input"][0]["content"][0]["image_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+}
+
+#[test]
+fn responses_stream_failure_does_not_save_partial_result() {
+    for terminal in [
+        "",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+    ] {
+        let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\n{terminal}");
+        let server = SseServer::start(&[wire]);
+        let dir = temp_history_dir();
+        let cfg = settings_config("[settings]\nhistory_keep=5\n");
+        let file = temp_file("unchanged.txt", b"original");
+        let out = run(
+            &[
+                "--adapter",
+                "openai-responses",
+                "--base-url",
+                &server.url(),
+                "--save",
+                file.to_str().unwrap(),
+            ],
+            b"hi",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+            ],
+        );
+        assert!(!out.status.success());
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        server.requests();
+    }
+}
+
+#[test]
+fn responses_stream_incomplete_warns_and_does_not_duplicate_snapshot() {
+    let end = serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"你好"}]}]}});
+    let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}}\n\ndata: {end}\n\n");
+    let server = SseServer::start(&[wire]);
+    let out = run(
+        &["--adapter", "openai-responses", "--base-url", &server.url()],
+        b"hi",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, "你好\n".as_bytes());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("truncated"));
+    server.requests();
+}
+
+#[test]
+fn preset_selects_profile_and_cli_can_override_it() {
+    let dir = temp_history_dir();
+    std::fs::write(dir.join("custom.toml"), "profile='response'\ninput_modes=['text']\nrequired_inputs=['text']\noutput_modes=['text']\n").unwrap();
+    for cli_override in [false, true] {
+        let body = if cli_override {
+            r#"{"choices":[{"message":{"content":"chat"}}]}"#.into()
+        } else {
+            response_body("responses")
+        };
+        let server = Server::start("200 OK", &body);
+        let cfg = settings_config(&format!("[settings]\nhistory_keep=0\n[profiles.response]\nadapter='openai-responses'\nbase_url='{}'\n[profiles.chat]\nadapter='openai-chat'\nbase_url='{}'\n", server.url(), server.url()));
+        let mut args = vec!["custom", "--no-stream"];
+        if cli_override {
+            args.extend(["--profile", "chat"]);
+        }
+        let out = run(
+            &args,
+            b"hi",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("AIDO_PRESETS_DIR", dir.to_str().unwrap()),
+                ("AIDO_PROFILE", "missing"),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let raw = server.request();
+        let path = if cli_override {
+            "/v1/chat/completions"
+        } else {
+            "/v1/responses"
+        };
+        assert!(String::from_utf8_lossy(&raw).starts_with(&format!("POST {path} ")));
+    }
+}
+
+#[test]
+fn invalid_modes_and_options_fail_before_connecting() {
+    for args in [
+        vec!["--adapter", "openai-chat", "--output-mode", "audio"],
+        vec!["--input-mode", "image"],
+        vec!["--adapter", "openai-speech", "--option", "speed=fast"],
+        vec!["--adapter", "openai-chat", "--option", "voice=alloy"],
+        vec!["--adapter", "openai-speech", "--copy"],
+    ] {
+        let mut args = args;
+        args.extend(["--base-url", "http://127.0.0.1:1"]);
+        let out = run(&args, b"hello", &[]);
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("request failed"));
+    }
+}
+
+#[test]
+fn transcription_uploads_audio_as_multipart() {
+    let server = Server::start("200 OK", r#"{"text":"meeting notes"}"#);
+    let out = run(
+        &[
+            "transcribe",
+            "--base-url",
+            &server.url(),
+            "--option",
+            "language=zh",
+        ],
+        b"RIFF\x04\x00\x00\x00WAVE",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"meeting notes\n");
+    let raw = server.request();
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(raw.starts_with("POST /v1/audio/transcriptions "));
+    assert!(raw.contains("multipart/form-data"));
+    assert!(raw.contains("filename=\"input.wav\""));
+    assert!(raw.contains("whisper-1"));
+    assert!(raw.contains("zh"));
+}
+
+#[test]
+fn speech_saves_binary_and_last_recovers_it() {
+    let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n{}",
+        bytes.len(),
+        std::str::from_utf8(bytes).unwrap()
+    );
+    let server = SseServer::start(&[response]);
+    let dir = temp_history_dir();
+    let cfg = settings_config("[settings]\nhistory_keep=3\n");
+    let file = temp_file("speech.wav", b"");
+    let envs = [
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ];
+    let out = run(
+        &[
+            "tts",
+            "--base-url",
+            &server.url(),
+            "--option",
+            "format=wav",
+            "--option",
+            "voice=alloy",
+            "--save",
+            file.to_str().unwrap(),
+        ],
+        b"hello",
+        &envs,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let requests = server.requests();
+    assert!(String::from_utf8_lossy(&requests[0]).starts_with("POST /v1/audio/speech "));
+    assert_eq!(request_json(&requests[0])["response_format"], "wav");
+    let last = run(&["last"], b"", &envs);
+    assert!(last.status.success());
+    assert_eq!(last.stdout, bytes);
+}
+
+#[test]
+fn images_save_multiple_artifacts_with_detected_format() {
+    let png = tall_png(2, 2);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let body = serde_json::json!({"data":[{"b64_json":encoded},{"b64_json":encoded}]}).to_string();
+    let server = Server::start("200 OK", &body);
+    let dir = temp_history_dir();
+    let out = run(
+        &[
+            "image",
+            "--base-url",
+            &server.url(),
+            "--save-dir",
+            dir.to_str().unwrap(),
+            "--option",
+            "n=2",
+        ],
+        b"a dog",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read(dir.join("image-1.png")).unwrap(), png);
+    assert_eq!(std::fs::read(dir.join("image-2.png")).unwrap(), png);
+    let body = request_json(&server.request());
+    assert_eq!(body["prompt"], "a dog");
+    assert_eq!(body["n"], 2);
+}
+
+#[test]
+fn responses_text_and_image_share_output_pipeline() {
+    let png = tall_png(2, 2);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let body = serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"A dog"}]},{"type":"image_generation_call","result":encoded}]}).to_string();
+    let server = Server::start("200 OK", &body);
+    let dir = temp_history_dir();
+    let out = run(
+        &[
+            "--adapter",
+            "openai-responses",
+            "--output-mode",
+            "text,image",
+            "--save-dir",
+            dir.to_str().unwrap(),
+            "--base-url",
+            &server.url(),
+        ],
+        b"draw a dog",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"A dog\n");
+    assert_eq!(std::fs::read(dir.join("image-1.png")).unwrap(), png);
+    assert_eq!(std::fs::read(dir.join("text.txt")).unwrap(), b"A dog");
+    let request = request_json(&server.request());
+    assert_eq!(request["tools"][0]["type"], "image_generation");
+    assert_eq!(request["store"], false);
+}
+
+#[test]
+fn chat_done_ends_reading_even_if_server_keeps_connection_open() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut stream = accept(
+            &listener,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
+        stream.set_nonblocking(false).unwrap();
+        read_request(&mut stream);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n").unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut buf = [0];
+        assert_eq!(
+            stream.read(&mut buf).unwrap(),
+            0,
+            "client should close after DONE"
+        );
+    });
+    let out = run(
+        &[
+            "--base-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--timeout",
+            "1",
+        ],
+        b"hi",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"done\n");
+    handle.join().unwrap();
+}
+
+#[test]
+fn single_image_stdout_is_exact_binary() {
+    let png = tall_png(2, 2);
+    let body = serde_json::json!({"data":[{"b64_json":base64::engine::general_purpose::STANDARD.encode(&png)}]}).to_string();
+    let server = Server::start("200 OK", &body);
+    let out = run(
+        &["image", "--base-url", &server.url(), "--text", "dog"],
+        b"ignored stdin",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, png);
+    assert_eq!(request_json(&server.request())["prompt"], "dog");
+}
+
+#[test]
+fn malformed_image_does_not_replace_file_or_history() {
+    let server = Server::start("200 OK", r#"{"data":[{"b64_json":"invalid"}]}"#);
+    let file = temp_file("keep.png", b"keep");
+    let history = temp_history_dir();
+    let cfg = settings_config("[settings]\nhistory_keep=5\n");
+    let out = run(
+        &[
+            "image",
+            "--base-url",
+            &server.url(),
+            "--save",
+            file.to_str().unwrap(),
+        ],
+        b"dog",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read(file).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(history).unwrap().count(), 0);
+    server.request();
+}
+
+#[test]
+fn missing_required_image_is_reported_before_request() {
+    let dir = temp_history_dir();
+    std::fs::write(
+        dir.join("strict-ocr.toml"),
+        "input_modes=['text','image']\nrequired_inputs=['image']\n",
+    )
+    .unwrap();
+    let out = run(
+        &["strict-ocr", "--base-url", "http://127.0.0.1:1"],
+        b"text only",
+        &[("AIDO_PRESETS_DIR", dir.to_str().unwrap())],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("required input 'image' is missing"));
+}
+
+#[test]
+fn media_history_and_text_history_share_retention() {
+    let dir = temp_history_dir();
+    std::fs::write(
+        dir.join("20000101-000000.000.json"),
+        r#"{"text":"old","artifacts":[],"status":"Complete","warnings":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("20000101-000001.000.txt"), "old text").unwrap();
+    let cfg = settings_config("[settings]\nhistory_keep=1\n");
+    let server = Server::start("200 OK", r#"{"choices":[{"message":{"content":"new"}}]}"#);
+    let out = run(
+        &["--base-url", &server.url()],
+        b"hi",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(history_files(&dir).len(), 1);
+    server.request();
+}
+
+#[test]
+fn generated_image_download_does_not_forward_api_credentials() {
+    let png = tall_png(2, 2);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let image_port = listener.local_addr().unwrap().port();
+    let bytes = png.clone();
+    let image_server = std::thread::spawn(move || {
+        let mut socket = accept(
+            &listener,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
+        socket.set_nonblocking(false).unwrap();
+        let request = read_request(&mut socket);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+            bytes.len()
+        );
+        socket.write_all(header.as_bytes()).unwrap();
+        socket.write_all(&bytes).unwrap();
+        request
+    });
+    let body = serde_json::json!({"data":[{"url":format!("http://127.0.0.1:{image_port}/asset.png?signature=example")}]}).to_string();
+    let server = Server::start("200 OK", &body);
+    let out = run(
+        &[
+            "image",
+            "--base-url",
+            &server.url(),
+            "--api-key",
+            "test-secret",
+        ],
+        b"dog",
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, png);
+    assert!(String::from_utf8_lossy(&server.request())
+        .to_lowercase()
+        .contains("authorization: bearer test-secret"));
+    let image_request = image_server.join().unwrap();
+    let image_request = String::from_utf8_lossy(&image_request).to_lowercase();
+    assert!(!image_request.contains("authorization"));
+    assert!(!image_request.contains("test-secret"));
+}
+
+#[test]
+fn image_only_ignores_caption_for_save_and_stdout_but_keeps_history() {
+    let png = tall_png(2, 2);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let body = serde_json::json!({"status":"completed","output":[
+        {"type":"message","content":[{"type":"output_text","text":"A dog"}]},
+        {"type":"image_generation_call","result":encoded}
+    ]});
+    for streaming in [false, true] {
+        for save in [false, true] {
+            let payload = if streaming {
+                format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    serde_json::json!({"type":"response.output_text.delta","delta":"A dog"}),
+                    serde_json::json!({"type":"response.completed","response":body})
+                )
+            } else {
+                body.to_string()
+            };
+            let mime = if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let server = SseServer::start(&[format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            )]);
+            let dir = temp_history_dir();
+            let cfg = settings_config("[settings]\nhistory_keep=3\n");
+            let file = dir.join("picture.png");
+            let url = server.url();
+            let mut args = vec![
+                "--adapter",
+                "openai-responses",
+                "--output-mode",
+                "image",
+                "--base-url",
+                &url,
+                "--no-spinner",
+                if streaming { "--stream" } else { "--no-stream" },
+            ];
+            if save {
+                args.extend(["--save", file.to_str().unwrap()]);
+            }
+            let out = run(
+                &args,
+                b"draw a dog",
+                &[
+                    ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                    ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+                ],
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if save {
+                assert!(out.stdout.is_empty());
+                assert_eq!(std::fs::read(&file).unwrap(), png);
+            } else {
+                assert_eq!(out.stdout, png);
+            }
+            let history = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|e| e == "json"))
+                .unwrap();
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(history).unwrap()).unwrap();
+            assert_eq!(result["text"], "A dog");
+            assert_eq!(result["artifacts"].as_array().unwrap().len(), 1);
+            server.requests();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn mismatched_speech_is_not_saved_or_recorded() {
+    for mime in ["audio/wav", "audio/mpeg", "application/octet-stream"] {
+        let bytes = "RIFF\x04\0\0\0WAVE";
+        let server = SseServer::start(&[format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\r\n{bytes}",
+            bytes.len()
+        )]);
+        let dir = temp_history_dir();
+        let cfg = settings_config("[settings]\nhistory_keep=3\n");
+        let file = dir.join("speech.mp3");
+        let out = run(
+            &[
+                "tts",
+                "--base-url",
+                &server.url(),
+                "--option",
+                "format=mp3",
+                "--save",
+                file.to_str().unwrap(),
+            ],
+            b"hello",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+            ],
+        );
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("speech response"));
+        assert!(out.stdout.is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        server.requests();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

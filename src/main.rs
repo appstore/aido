@@ -1,9 +1,9 @@
+mod api;
 mod cli;
 mod clipboard;
 mod config;
 mod history;
 mod input;
-mod openai;
 mod output;
 mod presets;
 mod spinner;
@@ -21,8 +21,8 @@ async fn main() -> Result<()> {
     require_action_for_files(&cli)?;
 
     // Internal: detached child that keeps the Linux clipboard alive.
-    if let Some(cli::Commands::Hold { secs }) = &cli.command {
-        return run_hold(*secs);
+    if let Some(cli::Commands::Hold { secs, image }) = &cli.command {
+        return run_hold(*secs, *image);
     }
     if let Some(cli::Commands::List) = &cli.command {
         return presets::list();
@@ -44,7 +44,12 @@ async fn main() -> Result<()> {
             .as_ref()
             .and_then(|c| c.settings.hold_secs)
             .unwrap_or(45);
-        return run_last(copy, hold_secs, cli.save.as_deref());
+        return run_last(
+            copy,
+            hold_secs,
+            cli.save.as_deref(),
+            cli.save_dir.as_deref(),
+        );
     }
     if cli.init {
         return config::init();
@@ -68,31 +73,82 @@ async fn main() -> Result<()> {
         None => cli.prompt.clone().unwrap_or_default(),
     };
 
-    let user = input::gather(&cli.files)?;
+    let user = match &cli.text {
+        Some(text) => input::UserContent {
+            text: Some(text.clone()),
+            ..Default::default()
+        },
+        None => input::gather(&cli.files)?,
+    };
+    resolved.modes.validate_input(&user, resolved.adapter)?;
+    output::validate_destination(
+        &resolved.modes.outputs,
+        resolved.output,
+        cli.save.as_deref(),
+        cli.save_dir.as_deref(),
+    )?;
+    if resolved
+        .options
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n > 1)
+        && cli.save_dir.is_none()
+    {
+        bail!("multiple images require --save-dir");
+    }
+    if resolved.adapter == api::Adapter::Speech {
+        if let Some(path) = cli.save.as_deref() {
+            output::validate_extension(
+                resolved
+                    .options
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mp3"),
+                path,
+            )?;
+        }
+    }
+    if cli.stream && !resolved.adapter.streams() {
+        bail!(
+            "adapter '{}' does not support --stream; use --no-stream or omit the flag",
+            resolved.adapter
+        );
+    }
     // Tall images are sliced into several requests; with nothing to slice
     // this is a single batch and behaves exactly as before.
-    let batches = split::expand(user, !cli.no_split)?;
+    let batches = split::expand(
+        user,
+        !cli.no_split
+            && resolved
+                .modes
+                .outputs
+                .iter()
+                .all(|m| *m == api::MediaMode::Text),
+    )?;
 
-    let client = openai::Client::new(&resolved)?;
+    let client = api::Client::new(&resolved)?;
     // Streaming is the default for every output mode: a clipboard-only
     // run streams silently — the clipboard has no "partial" state — so
     // long generations are bounded by idle gaps, not a total request
     // timeout. Deltas print live only where stdout carries the reply.
-    let stream = resolved.stream;
-    let live = matches!(
-        resolved.output,
-        cli::OutputMode::Stdout | cli::OutputMode::Both
-    );
+    let stream = resolved.stream && resolved.adapter.streams();
+    let live = resolved.modes.outputs.contains(&api::MediaMode::Text)
+        && matches!(
+            resolved.output,
+            cli::OutputMode::Stdout | cli::OutputMode::Both
+        );
 
+    let mut combined = api::GenerateResult::default();
     let mut replies: Vec<String> = Vec::with_capacity(batches.len());
     for (i, batch) in batches.iter().enumerate() {
-        let messages = openai::build_messages(Some(&system), batch)?;
-        let request = openai::ChatRequest {
-            model: resolved.model.clone(),
-            messages,
+        let request = api::GenerateRequest {
+            system: Some(&system),
+            user: batch,
+            model: &resolved.model,
             max_tokens: resolved.max_tokens,
             temperature: resolved.temperature,
-            stream,
+            outputs: &resolved.modes.outputs,
+            options: &resolved.options,
         };
         let spinner = if cli.no_spinner {
             spinner::Spinner::disabled()
@@ -120,7 +176,7 @@ async fn main() -> Result<()> {
             // instead counts the chars received so far.
             let mut seen = 0u64;
             let reply = client
-                .chat_stream(&request, |delta| {
+                .generate_stream(&request, |delta| {
                     if live {
                         if let Some(s) = spinner.take() {
                             s.stop();
@@ -138,11 +194,20 @@ async fn main() -> Result<()> {
             }
             reply
         } else {
-            let reply = client.chat(&request).await;
+            let reply = client.generate(&request).await;
             spinner.stop();
             reply
         };
-        replies.push(reply?);
+        let reply = reply?;
+        for warning in reply.diagnostics() {
+            eprintln!("warning: {warning}");
+        }
+        if reply.status != api::CompletionStatus::Complete {
+            combined.status = reply.status;
+        }
+        combined.warnings.extend(reply.warnings);
+        combined.artifacts.extend(reply.artifacts);
+        replies.push(reply.text);
     }
     let reply = if replies.len() > 1 {
         replies.join("\n")
@@ -150,7 +215,7 @@ async fn main() -> Result<()> {
         replies.into_iter().next().unwrap_or_default()
     };
 
-    if reply.trim().is_empty() {
+    if reply.trim().is_empty() && combined.artifacts.is_empty() {
         if matches!(
             resolved.output,
             cli::OutputMode::Clipboard | cli::OutputMode::Both
@@ -161,6 +226,31 @@ async fn main() -> Result<()> {
         }
         eprintln!("warning: model returned empty content");
     }
+    combined.text = reply;
+    for mode in &resolved.modes.outputs {
+        if *mode != api::MediaMode::Text && !combined.artifacts.iter().any(|a| a.mode == *mode) {
+            bail!("response did not produce the requested '{mode}' output");
+        }
+    }
+    if !combined.artifacts.is_empty() || cli.save_dir.is_some() {
+        history::record_result(&combined, resolved.history_keep);
+        // Keep the full response in history, but render only requested modalities.
+        if !resolved.modes.outputs.contains(&api::MediaMode::Text) {
+            combined.text.clear();
+        }
+        combined
+            .artifacts
+            .retain(|a| resolved.modes.outputs.contains(&a.mode));
+        return output::emit_result(
+            &combined,
+            resolved.output,
+            resolved.hold_secs,
+            cli.save.as_deref(),
+            cli.save_dir.as_deref(),
+            stream && live,
+        );
+    }
+    let reply = combined.text;
     history::record(&reply, resolved.history_keep);
     if stream && live {
         // The deltas already went to stdout: just close the line, then run
@@ -209,7 +299,12 @@ fn looks_like_path(word: &str) -> bool {
 /// behind them, so a bare `aido notes.txt` is an error; an action or a
 /// -p prompt must name what to do with the file.
 fn require_action_for_files(cli: &cli::Cli) -> Result<()> {
-    if cli.files.is_empty() || cli.preset.is_some() || cli.prompt.is_some() {
+    if cli.files.is_empty()
+        || cli.preset.is_some()
+        || cli.prompt.is_some()
+        || cli.profile.is_some()
+        || cli.adapter.is_some()
+    {
         return Ok(());
     }
     let example = cli.files[0].display();
@@ -284,39 +379,44 @@ fn restore_sigpipe() {}
 
 /// `aido last`: re-print (or re-copy) the most recent history entry, so a
 /// clipboard lost to a later copy doesn't mean paying for the model again.
-fn run_last(copy: bool, hold_secs: u64, save: Option<&std::path::Path>) -> Result<()> {
-    let Some(text) = history::last()? else {
-        bail!(
-            "no saved results yet; every non-empty result is kept on disk \
-               (settings.history_keep, 0 disables)"
-        );
+fn run_last(
+    copy: bool,
+    hold_secs: u64,
+    save: Option<&std::path::Path>,
+    save_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let Some(result) = history::last_result()? else {
+        bail!("no saved results yet; every non-empty result is kept on disk (settings.history_keep, 0 disables)");
     };
-    if !text.trim().is_empty() {
-        if let Some(path) = save {
-            output::save_to_file(&text, path)?;
-        }
+    for warning in result.diagnostics() {
+        eprintln!("warning: {warning}");
     }
-    if copy {
-        // Same trailing-newline trim as a normal clipboard write.
-        let text = text.trim_end();
-        clipboard::write_text(text, hold_secs)?;
-        eprintln!("copied {} chars to clipboard", text.chars().count());
-    } else {
-        println!("{text}");
-    }
-    Ok(())
+    output::emit_result(
+        &result,
+        if copy {
+            cli::OutputMode::Clipboard
+        } else {
+            cli::OutputMode::Stdout
+        },
+        hold_secs,
+        save,
+        save_dir,
+        false,
+    )
 }
 
-fn run_hold(secs: u64) -> Result<()> {
+fn run_hold(secs: u64, image: bool) -> Result<()> {
     use std::io::Read;
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
-    // Errors propagate to stderr (the child inherits it), so a failed hold
-    // is visible instead of silently losing the clipboard contents.
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes)?;
     let mut cb =
         arboard::Clipboard::new().map_err(|e| anyhow!("cannot access the clipboard: {e}"))?;
-    cb.set_text(text)
-        .map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
+    if image {
+        clipboard::set_image(&mut cb, &bytes)?;
+    } else {
+        cb.set_text(String::from_utf8(bytes)?)
+            .map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
+    }
     std::thread::sleep(std::time::Duration::from_secs(secs));
     Ok(())
 }

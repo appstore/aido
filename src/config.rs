@@ -1,3 +1,4 @@
+use crate::api::{Adapter, MediaMode, Modes};
 use crate::cli::{Cli, OutputMode};
 use crate::history;
 use crate::presets::Preset;
@@ -17,11 +18,16 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Profile {
+    pub adapter: Option<Adapter>,
+    pub input_modes: Option<Vec<MediaMode>>,
+    pub required_inputs: Option<Vec<MediaMode>>,
+    pub output_modes: Option<Vec<MediaMode>>,
+    pub options: BTreeMap<String, serde_json::Value>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub max_tokens: Option<u64>,
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -41,11 +47,14 @@ pub struct Settings {
 /// global defaults.
 #[derive(Debug)]
 pub struct Resolved {
+    pub adapter: Adapter,
+    pub modes: Modes,
+    pub options: BTreeMap<String, serde_json::Value>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
     pub max_tokens: Option<u64>,
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     pub output: OutputMode,
     pub timeout_secs: u64,
     pub hold_secs: u64,
@@ -106,6 +115,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
     let profile_name = cli
         .profile
         .clone()
+        .or_else(|| preset.and_then(|p| p.profile.clone()))
         .or_else(|| env_nonempty("AIDO_PROFILE"))
         .or_else(|| cfg.default_profile.clone())
         .unwrap_or_else(|| "default".to_string());
@@ -115,6 +125,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
         Some(p) => p,
         None => {
             let explicit = cli.profile.is_some()
+                || preset.is_some_and(|p| p.profile.is_some())
                 || env_nonempty("AIDO_PROFILE").is_some()
                 || cfg.default_profile.is_some();
             if explicit {
@@ -133,7 +144,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
     let env_key = env_nonempty("AIDO_API_KEY").or_else(|| env_nonempty("OPENAI_API_KEY"));
     let env_model = env_nonempty("AIDO_MODEL");
     let env_max_tokens = parse_env_number::<u64>("AIDO_MAX_TOKENS")?;
-    let env_temperature = parse_env_number::<f32>("AIDO_TEMPERATURE")?;
+    let env_temperature = parse_env_number::<f64>("AIDO_TEMPERATURE")?;
 
     let raw_base = cli
         .base_url
@@ -151,13 +162,65 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
         .or(profile.api_key.clone())
         .filter(|k| !k.trim().is_empty());
 
+    let env_adapter = env_nonempty("AIDO_ADAPTER")
+        .map(|value| serde_json::from_value::<Adapter>(serde_json::Value::String(value)))
+        .transpose()
+        .context("invalid AIDO_ADAPTER")?;
+    let adapter = cli
+        .adapter
+        .or_else(|| preset.and_then(|p| p.adapter))
+        .or(env_adapter)
+        .or(profile.adapter)
+        .unwrap_or_default();
+    let modes = Modes {
+        inputs: if cli.input_mode.is_empty() {
+            preset
+                .and_then(|p| p.input_modes.clone())
+                .or_else(|| profile.input_modes.clone())
+        } else {
+            Some(cli.input_mode.clone())
+        },
+        required: preset
+            .and_then(|p| p.required_inputs.clone())
+            .or_else(|| profile.required_inputs.clone())
+            .unwrap_or_default(),
+        outputs: if cli.output_mode.is_empty() {
+            preset
+                .and_then(|p| p.output_modes.clone())
+                .or_else(|| profile.output_modes.clone())
+                .unwrap_or_else(|| adapter.default_outputs())
+        } else {
+            cli.output_mode.clone()
+        },
+    };
+    modes.validate(adapter)?;
+    let mut options = profile.options.clone();
+    if let Some(preset) = preset {
+        options.extend(preset.options.clone());
+    }
+    for option in &cli.options {
+        let (key, value) = option
+            .split_once('=')
+            .context("--option requires KEY=VALUE")?;
+        let value =
+            serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
+        options.insert(key.into(), value);
+    }
+    adapter.validate_options(&options)?;
+    if adapter == Adapter::Responses
+        && !options.is_empty()
+        && !modes.outputs.contains(&MediaMode::Image)
+    {
+        bail!("image options require --output-mode image (or text,image)");
+    }
+
     let model = cli
         .model
         .clone()
         .or_else(|| preset.and_then(|p| p.model.clone()))
         .or(env_model)
         .or(profile.model.clone())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+        .unwrap_or_else(|| adapter.default_model().to_string());
 
     let max_tokens = match cli
         .max_tokens
@@ -180,12 +243,12 @@ pub fn resolve(cli: &Cli, cfg: &Config, preset: Option<&Preset>) -> Result<Resol
             .unwrap_or(OutputMode::Stdout)
     };
 
-    let base_url = crate::openai::normalize_base_url(&raw_base);
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        bail!("base URL must start with http:// or https:// (got '{raw_base}')");
-    }
+    let base_url = crate::api::normalize_base_url(&raw_base)?;
 
     Ok(Resolved {
+        adapter,
+        modes,
+        options,
         base_url,
         api_key,
         model,
@@ -265,7 +328,26 @@ default_profile = "default"
 [profiles.default]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
+# adapter = "openai-chat"   # default; or openai-responses
 # api_key = "sk-..."       # prefer env vars: OPENAI_API_KEY / AIDO_API_KEY
+
+# Use with: echo hello | aido tts --profile speech --save hello.mp3
+# [profiles.speech]
+# adapter = "openai-speech"
+# model = "tts-1"
+# [profiles.speech.options]
+# voice = "alloy"
+# format = "mp3"
+
+# Use with: aido transcribe meeting.wav --profile transcription
+# [profiles.transcription]
+# adapter = "openai-transcription"
+# model = "whisper-1"
+
+# Use with: aido image --text "a dog" --profile images --save dog.png
+# [profiles.images]
+# adapter = "openai-images"
+# model = "gpt-image-1"
 
 # Local LLM (vLLM / SGLang / llama.cpp / Ollama / LM Studio)
 # [profiles.local]

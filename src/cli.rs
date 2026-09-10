@@ -1,3 +1,4 @@
+use crate::api::{Adapter, MediaMode};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -33,17 +34,41 @@ pub struct Cli {
     pub prompt: Option<String>,
 
     /// Input file(s), paired with an action or -p/--prompt; text is sent
-    /// as-is, PNG/JPEG images go to vision models
+    /// as-is; images and audio are checked against the selected adapter
     #[arg(value_name = "FILE")]
     pub files: Vec<std::path::PathBuf>,
 
-    /// Use a prompt preset (see `aido list`); shorthand: aido NAME
+    /// Use a task preset (see `aido list`); shorthand: aido NAME
     #[arg(long)]
     pub preset: Option<String>,
 
     /// Config profile to use (see --init for a sample config)
     #[arg(long)]
     pub profile: Option<String>,
+
+    /// Protocol adapter (normally set by the selected profile)
+    #[arg(long, value_enum)]
+    pub adapter: Option<Adapter>,
+
+    /// Allowed detected input types; comma-separated or repeated (does not convert input)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub input_mode: Vec<MediaMode>,
+
+    /// Requested generated types, independent of --output and --save
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub output_mode: Vec<MediaMode>,
+
+    /// Adapter option KEY=VALUE; strings or JSON scalars (e.g. voice=alloy, speed=1.2)
+    #[arg(long = "option", value_name = "KEY=VALUE")]
+    pub options: Vec<String>,
+
+    /// Explicit input text, instead of files, stdin or clipboard
+    #[arg(long, conflicts_with = "files")]
+    pub text: Option<String>,
+
+    /// Save multiple output artifacts into a directory
+    #[arg(long, value_name = "DIR", conflicts_with = "save")]
+    pub save_dir: Option<std::path::PathBuf>,
 
     /// Model name
     #[arg(short = 'm', long)]
@@ -75,7 +100,7 @@ pub struct Cli {
 
     /// Sampling temperature
     #[arg(long)]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
 
     /// Request timeout in seconds (default 120); for streaming requests it
     /// bounds the wait for the response headers and each gap between bytes,
@@ -118,7 +143,7 @@ pub enum Commands {
     /// List available presets
     List,
 
-    /// Print the most recent saved result (see the history section)
+    /// Restore the most recent text or media result (see --save / --save-dir)
     Last {
         /// Copy the result back to the clipboard instead of printing it
         #[arg(short = 'c', long)]
@@ -128,6 +153,8 @@ pub enum Commands {
     /// Internal: hold clipboard contents in the background (Linux)
     #[command(name = "__hold", hide = true)]
     Hold {
+        #[arg(long)]
+        image: bool,
         /// Seconds to keep the clipboard alive
         secs: u64,
     },
