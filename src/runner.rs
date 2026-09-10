@@ -6,8 +6,10 @@ use crate::domain::{
     AppError, AppResult, Artifact, Destination, GenerationStatus, MediaKind, Provenance,
 };
 use crate::plan::{DeliveryMode, ExecutionPlan};
+use crate::processors::chunk::ChunkGate;
 use crate::processors::ocr::BoundaryGate;
 use crate::spinner::Spinner;
+use crate::tasks::ProcessorKind;
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::rc::Rc;
@@ -71,9 +73,41 @@ impl DeltaSink {
     }
 }
 
+/// Merges a multi-request run's replies into one text stream. The right
+/// join depends on the strategy: ocr-tiles re-shows overlap bands and
+/// dedups them; chunk-map-reduce carries context instead, so chunks join
+/// with a plain paragraph break.
+enum SliceMerger {
+    Boundary(BoundaryGate),
+    Chunk(ChunkGate),
+}
+
+impl SliceMerger {
+    fn push_delta(&mut self, delta: &str) {
+        match self {
+            Self::Boundary(gate) => gate.push_delta(delta),
+            Self::Chunk(gate) => gate.push_delta(delta),
+        }
+    }
+
+    fn slice_end(&mut self, hard: bool) {
+        match self {
+            Self::Boundary(gate) => gate.slice_end(hard),
+            Self::Chunk(gate) => gate.slice_end(),
+        }
+    }
+
+    fn finish(&mut self) {
+        match self {
+            Self::Boundary(gate) => gate.finish(),
+            Self::Chunk(gate) => gate.finish(),
+        }
+    }
+}
+
 /// Run every step of the plan. Text deltas stream live when the plan says
-/// so; slice replies merge through the boundary gate so live and buffered
-/// delivery end up byte-identical.
+/// so; slice replies merge through the strategy's gate so live and
+/// buffered delivery end up byte-identical.
 pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let api_key = plan.resolved.api_key_env.as_deref().and_then(|name| {
         // The default provider also accepts the conventional OpenAI name.
@@ -101,9 +135,20 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         chars_seen: 0,
     }));
     let multi_step = plan.steps.len() > 1;
-    let mut gate = multi_step.then(|| {
+    let mut gate: Option<SliceMerger> = multi_step.then(|| {
         let gate_sink = sink.clone();
-        BoundaryGate::new(move |t: &str| gate_sink.borrow_mut().emit(t))
+        match plan.processor {
+            ProcessorKind::ChunkMapReduce => SliceMerger::Chunk(ChunkGate::new(move |t: &str| {
+                gate_sink.borrow_mut().emit(t)
+            })),
+            // Single never multi-steps, but the arm keeps the match total
+            // so a future variant must pick its merge explicitly.
+            ProcessorKind::Single | ProcessorKind::OcrTiles => {
+                SliceMerger::Boundary(BoundaryGate::new(move |t: &str| {
+                    gate_sink.borrow_mut().emit(t)
+                }))
+            }
+        }
     });
 
     let spinner = if plan.quiet {

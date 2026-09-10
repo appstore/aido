@@ -632,7 +632,7 @@ pub struct Cli {
     #[arg(long, value_name = "WxH")]
     pub size: Option<String>,
 
-    /// Send tall images whole instead of slicing (ocr)
+    /// Send inputs whole instead of slicing/chunking (ocr, summarize, translate)
     #[arg(long)]
     pub no_split: bool,
 

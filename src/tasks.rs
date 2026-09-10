@@ -73,6 +73,9 @@ pub enum ProcessorKind {
     /// OCR strategy: tall images are sliced vertically, requests are
     /// per-slice, replies merge at slice boundaries.
     OcrTiles,
+    /// Text strategy: oversized text is chunked at paragraph boundaries,
+    /// one request per chunk, replies joined in order.
+    ChunkMapReduce,
 }
 
 /// Typed CLI parameters a task accepts (`--to`, `--voice`, ...); validated

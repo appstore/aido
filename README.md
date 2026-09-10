@@ -154,8 +154,8 @@ Profile 选择顺序：`--profile` → 任务默认 → `AIDO_PROFILE` → `defa
 | 任务 | operation | 输入 | 输出 | 专属参数 |
 |---|---|---|---|---|
 | `ocr` | generate | image（可加 text） | text | `--no-split` |
-| `translate` | generate | text | text | `--to LANG` |
-| `summarize` | generate | text | text | |
+| `translate` | generate | text | text | `--to LANG` `--no-split` |
+| `summarize` | generate | text | text | `--no-split` |
 | `code-review` | generate | text | text | |
 | `tts` | speech | text | audio | `--voice` `--speed` |
 | `transcribe` | transcribe | 恰好一个 audio | text | |
@@ -174,7 +174,7 @@ instruction = """
 input_types = ["text", "image"]
 required_types = ["image"]
 output_types = ["text"]
-processor = "ocr-tiles"        # 或 "single"（默认）
+processor = "ocr-tiles"        # 或 "single"（默认）、"chunk-map-reduce"（长文分块）
 
 # 可选：
 # profile = "vision"           # 默认 Profile
@@ -213,6 +213,12 @@ aido tts article.txt -o article.mp3 --profile edge --voice zh-CN-YunxiNeural --s
 ## 长图 OCR
 
 视觉服务端会把超限图片等比压缩（OpenAI 约定长边 2048px，Qwen-VL 系有 `max_pixels` 上限），长图整张发送会被压到文字不可读。`ocr` 任务声明 `ocr-tiles` 策略：高超过 3072px 的竖长图自动切成若干竖条（切缝优先落在空白行，硬切处回看一小段重叠带），逐条请求后按顺序合并；只有重叠带内确实重复的行会被去掉。每个切片请求都携带任务指令。`--no-split` 可关闭。
+
+## 长文分块
+
+长文本超出模型上下文窗口——或像翻译这类输出随输入等比增长的任务，超出回复上限——单请求会截断或失败。`summarize` / `translate` 声明 `chunk-map-reduce` 策略：超过约 4000 字符（按字符计，中英文同一预算）的文本在段落边界切块，逐块请求（每块都携带任务指令），回复按序以段落分隔拼接。
+
+衔接靠**上下文携带**而不是输出重叠去重：每个后续分块附上前一分块末尾的一小段（约 400 字符），明确标注"仅供衔接，不处理、不输出"。翻译对同一段源的两次措辞不会逐字一致，精确匹配去重只在 OCR 这类确定性转写上可行；上下文携带让回复永不重复，拼接即全部结果。没有段落边界的超长段落退到句子边界（中英文终止符都认），连句子都没有的巨句在字符边界硬切；过小的尾块并回前一块。`--no-split` 可关闭。自定义任务声明 `processor = "chunk-map-reduce"` 即可使用。
 
 ## 结果留底与恢复
 

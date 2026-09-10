@@ -2,8 +2,12 @@
 //!
 //! `single` sends everything in one request. `ocr-tiles` slices tall
 //! images so their text stays legible, merges slice replies at their
-//! boundaries, and is the strategy OCR tasks declare.
+//! boundaries, and is the strategy OCR tasks declare. `chunk-map-reduce`
+//! splits oversized text at paragraph boundaries, one request per chunk
+//! with the previous chunk's tail carried along as context, and joins the
+//! replies in order.
 
+pub mod chunk;
 pub mod ocr;
 
 use crate::domain::{InputContent, InputPart, MediaKind};
@@ -37,6 +41,7 @@ pub fn plan_steps(
             hard_cut_end: false,
         }]),
         ProcessorKind::OcrTiles => ocr::plan_steps(inputs, quiet),
+        ProcessorKind::ChunkMapReduce => chunk::plan_steps(inputs, quiet),
     }
 }
 

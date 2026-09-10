@@ -10,6 +10,10 @@ Translate the user's text.
 input_types = ["text"]
 output_types = ["text"]
 params = ["to"]
+# Oversized inputs are chunked at paragraph boundaries — every chunk
+# carries the tail of the previous one as context, so the joined
+# translation stays coherent; disable per-run with --no-split.
+processor = "chunk-map-reduce"
 
 [defaults]
 to = "auto"

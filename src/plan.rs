@@ -670,6 +670,19 @@ pub fn describe(plan: &ExecutionPlan) -> String {
                     format!("ocr-tiles — {}", parts.join("; "))
                 }
             }
+            ProcessorKind::ChunkMapReduce => {
+                let mut parts = Vec::new();
+                for step in &plan.steps {
+                    if step.label != "all material" {
+                        parts.push(step.label.clone());
+                    }
+                }
+                if parts.is_empty() {
+                    "chunk-map-reduce (no text needs chunking)".to_string()
+                } else {
+                    format!("chunk-map-reduce — {}", parts.join("; "))
+                }
+            }
         }
     ));
     out.push_str(&format!(
@@ -790,6 +803,7 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
             match plan.processor {
                 ProcessorKind::Single => "single",
                 ProcessorKind::OcrTiles => "ocr-tiles",
+                ProcessorKind::ChunkMapReduce => "chunk-map-reduce",
             }
             .to_string(),
         ),

@@ -7,3 +7,6 @@ Summarize the user's text concisely.
 """
 input_types = ["text"]
 output_types = ["text"]
+# Oversized inputs are chunked at paragraph boundaries and the per-chunk
+# summaries joined in order; disable per-run with --no-split.
+processor = "chunk-map-reduce"
