@@ -375,15 +375,15 @@ pub fn run_tty_with(
     use std::os::fd::FromRawFd;
     let mut master = 0i32;
     let mut slave = 0i32;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
+    // Apple's openpty takes *mut termios/winsize; the Linux binding takes
+    // *const for both.
+    #[cfg(target_os = "macos")]
+    let (termp, winp): (*mut libc::termios, *mut libc::winsize) =
+        (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_os = "macos"))]
+    let (termp, winp): (*const libc::termios, *const libc::winsize) =
+        (std::ptr::null(), std::ptr::null());
+    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), termp, winp) };
     assert_eq!(rc, 0, "openpty failed");
     let mut cmd = Command::new(EXE);
     cmd.args(args)
