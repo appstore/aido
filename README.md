@@ -111,7 +111,7 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 default_profile = "vision"
 
 [settings]
-# stream = true
+# stream = false
 # timeout_secs = 120
 # hold_secs = 45
 # history_keep = 50

@@ -351,3 +351,16 @@ fn task_rejects_foreign_parameters() {
     assert!(err.contains("--to"), "{err}");
     assert!(err.contains("ocr"), "{err}");
 }
+
+#[test]
+fn dry_run_does_not_touch_the_clipboard() {
+    // --paste under --dry-run must plan against a placeholder: the
+    // clipboard is never read (the test env has no display, so a read
+    // would fail with a clipboard error instead of producing a plan).
+    let out = run_tty(&["ocr", "--paste", "--dry-run"], &[]);
+    let err = out.stderr();
+    assert!(!err.contains("clipboard:"), "{err}");
+    // the placeholder keeps the type checks honest: ocr needs an image
+    assert_eq!(out.code(), 2, "{err}");
+    assert!(err.contains("image"), "{err}");
+}

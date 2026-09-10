@@ -484,6 +484,93 @@ fn no_split_sends_the_whole_image() {
     assert_eq!(content.as_array().unwrap().len(), 2);
 }
 
+// --- flag semantics -------------------------------------------------------
+
+#[test]
+fn no_stream_is_a_buffering_request_even_on_non_streaming_adapters() {
+    // `--no-stream` forces buffering; on an adapter that never streams it
+    // must be a no-op, not "does not support streaming" (it is the very
+    // fix the `--stream` error recommends).
+    let out = run_tty(&["tts", "--text", "hi", "--no-stream", "--dry-run"], &[]);
+    out.assert_code(0);
+    assert!(out.stdout().contains("buffered"), "{}", out.stdout());
+    // `--stream` on a non-streaming adapter is still refused, with the
+    // (now working) advice.
+    let out = run_tty(&["tts", "--text", "hi", "--stream", "--dry-run"], &[]);
+    out.assert_code(2);
+    assert!(out.stderr().contains("--no-stream"), "{}", out.stderr());
+}
+
+// --- responses ------------------------------------------------------------
+
+#[test]
+fn responses_instruction_only_run_sends_the_instruction_once() {
+    let server = Server::json(&responses_body("ok"));
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"\n\
+         [providers.srv.routes]\ngenerate = \"openai-responses\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &["ask", "-p", "summarize this", "--profile", "test"],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    let body = request_json(&server.request());
+    // instruction-only: the user turn carries it; the `instructions`
+    // field must stay unset or the model would see the text twice.
+    assert!(
+        body.get("instructions").is_none(),
+        "instruction duplicated: {body}"
+    );
+    assert_eq!(body["input"][0]["content"][0]["text"], "summarize this");
+}
+
+// --- speech ---------------------------------------------------------------
+
+#[test]
+fn speech_input_is_plain_text_without_file_labels() {
+    let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n{}",
+        bytes.len(),
+        std::str::from_utf8(bytes).unwrap()
+    );
+    let server = SseServer::start(&[response]);
+    let out_file = temp_dir("tts-labels");
+    let file = out_file.join("out.wav");
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"tts-1\"\noperations = [\"speech\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "tts",
+            "--profile",
+            "test",
+            "--text",
+            "one",
+            "--text",
+            "two",
+            "--option",
+            "format=wav",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    // The spoken input must be the plain text; `--- name ---` labels
+    // would be read aloud.
+    let req = request_json(&server.requests().remove(0));
+    assert_eq!(req["input"], "one\n\ntwo");
+}
+
 /// Minimal base64 encoder (standard alphabet, padding).
 fn b64(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

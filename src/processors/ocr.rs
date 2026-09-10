@@ -38,15 +38,16 @@ pub const SLICE_NOTE: &str = "This image is one slice of a taller image that was
 /// Plan the request sequence: unsliced material travels with the first
 /// request, each tall image's slices follow in order, and every slice
 /// request carries the task's instruction (the runner re-attaches it).
-pub fn plan_steps(inputs: &[InputPart]) -> Result<Vec<RequestStep>> {
+/// `quiet` suppresses the split note on stderr.
+pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
     let mut untouched: Vec<InputPart> = Vec::new();
-    let mut sliced: Vec<Vec<InputPart>> = Vec::new();
-    let mut hard_ends: Vec<bool> = Vec::new();
+    // (image name, slices, per-slice hard flags): flag i marks the
+    // boundary after slice i, whose overlap band slice i+1 re-shows.
+    let mut sliced: Vec<(String, Vec<InputPart>, Vec<bool>)> = Vec::new();
     for part in inputs {
         if part.kind == MediaKind::Image {
-            if let Some((chunks, hard)) = slice_if_tall(part)? {
-                sliced.push(chunks);
-                hard_ends.push(hard);
+            if let Some((chunks, hard_flags)) = slice_if_tall(part, quiet)? {
+                sliced.push((part.name.clone(), chunks, hard_flags));
                 continue;
             }
         }
@@ -62,9 +63,8 @@ pub fn plan_steps(inputs: &[InputPart]) -> Result<Vec<RequestStep>> {
     }
 
     let mut steps = Vec::new();
-    for (image_idx, chunks) in sliced.into_iter().enumerate() {
+    for (image_name, chunks, hard_flags) in sliced {
         let total = chunks.len();
-        let hard_end = hard_ends[image_idx];
         for (i, chunk) in chunks.into_iter().enumerate() {
             let first = steps.is_empty();
             let mut step_inputs = Vec::new();
@@ -78,17 +78,12 @@ pub fn plan_steps(inputs: &[InputPart]) -> Result<Vec<RequestStep>> {
             steps.push(RequestStep {
                 index: steps.len(),
                 inputs: step_inputs,
-                label: format!(
-                    "slice {}/{} of {}",
-                    i + 1,
-                    total,
-                    inputs
-                        .iter()
-                        .find(|p| p.kind == MediaKind::Image)
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("image")
-                ),
-                hard_cut_end: hard_end,
+                label: format!("slice {}/{} of {image_name}", i + 1, total),
+                // The merge gate may only compare at a boundary that
+                // re-shows an overlap band: cut i's hardness belongs to
+                // the step whose bottom edge it cuts, and a tail slice
+                // has no next step at all.
+                hard_cut_end: hard_flags[i],
             });
         }
     }
@@ -106,7 +101,7 @@ fn slice_height_for(w: u32) -> u32 {
     MAX_SLICE_HEIGHT.min((MAX_SLICE_PIXELS / w.max(1)).max(MIN_SLICE_HEIGHT))
 }
 
-fn slice_if_tall(part: &InputPart) -> Result<Option<(Vec<InputPart>, bool)>> {
+fn slice_if_tall(part: &InputPart, quiet: bool) -> Result<Option<(Vec<InputPart>, Vec<bool>)>> {
     let png = image_as_png(part)?;
     // Every image here is PNG, so the IHDR — always the first chunk —
     // carries the dimensions without paying for a full decode first.
@@ -128,7 +123,7 @@ fn slice_if_tall(part: &InputPart) -> Result<Option<(Vec<InputPart>, bool)>> {
     let rgba = img.to_rgba8();
     let gray = image::imageops::grayscale(&rgba);
     let energies = row_energies(&gray);
-    let quiet = quiet_threshold(&energies);
+    let quiet_row = quiet_threshold(&energies);
 
     let slice_h = slice_height_for(w);
     let slack = slice_h / 4;
@@ -141,12 +136,21 @@ fn slice_if_tall(part: &InputPart) -> Result<Option<(Vec<InputPart>, bool)>> {
         if lo >= hi {
             break;
         }
-        let (y, hard) = pick_seam(&energies, lo as usize, hi as usize, target as usize, quiet);
+        let (y, hard) = pick_seam(
+            &energies,
+            lo as usize,
+            hi as usize,
+            target as usize,
+            quiet_row,
+        );
         cuts.push((y as u32, hard));
         pos = y as u32;
     }
 
-    let hard_end = cuts.last().is_some_and(|(_, hard)| *hard);
+    // Flag i marks the boundary between slice i and slice i+1 — exactly
+    // the cut whose overlap band slice i+1 re-shows at its top. The last
+    // slice has no next step, so its flag is false.
+    let hard_flags: Vec<bool> = cuts.iter().map(|(_, hard)| *hard).chain([false]).collect();
     let mut chunks = Vec::with_capacity(cuts.len() + 1);
     let mut start: u32 = 0;
     for (y, hard) in cuts {
@@ -154,12 +158,14 @@ fn slice_if_tall(part: &InputPart) -> Result<Option<(Vec<InputPart>, bool)>> {
         start = y.saturating_sub(if hard { HARD_CUT_OVERLAP } else { 0 });
     }
     chunks.push(encode_slice(part, &rgba, start, h)?);
-    eprintln!(
-        "note: tall image '{}' ({w}\u{d7}{h}) split into {} slices for legibility",
-        part.name,
-        chunks.len()
-    );
-    Ok(Some((chunks, hard_end)))
+    if !quiet {
+        eprintln!(
+            "note: tall image '{}' ({w}\u{d7}{h}) split into {} slices for legibility",
+            part.name,
+            chunks.len()
+        );
+    }
+    Ok(Some((chunks, hard_flags)))
 }
 
 fn encode_slice(
@@ -455,7 +461,7 @@ mod tests {
 
     #[test]
     fn short_images_pass_through_untouched() {
-        let steps = plan_steps(&[image_part(solid_png(100, 500))]).unwrap();
+        let steps = plan_steps(&[image_part(solid_png(100, 500))], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].inputs.len(), 1);
         assert_eq!(steps[0].label, "all material");
@@ -463,7 +469,7 @@ mod tests {
 
     #[test]
     fn tall_image_produces_sequential_slices_that_tile_it() {
-        let steps = plan_steps(&[image_part(solid_png(100, 3200))]).unwrap();
+        let steps = plan_steps(&[image_part(solid_png(100, 3200))], true).unwrap();
         assert_eq!(steps.len(), 2);
         assert!(steps[0].label.contains("slice 1/2"));
         let (w1, h1) = dims(match &steps[0].inputs[0].content {
@@ -485,7 +491,7 @@ mod tests {
             image_part(solid_png(100, 500)),
             image_part(striped_png(100, 3200)),
         ];
-        let steps = plan_steps(&inputs).unwrap();
+        let steps = plan_steps(&inputs, true).unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].inputs.len(), 2);
         assert_eq!(steps[1].inputs.len(), 2); // slice note + slice
@@ -582,5 +588,45 @@ mod tests {
         gate.finish();
         gate.finish();
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn mixed_seams_flag_only_the_hard_boundaries() {
+        // Top half solid (quiet seam lands on the target), bottom half
+        // striped (no quiet row: the seam is hard). Only the middle
+        // boundary may tell the merge gate to look for duplicated lines —
+        // gating the quiet one would delete real text on a coincidence.
+        let mut img = image::RgbaImage::new(100, 4400);
+        for y in 0..4400u32 {
+            for x in 0..100u32 {
+                let c = if y >= 2200 && (x + y) % 2 == 0 {
+                    0
+                } else {
+                    255
+                };
+                img.put_pixel(x, y, image::Rgba([c, c, c, 255]));
+            }
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let steps = plan_steps(&[image_part(png)], true).unwrap();
+        assert_eq!(steps.len(), 3, "two cuts expected");
+        assert!(!steps[0].hard_cut_end, "quiet boundary must not gate");
+        assert!(steps[1].hard_cut_end, "hard boundary must gate");
+        assert!(!steps[2].hard_cut_end, "the tail slice has no next step");
+    }
+
+    #[test]
+    fn slice_labels_name_their_own_image() {
+        let small = image_part(solid_png(100, 500));
+        let tall = InputPart {
+            name: "other.png".into(),
+            ..image_part(striped_png(100, 3200))
+        };
+        let steps = plan_steps(&[small, tall], true).unwrap();
+        let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.iter().all(|l| l.contains("other.png")), "{labels:?}");
     }
 }

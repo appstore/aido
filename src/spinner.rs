@@ -89,6 +89,15 @@ impl Spinner {
     }
 }
 
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        // Cancellation paths (Ctrl+C dropping the run future) discard the
+        // spinner without calling stop(): signal the thread so it ends
+        // within one tick instead of spinning against a dying process.
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// One rendered spinner line: the frame, the message, and — once content
 /// has started arriving — the live count, e.g. `⠙ asking glm-4.6... 1,204 chars`.
 fn spinner_line(frame: char, msg: &str, chars: u64) -> String {

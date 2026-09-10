@@ -36,18 +36,52 @@ pub struct DeliveryOutcome {
     pub states: Vec<DeliveryState>,
     /// artifact id → absolute saved path (for the JSON report).
     pub saved: BTreeMap<String, PathBuf>,
+    /// Set when at least one destination failed (the run exits 5). The
+    /// states keep every real per-destination outcome, so a file that was
+    /// written before the clipboard failed stays recorded as delivered.
+    pub error: Option<AppError>,
 }
 
-/// Deliver everywhere the plan says. Returns per-destination states; on any
-/// failure the run exits 5 — with successes kept — via the returned error.
-pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
+impl DeliveryOutcome {
+    /// `Ok` only when every destination succeeded.
+    pub fn result(self) -> AppResult<Self> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self),
+        }
+    }
+}
+
+/// Deliver everywhere the plan says, recording each destination's real
+/// outcome. On any failure the run exits 5 — with successes kept.
+pub fn deliver(args: &DeliverArgs<'_>) -> DeliveryOutcome {
+    let mut states: Vec<DeliveryState> = Vec::new();
+    let mut saved: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut failed: Option<AppError> = None;
+    let deliver_result = deliver_inner(args, &mut states, &mut saved, &mut failed);
+    if let Err(e) = deliver_result {
+        failed = failed.or(Some(e));
+    }
+    DeliveryOutcome {
+        states,
+        saved,
+        error: failed,
+    }
+}
+
+fn deliver_inner(
+    args: &DeliverArgs<'_>,
+    states: &mut Vec<DeliveryState>,
+    saved: &mut BTreeMap<String, PathBuf>,
+    failed: &mut Option<AppError>,
+) -> AppResult<()> {
     let delivered: Vec<&Artifact> = args
         .artifacts
         .iter()
         .filter(|a| args.produce.contains(&a.kind))
         .collect();
     if delivered.is_empty() {
-        return Err(AppError::generation(
+        return Err(AppError::usage(
             "nothing to deliver: the run produced none of the requested kinds",
         ));
     }
@@ -55,7 +89,7 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
     // Late re-validation: what came back must fit the destinations.
     let has_stdout = args.destinations.contains(&Destination::Stdout);
     if has_stdout && !args.json && delivered.len() > 1 {
-        return Err(AppError::generation(
+        return Err(AppError::usage(
             "several artifacts cannot share bare stdout; use --out-dir",
         ));
     }
@@ -65,7 +99,7 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
     });
     if let Some(path) = &file_dest {
         if delivered.len() != 1 {
-            return Err(AppError::generation(format!(
+            return Err(AppError::usage(format!(
                 "{} artifacts cannot go to one file ({}); use --out-dir",
                 delivered.len(),
                 path.display()
@@ -93,10 +127,6 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
         }
     }
 
-    let mut states: Vec<DeliveryState> = Vec::new();
-    let mut saved: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut failed: Option<AppError> = None;
-
     // --- stdout (the body; the JSON report prints later, after paths exist)
     if has_stdout && !args.json {
         match stdout_body(&delivered, args.live_stdout) {
@@ -105,7 +135,9 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
                 status: DeliveryStatus::Succeeded,
             }),
             Err(e) => {
-                failed = Some(AppError::delivery(format!("stdout: {}", e.chain())));
+                *failed = failed
+                    .take()
+                    .or(Some(AppError::delivery(format!("stdout: {}", e.chain()))));
                 states.push(DeliveryState {
                     destination: Destination::Stdout,
                     status: DeliveryStatus::Failed { error: e.chain() },
@@ -129,7 +161,7 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
                 });
             }
             Err(e) => {
-                failed = failed.or(Some(AppError::delivery(format!(
+                *failed = failed.take().or(Some(AppError::delivery(format!(
                     "{}: {}",
                     path.display(),
                     e.chain()
@@ -161,7 +193,7 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
                 });
             }
             Err(e) => {
-                failed = failed.or(Some(AppError::delivery(format!(
+                *failed = failed.take().or(Some(AppError::delivery(format!(
                     "{}: {}",
                     dir.display(),
                     e.chain()
@@ -177,23 +209,12 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
     // --- clipboard last
     if args.destinations.contains(&Destination::Clipboard) {
         let artifact = delivered[0];
-        let result = match artifact.kind {
-            MediaKind::Text => clipboard::write_text(
-                std::str::from_utf8(&artifact.bytes)
-                    .unwrap_or_default()
-                    .trim_end(),
-                args.hold_secs,
-            ),
-            _ => clipboard::write_image(&artifact.bytes, args.hold_secs),
-        };
-        match result {
-            Ok(()) => {
+        let clip = deliver_clipboard(artifact, args.hold_secs);
+        match clip {
+            Ok(chars) => {
                 if !args.quiet {
                     match artifact.kind {
-                        MediaKind::Text => eprintln!(
-                            "copied {} chars to clipboard",
-                            String::from_utf8_lossy(&artifact.bytes).chars().count()
-                        ),
+                        MediaKind::Text => eprintln!("copied {chars} chars to clipboard"),
                         _ => eprintln!("copied image to clipboard"),
                     }
                 }
@@ -203,7 +224,9 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
                 });
             }
             Err(e) => {
-                failed = failed.or(Some(AppError::delivery(format!("clipboard: {e:#}"))));
+                *failed = failed
+                    .take()
+                    .or(Some(AppError::delivery(format!("clipboard: {e:#}"))));
                 states.push(DeliveryState {
                     destination: Destination::Clipboard,
                     status: DeliveryStatus::Failed {
@@ -216,14 +239,21 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
 
     // --- the JSON report replaces the body on stdout
     if args.json {
-        states.insert(
-            0,
-            DeliveryState {
-                destination: Destination::Stdout,
-                status: DeliveryStatus::Succeeded,
-            },
-        );
-        let report = json_report(args, &delivered, &states, &saved, failed.as_ref());
+        // The report itself is the stdout delivery; `-o -` plus --json
+        // must not list stdout twice. Recorded before the report is
+        // built so the report lists it.
+        let report_state = DeliveryState {
+            destination: Destination::Stdout,
+            status: DeliveryStatus::Succeeded,
+        };
+        match states
+            .iter()
+            .position(|s| s.destination == Destination::Stdout)
+        {
+            Some(i) => states[i] = report_state,
+            None => states.insert(0, report_state),
+        }
+        let report = json_report(args, &delivered, states, saved, failed.as_ref());
         let mut out = std::io::stdout().lock();
         let print = (|| {
             serde_json::to_writer_pretty(&mut out, &report)
@@ -233,19 +263,38 @@ pub fn deliver(args: &DeliverArgs<'_>) -> AppResult<DeliveryOutcome> {
             Ok(())
         })();
         if let Err(e) = print {
-            failed = failed.or(Some(e));
-            states[0] = DeliveryState {
-                destination: Destination::Stdout,
-                status: DeliveryStatus::Failed {
-                    error: "json report write failed".into(),
-                },
-            };
+            *failed = failed.take().or(Some(e));
+            if let Some(i) = states
+                .iter()
+                .position(|s| s.destination == Destination::Stdout)
+            {
+                states[i] = DeliveryState {
+                    destination: Destination::Stdout,
+                    status: DeliveryStatus::Failed {
+                        error: "json report write failed".into(),
+                    },
+                };
+            }
         }
     }
+    Ok(())
+}
 
-    match failed {
-        Some(e) => Err(e),
-        None => Ok(DeliveryOutcome { states, saved }),
+/// One artifact to the clipboard. Returns the copied char count for text
+/// (0 for images). Invalid UTF-8 is an error, never a silent empty copy.
+fn deliver_clipboard(artifact: &Artifact, hold_secs: u64) -> anyhow::Result<usize> {
+    match artifact.kind {
+        MediaKind::Text => {
+            let text = std::str::from_utf8(&artifact.bytes)
+                .map_err(|e| anyhow::anyhow!("text artifact is not valid UTF-8: {e}"))?;
+            let trimmed = text.trim_end();
+            clipboard::write_text(trimmed, hold_secs)?;
+            Ok(trimmed.chars().count())
+        }
+        _ => {
+            clipboard::write_image(&artifact.bytes, hold_secs)?;
+            Ok(0)
+        }
     }
 }
 
@@ -296,8 +345,7 @@ fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
     let format = &artifact.format;
     let ok = extension == format.as_str()
         || (extension == "jpg" && format == "jpeg")
-        || (extension == "ogg" && format == "opus")
-        || (extension == "txt" && artifact.kind == MediaKind::Text);
+        || (extension == "ogg" && format == "opus");
     if !ok {
         return Err(format!(
             "output format is '{format}', but the file is named '.{extension}'; \
@@ -308,8 +356,10 @@ fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
 }
 
 /// Write bytes via a same-directory temp file, then commit without
-/// clobbering an existing target (hard link on Unix, exclusive create
-/// elsewhere). `--overwrite` swaps the commit for an atomic rename.
+/// clobbering an existing target: the no-clobber commit is a fresh hard
+/// link (it fails atomically when the target exists — no check-then-rename
+/// race), with the temp file unlinked afterwards. `--overwrite` swaps the
+/// commit for an atomic rename.
 pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) -> AppResult<()> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(dir) = parent {
@@ -341,21 +391,37 @@ pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) ->
             .map_err(|e| AppError::delivery(format!("cannot flush {}: {e}", temp.display())))?;
         Ok(())
     };
-    write_temp()?;
+    if let Err(e) = write_temp() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
 
+    let already_exists = || {
+        AppError::delivery(format!(
+            "{} already exists; use --overwrite to replace it",
+            target.display()
+        ))
+    };
     let commit = || -> AppResult<()> {
         if overwrite {
             std::fs::rename(&temp, target).map_err(|e| {
                 AppError::delivery(format!("cannot replace {}: {e}", target.display()))
             })
-        } else if target.exists() {
-            Err(AppError::delivery(format!(
-                "{} already exists; use --overwrite to replace it",
-                target.display()
-            )))
         } else {
-            std::fs::rename(&temp, target)
-                .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", target.display())))
+            match std::fs::hard_link(&temp, target) {
+                // The link shares the temp file's inode; drop the temp name.
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&temp);
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(already_exists()),
+                // Filesystems without hard-link support fall back to the
+                // racy check-then-rename (sequential behavior is correct).
+                Err(_) if target.exists() => Err(already_exists()),
+                Err(_) => std::fs::rename(&temp, target).map_err(|e| {
+                    AppError::delivery(format!("cannot write {}: {e}", target.display()))
+                }),
+            }
         }
     };
     match commit() {
@@ -415,8 +481,9 @@ fn write_directory(
 }
 
 /// Program-generated names; a service-returned file name can never escape
-/// the target directory.
-fn artifact_file_name(artifact: &Artifact) -> String {
+/// the target directory. History uses the same scheme so records and
+/// deliveries never disagree about where an artifact lives.
+pub(crate) fn artifact_file_name(artifact: &Artifact) -> String {
     let extension = match artifact.kind {
         MediaKind::Text => "txt",
         _ => artifact.format.as_str(),
@@ -523,7 +590,8 @@ mod tests {
         };
         // Deliver to a real stdout is awkward in-process; the states tell
         // the story.
-        let outcome = deliver(&args).unwrap();
+        let outcome = deliver(&args);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(outcome.states.len(), 1);
         assert!(outcome.states[0].status.is_succeeded());
     }

@@ -4,21 +4,32 @@
 use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
 use crate::config;
 use crate::domain::{
-    AppError, AppResult, DeliveryState, DeliveryStatus, Destination, GenerationStatus, MediaKind,
-    RunRecord,
+    AppError, AppResult, Destination, GenerationStatus, MediaKind, RunRecord, RunSummary,
 };
 use crate::history;
 use crate::input::InputEnv;
 use crate::output::{self, DeliverArgs};
-use crate::plan::{self, ExecutionPlan, TerminalInfo};
+use crate::plan::{self, TerminalInfo};
 use crate::runner;
 use crate::tasks;
 use anyhow::Result;
 use clap::Parser as _;
 use std::io::Write as _;
+use std::sync::Arc;
 
 /// Exit code for "the user pressed Ctrl+C".
 pub const EXIT_CANCEL: i32 = 130;
+
+/// What the Ctrl+C handler needs to leave an honest trace of an
+/// interrupted run: the run was started (a history dir may exist) but no
+/// result ever existed.
+struct PendingRun {
+    run_id: String,
+    task: Option<String>,
+    created_at: String,
+    summary: RunSummary,
+    record_history: bool,
+}
 
 pub async fn run() -> i32 {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -36,15 +47,46 @@ pub async fn run() -> i32 {
         }
     };
     // Ctrl+C anywhere in a run cancels it (exit 130) instead of hanging on
-    // a slow request or leaving a half-written delivery.
+    // a slow request or leaving a half-written delivery. The interrupted
+    // run is recorded as cancelled when a plan had already been built.
+    let pending: Arc<std::sync::Mutex<Option<PendingRun>>> = Arc::default();
     let result = tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => return EXIT_CANCEL,
-        result = dispatch(cli, normalized) => result,
+        _ = tokio::signal::ctrl_c() => {
+            record_cancelled(&pending);
+            return EXIT_CANCEL;
+        }
+        result = dispatch(cli, normalized, pending.clone()) => result,
     };
     match result {
         Ok(()) => 0,
         Err(e) => fail(&e),
+    }
+}
+
+fn record_cancelled(pending: &std::sync::Mutex<Option<PendingRun>>) {
+    let claimed = pending.lock().ok().and_then(|mut slot| slot.take());
+    match claimed {
+        Some(p) => {
+            eprintln!("interrupted — the run was cancelled, nothing was delivered");
+            if p.record_history {
+                let record = RunRecord {
+                    run_id: p.run_id,
+                    task: p.task,
+                    created_at: p.created_at,
+                    summary: p.summary,
+                    generation: GenerationStatus::Cancelled,
+                    artifacts: Vec::new(),
+                    warnings: vec!["interrupted by Ctrl+C".into()],
+                    deliveries: Vec::new(),
+                };
+                best_effort(
+                    history::save_generation(&record, false),
+                    "failed to record the interrupted run",
+                );
+            }
+        }
+        None => eprintln!("interrupted"),
     }
 }
 
@@ -54,7 +96,11 @@ fn fail(e: &AppError) -> i32 {
     e.kind.exit_code()
 }
 
-async fn dispatch(cli: Cli, normalized: Normalized) -> AppResult<()> {
+async fn dispatch(
+    cli: Cli,
+    normalized: Normalized,
+    pending: Arc<std::sync::Mutex<Option<PendingRun>>>,
+) -> AppResult<()> {
     // Management subcommands.
     match &cli.command {
         Some(Commands::Tasks { cmd }) => return manage_tasks(cmd),
@@ -107,48 +153,92 @@ async fn dispatch(cli: Cli, normalized: Normalized) -> AppResult<()> {
         return Ok(());
     }
 
+    // The run id exists before the request so a Ctrl+C mid-flight can be
+    // recorded. With history on the run dir is created exclusively here;
+    // with history off nothing is created.
+    let record_history = plan.record_history;
+    let run_id = if record_history {
+        history::new_run_id()
+    } else {
+        history::stamp_now()
+    };
+    if let Ok(mut slot) = pending.lock() {
+        *slot = Some(PendingRun {
+            run_id: run_id.clone(),
+            task: Some(task.name.clone()),
+            created_at: now_iso(),
+            summary: plan::summarize(&plan),
+            record_history,
+        });
+    }
+
     // Run: the runner streams, merges and assembles artifacts.
     let output = runner::execute(&plan).await?;
+    // The outcome now exists and is recorded below; a Ctrl+C from here on
+    // (during the save or the delivery) must not overwrite that record
+    // with an empty cancelled placeholder.
+    if let Ok(mut slot) = pending.lock() {
+        *slot = None;
+    }
+
+    // A generation that finished cleanly but did not satisfy the request
+    // (missing kind, short count) is recorded, clearly marked as
+    // incomplete, and not delivered.
+    let unsatisfied = output.unsatisfied_reason(&plan);
+    let generation = match (&output.status, &unsatisfied) {
+        (GenerationStatus::Complete, Some(reason)) => GenerationStatus::Incomplete {
+            reason: reason.clone(),
+        },
+        (status, _) => status.clone(),
+    };
 
     // Truncated or otherwise incomplete generations are recorded but not
     // delivered (what streamed live already cannot be taken back).
-    let run_id = history::new_run_id();
     let mut record = RunRecord {
         run_id: run_id.clone(),
         task: Some(task.name.clone()),
         created_at: now_iso(),
         summary: plan::summarize(&plan),
-        generation: output.status.clone(),
+        generation,
         artifacts: output.artifacts.clone(),
         warnings: output.warnings.clone(),
         deliveries: Vec::new(),
     };
-    if !output.status.is_complete() {
+    if !record.generation.is_complete() {
         if plan.record_history {
+            // `output.status` is Complete for an unsatisfied generation:
+            // its validated artifacts stay in the record's directory
+            // instead of being dropped. A truncated stream keeps metadata
+            // only — partial text is never presented as recoverable.
             best_effort(
-                history::save_generation(&record),
+                history::save_generation(&record, output.status.is_complete()),
                 "failed to record the run",
             );
         }
-        let reason = match &output.status {
+        let reason = match &record.generation {
             GenerationStatus::Incomplete { reason } => format!(" ({reason})"),
             _ => String::new(),
         };
-        return Err(AppError::generation(format!(
-            "the generation did not complete{reason}; the result is not delivered"
-        )));
+        let message = if unsatisfied.is_some() {
+            format!(
+                "the generation did not satisfy the request{reason}; the result is not delivered"
+            )
+        } else {
+            format!("the generation did not complete{reason}; the result is not delivered")
+        };
+        return Err(AppError::generation(message));
     }
 
     // Save before delivery: a generation is recoverable even when every
     // destination fails.
     if plan.record_history {
         best_effort(
-            history::save_generation(&record),
+            history::save_generation(&record, false),
             "failed to record the run",
         );
     }
 
-    let hold_secs = cfg.settings.hold_secs.unwrap_or(45);
+    let hold_secs = cfg.settings.hold_secs.unwrap_or(config::DEFAULT_HOLD_SECS);
     let deliver_args = DeliverArgs {
         artifacts: &output.artifacts,
         produce: &plan.resolved.produce,
@@ -161,50 +251,27 @@ async fn dispatch(cli: Cli, normalized: Normalized) -> AppResult<()> {
         run_id: &run_id,
         task: Some(&task.name),
     };
-    match output::deliver(&deliver_args) {
-        Ok(outcome) => {
-            record.deliveries = outcome.states;
-            if plan.record_history {
-                best_effort(
-                    history::update_deliveries(&record),
-                    "failed to update the run record",
-                );
-                history::prune(
-                    cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP),
-                    cfg.settings
-                        .history_bytes
-                        .unwrap_or(history::DEFAULT_HISTORY_BYTES),
-                );
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Keep whatever succeeded on record: partial deliveries are
-            // the recoverable path when the clipboard failed.
-            record.deliveries = fallback_states(&plan);
-            if plan.record_history {
-                best_effort(
-                    history::update_deliveries(&record),
-                    "failed to update the run record",
-                );
-            }
-            Err(e)
-        }
+    // The outcome keeps every destination's real state, on success and on
+    // failure alike: partial deliveries are the recoverable path when a
+    // later destination (say, the clipboard) failed.
+    let outcome = output::deliver(&deliver_args);
+    record.deliveries = outcome.states;
+    if plan.record_history {
+        best_effort(
+            history::update_deliveries(&record),
+            "failed to update the run record",
+        );
+        history::prune(
+            cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP),
+            cfg.settings
+                .history_bytes
+                .unwrap_or(history::DEFAULT_HISTORY_BYTES),
+        );
     }
-}
-
-/// Best-effort per-destination states when delivery reported an error:
-/// stdout streamed live already, so it "succeeded" as far as bytes go.
-fn fallback_states(plan: &ExecutionPlan) -> Vec<DeliveryState> {
-    plan.destinations
-        .iter()
-        .map(|d| DeliveryState {
-            destination: d.clone(),
-            status: DeliveryStatus::Failed {
-                error: "delivery failed".into(),
-            },
-        })
-        .collect()
+    match outcome.error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn best_effort(result: Result<()>, what: &str) {
@@ -300,23 +367,27 @@ async fn manage_history(cmd: &HistoryCmd) -> AppResult<()> {
 }
 
 /// Restore delivers through the normal output system without touching the
-/// service (or credentials, or the config).
+/// service (or credentials).
 async fn deliver_restored(cli: &Cli, record: RunRecord) -> AppResult<()> {
     let produce: Vec<MediaKind> = record.artifacts.iter().map(|a| a.kind).collect();
     let destinations: Vec<Destination> = restore_destinations(cli, &record)?;
+    let hold_secs = config::load()
+        .ok()
+        .and_then(|c| c.settings.hold_secs)
+        .unwrap_or(config::DEFAULT_HOLD_SECS);
     let args = DeliverArgs {
         artifacts: &record.artifacts,
         produce: &produce,
         destinations: &destinations,
         overwrite: cli.overwrite,
         live_stdout: false,
-        hold_secs: 45,
+        hold_secs,
         quiet: cli.quiet,
         json: cli.json,
         run_id: &record.run_id,
         task: record.task.as_deref(),
     };
-    output::deliver(&args).map(|_| ())
+    output::deliver(&args).result().map(|_| ())
 }
 
 fn restore_destinations(cli: &Cli, record: &RunRecord) -> AppResult<Vec<Destination>> {
@@ -343,6 +414,14 @@ fn restore_destinations(cli: &Cli, record: &RunRecord) -> AppResult<Vec<Destinat
         destinations.push(Destination::Clipboard);
     }
     if destinations.is_empty() {
+        // Default stdout: binary on a terminal is refused, exactly as the
+        // live plan refuses it — media goes to -o/--out-dir or a pipe.
+        let binary = record.artifacts.iter().any(|a| a.kind != MediaKind::Text);
+        if binary && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return Err(AppError::usage(
+                "this run produced binary artifacts; use -o FILE or --out-dir, or pipe stdout",
+            ));
+        }
         destinations.push(Destination::Stdout);
     }
     Ok(destinations)

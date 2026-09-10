@@ -26,6 +26,17 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Parse an operation name (used to validate provider route keys).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "generate" => Some(Self::Generate),
+            "speech" => Some(Self::Speech),
+            "transcribe" => Some(Self::Transcribe),
+            "image" => Some(Self::Image),
+            _ => None,
+        }
+    }
+
     /// The adapter name used when a provider route is not configured
     /// explicitly; also the key into `[providers.X.routes]`.
     pub fn default_route(self) -> &'static str {
@@ -347,7 +358,8 @@ mod tests {
         assert!(ocr.required_types.contains(&MediaKind::Image));
         let tts = &all["tts"];
         assert_eq!(tts.operation, Operation::Speech);
-        assert!(!tts.requires_material || tts.requires_material);
+        // tts is useless without material to speak
+        assert!(tts.requires_material);
         // ask runs without material
         assert!(!all["ask"].requires_material);
         // transcribe allows exactly one audio

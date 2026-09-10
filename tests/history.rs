@@ -374,3 +374,244 @@ fn last_can_restore_media_into_a_directory() {
         bytes.to_vec()
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_delivery_records_each_destination_honestly() {
+    // The file write succeeds and the clipboard write fails (headless):
+    // exit 5, and the manifest must keep the real per-destination states
+    // — file delivered, clipboard failed — instead of marking everything
+    // failed.
+    let server = Server::json(chat_body("PARTIAL"));
+    let dir = temp_dir("hist-partial");
+    let out_file = dir.join("out.txt");
+    let cfg = chat_cfg(&server.url());
+    let envs = [
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ];
+    let out = run_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "-o",
+            out_file.to_str().unwrap(),
+            "--copy",
+        ],
+        b"hi\n",
+        &envs,
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(5);
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    let deliveries = manifest["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 2, "{deliveries:?}");
+    let file_state = deliveries
+        .iter()
+        .find(|d| d["destination"]["type"] == "file")
+        .expect("file destination recorded");
+    assert_eq!(file_state["status"], "succeeded", "{deliveries:?}");
+    let clip_state = deliveries
+        .iter()
+        .find(|d| d["destination"]["type"] == "clipboard")
+        .expect("clipboard destination recorded");
+    assert!(
+        clip_state["status"].get("failed").is_some(),
+        "{deliveries:?}"
+    );
+}
+
+#[test]
+fn byte_budget_never_deletes_the_newest_run() {
+    // An old complete run heavier than the whole budget is pruned, but
+    // the run just saved always survives — the recovery promise depends
+    // on it — even while the total stays over budget.
+    let dir = temp_dir("hist-bytes");
+    let old_id = "20260101-000000.000";
+    let old_dir = dir.join(old_id);
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(old_dir.join("text.txt"), vec![b'x'; 4096]).unwrap();
+    std::fs::write(
+        old_dir.join("manifest.json"),
+        format!(
+            r#"{{"version":1,"run_id":"{old_id}","task":"summarize","created_at":"2026-01-01T00:00:00Z","generation":{{"status":"complete"}},"artifacts":[{{"id":"text","kind":"text","mime":"text/plain","format":"text","file":"text.txt","size":4096}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    let server = Server::json(chat_body("NEW"));
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 50\nhistory_bytes = 1024\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 1, "the over-budget old run is pruned");
+    assert_ne!(runs[0].file_name().unwrap(), old_id);
+    // the newest run is still recoverable
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "NEW\n");
+}
+
+#[test]
+fn last_skips_a_damaged_newest_entry() {
+    // One corrupted manifest must not brick recovery: `last` skips the
+    // unreadable entry and restores the older complete run.
+    let dir = temp_dir("hist-corrupt");
+    let server = Server::json(chat_body("OLDER"));
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+
+    let bad = dir.join("99999999-999999.999");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("manifest.json"), "{ not json").unwrap();
+
+    let out = run(
+        &["last"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "OLDER\n");
+}
+
+#[test]
+fn unsatisfied_generation_is_recorded_with_its_artifacts() {
+    // --count 2 but the service returns one image: exit 4, and the good
+    // image stays in the clearly-marked record instead of being dropped.
+    let dir = temp_dir("hist-unsatisfied");
+    let body = serde_json::json!({"created": 1, "data": [{"b64_json": b64(&solid_png(2, 2))}]})
+        .to_string();
+    let server = Server::json(&body);
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"gpt-image-1\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "a dog",
+            "--count",
+            "2",
+            // satisfies the "multiple images need a directory" precheck;
+            // the run never reaches delivery
+            "--out-dir",
+            dir.join("never").to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(4);
+    assert!(out.stderr().contains("expected 2"), "{}", out.stderr());
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 1, "the run is recorded");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    assert!(manifest["generation"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("expected 2"));
+    assert!(runs[0].join("image-1.png").exists(), "artifact bytes kept");
+    assert!(!runs[0].join("image-2.png").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_records_a_cancelled_run_and_exits_130() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+
+    // A server that accepts and never answers: the request hangs until
+    // the interrupt arrives.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let holder = std::thread::spawn(move || {
+        let _stream = listener.accept();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    let dir = temp_dir("hist-cancel");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:{port}\""
+    ));
+    let mut child = Command::new(EXE)
+        .args(["ask", "-", "-p", "hang", "--profile", "test"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("AIDO_CONFIG", cfg.to_str().unwrap())
+        .env("AIDO_TASKS_DIR", "/nonexistent/aido-test-tasks")
+        .env("AIDO_HISTORY_DIR", dir.to_str().unwrap())
+        .spawn()
+        .unwrap();
+    // Feed the piped material and close stdin so gathering finishes and
+    // the request starts hanging.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello\n").unwrap();
+    drop(stdin);
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    holder.join().ok();
+
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 1, "the interrupted run leaves a trace");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "cancelled");
+}

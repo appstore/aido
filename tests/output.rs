@@ -313,7 +313,10 @@ fn several_artifacts_cannot_share_bare_stdout() {
         &[("AIDO_CONFIG", cfg.to_str().unwrap())],
         cfg.clone(),
     );
-    assert_eq!(out.code(), 4, "stderr: {}", out.stderr());
+    assert_eq!(out.code(), 2, "stderr: {}", out.stderr());
+    assert!(out
+        .stderr()
+        .contains("several artifacts cannot share bare stdout"));
     assert!(out.stdout().is_empty());
 }
 
@@ -342,4 +345,28 @@ pub fn encode_png() -> String {
         });
     }
     out
+}
+
+#[test]
+fn attached_short_o_delivers_to_the_named_file() {
+    // `-ofile` (attached short value) must reach --output, never collapse
+    // into the prompt.
+    let server = Server::json(chat_body("FILED"));
+    let dir = temp_dir("out-attached");
+    let file = dir.join("out.txt");
+    let cfg = chat_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--text",
+            "hi",
+            &format!("-o{}", file.display()),
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "FILED");
 }

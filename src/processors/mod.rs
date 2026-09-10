@@ -22,8 +22,13 @@ pub struct RequestStep {
     pub hard_cut_end: bool,
 }
 
-/// Decide the request sequence for the chosen processor.
-pub fn plan_steps(inputs: &[InputPart], kind: ProcessorKind) -> Result<Vec<RequestStep>> {
+/// Decide the request sequence for the chosen processor. `quiet`
+/// suppresses side-channel notes (stderr).
+pub fn plan_steps(
+    inputs: &[InputPart],
+    kind: ProcessorKind,
+    quiet: bool,
+) -> Result<Vec<RequestStep>> {
     match kind {
         ProcessorKind::Single => Ok(vec![RequestStep {
             index: 0,
@@ -31,7 +36,7 @@ pub fn plan_steps(inputs: &[InputPart], kind: ProcessorKind) -> Result<Vec<Reque
             label: "all material".into(),
             hard_cut_end: false,
         }]),
-        ProcessorKind::OcrTiles => ocr::plan_steps(inputs),
+        ProcessorKind::OcrTiles => ocr::plan_steps(inputs, quiet),
     }
 }
 

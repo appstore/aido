@@ -329,3 +329,48 @@ fn dry_run_explains_the_plan_without_any_request() {
     // deadline, which surfaces as a join error)
     assert!(handle.join().is_err(), "dry-run must not send requests");
 }
+
+#[test]
+fn config_check_flags_route_keys_that_are_not_operations() {
+    // A typo'd route key (`speach`) would silently fall back to the
+    // conventional adapter; `config check` must name it.
+    let cfg = settings_config(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"\n\
+         [providers.srv.routes]\nspeach = \"openai-speech\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    assert!(out.stdout().contains("speach"), "{}", out.stdout());
+    assert!(
+        out.stdout().contains("not an operation"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn config_check_requires_the_default_profile_to_exist_with_providers() {
+    // The built-in `default` profile only exists when no providers are
+    // configured; check and a real run must agree about that.
+    let cfg = settings_config(
+        "[settings]\nhistory_keep = 0\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stdout().contains("default profile 'default'"),
+        "{}",
+        out.stdout()
+    );
+}

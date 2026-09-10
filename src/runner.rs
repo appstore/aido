@@ -3,7 +3,7 @@
 
 use crate::api::{Client, Connection, GenerateRequest, GenerateResult};
 use crate::domain::{
-    AppError, AppResult, Artifact, Destination, ErrorKind, GenerationStatus, MediaKind, Provenance,
+    AppError, AppResult, Artifact, Destination, GenerationStatus, MediaKind, Provenance,
 };
 use crate::plan::{DeliveryMode, ExecutionPlan};
 use crate::processors::ocr::BoundaryGate;
@@ -19,6 +19,35 @@ pub struct RunOutput {
     pub warnings: Vec<String>,
     /// Live stdout already printed the text (cannot be taken back).
     pub live_stdout: bool,
+}
+
+impl RunOutput {
+    /// Why the artifacts do not satisfy what the plan asked for, if they
+    /// do not. The plan's expectations re-validated against the real
+    /// response (contract §step 4.8): a missing kind, a short count, or
+    /// nothing usable at all. The caller records the run and refuses
+    /// delivery instead of discarding what did come back.
+    pub fn unsatisfied_reason(&self, plan: &ExecutionPlan) -> Option<String> {
+        for kind in &plan.resolved.produce {
+            if !self.artifacts.iter().any(|a| a.kind == *kind) {
+                return Some(format!(
+                    "the response did not produce the requested '{kind}' output"
+                ));
+            }
+        }
+        for (kind, expected) in &plan.expected_counts {
+            if let Some(n) = expected {
+                let have = self.artifacts.iter().filter(|a| a.kind == *kind).count() as u64;
+                if have != *n {
+                    return Some(format!("expected {n} {kind} artifact(s), got {have}"));
+                }
+            }
+        }
+        if self.artifacts.is_empty() {
+            return Some("the model returned no usable content for this run".into());
+        }
+        None
+    }
 }
 
 fn env_key(name: &str) -> Option<String> {
@@ -175,31 +204,6 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         });
     }
 
-    // Post-checks on what actually came back (the plan's expectations are
-    // re-validated against the real response, contract §step 4.8).
-    for kind in &plan.resolved.produce {
-        if !artifacts.iter().any(|a| a.kind == *kind) {
-            return Err(AppError::generation(format!(
-                "the response did not produce the requested '{kind}' output"
-            )));
-        }
-    }
-    for (kind, expected) in &plan.expected_counts {
-        if let Some(n) = expected {
-            let have = artifacts.iter().filter(|a| a.kind == *kind).count() as u64;
-            if have != *n {
-                return Err(AppError::generation(format!(
-                    "expected {n} {kind} artifact(s), got {have}"
-                )));
-            }
-        }
-    }
-    if artifacts.is_empty() {
-        return Err(AppError::generation(
-            "the model returned no usable content for this run",
-        ));
-    }
-
     Ok(RunOutput {
         artifacts,
         status: overall,
@@ -214,18 +218,13 @@ fn absorb(
     warnings: &mut Vec<String>,
     overall: &mut GenerationStatus,
 ) {
-    warnings.extend(reply.warnings);
+    for warning in reply.warnings {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
     media_artifacts.extend(reply.artifacts);
     if reply.status != GenerationStatus::Complete && *overall == GenerationStatus::Complete {
         *overall = reply.status;
-    }
-}
-
-/// The exit-code kind for a run whose generation did not complete cleanly.
-pub fn classify(output: &RunOutput) -> Option<ErrorKind> {
-    if output.status.is_complete() {
-        None
-    } else {
-        Some(ErrorKind::Generation)
     }
 }

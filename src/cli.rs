@@ -131,15 +131,25 @@ enum Slot {
 fn flag_arity(token: &str) -> Option<bool> {
     if let Some((name, _)) = token.split_once('=') {
         if name.len() > 2 && name.starts_with("--") {
-            return FLAGS.iter().find(|(f, _)| *f == name).map(|(_, v)| *v);
+            return Some(match FLAGS.iter().find(|(f, _)| *f == name) {
+                Some((_, takes_value)) => *takes_value,
+                // An unknown `--x=y` is still a flag: hand it to clap so
+                // the typo gets "unexpected argument", not "cannot read
+                // the file".
+                None => false,
+            });
+        }
+        // -p=… / -m=… / -o=… are attached short values.
+        if SHORT_VALUE_FLAGS.iter().any(|(s, _)| *s == name) {
+            return Some(true);
         }
         return None;
     }
     if let Some((_, v)) = FLAGS.iter().find(|(f, _)| *f == token) {
         return Some(*v);
     }
-    for short in ["-p", "-m", "-o"] {
-        if token == short {
+    for (short, _) in SHORT_VALUE_FLAGS {
+        if token == *short {
             return Some(true);
         }
         if token.starts_with(short) && token.len() > 2 {
@@ -160,6 +170,8 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     let mut after_separator = false;
     // Free tokens seen before `--`; only these can name a task.
     let mut free_pre: Vec<OsString> = Vec::new();
+    // Everything after `--`; management commands must keep these literals.
+    let mut post_separator: Vec<OsString> = Vec::new();
 
     let mut iter = argv.into_iter().peekable();
     while let Some(token) = iter.next() {
@@ -178,39 +190,61 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                 }
                 match flag_arity(t) {
                     Some(true) => {
+                        // Resolve an attached short (-pfoo/-mfoo/-ofile) to
+                        // its long form so every check below sees one
+                        // spelling.
+                        let attached = short_attached(t);
                         if t == "--prompt"
                             || t.starts_with("--prompt=")
                             || t == "-p"
-                            || t.starts_with("-p")
+                            || attached
+                                .as_ref()
+                                .is_some_and(|(long, _)| *long == "--prompt")
                         {
                             prompt_seen = true;
                         }
-                        if t == "--text" {
-                            let value = t
-                                .split_once('=')
-                                .map(|(_, v)| v.to_string())
-                                .unwrap_or_else(|| take_value(&mut iter));
+                        if t == "--text" || t.starts_with("--text=") {
+                            let value = match t.split_once('=') {
+                                Some((_, v)) => v.to_string(),
+                                None => take_value(&mut iter)
+                                    .ok_or_else(|| anyhow::anyhow!("--text requires a value"))?,
+                            };
                             slots.push(Slot::Text(value));
-                        } else if t == "--prompt" || t.starts_with("--prompt=") {
-                            let value = t
-                                .strip_prefix("--prompt")
-                                .and_then(|v| v.strip_prefix('='))
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| take_value(&mut iter));
-                            rest.push(OsString::from("--prompt"));
+                        } else if let Some((long, value)) = attached {
+                            rest.push(OsString::from(long));
                             rest.push(OsString::from(value));
-                        } else if let Some(value) = short_attached(t) {
+                        } else if t == "--prompt" || t.starts_with("--prompt=") {
+                            let value = match t.strip_prefix("--prompt=") {
+                                Some(v) => v.to_string(),
+                                None => take_value(&mut iter)
+                                    .ok_or_else(|| anyhow::anyhow!("--prompt requires a value"))?,
+                            };
                             rest.push(OsString::from("--prompt"));
                             rest.push(OsString::from(value));
                         } else {
-                            rest.push(token.clone());
                             // `--flag=value` carries its own value; only the
                             // separated form consumes the next token.
                             if !t.contains('=') {
                                 let Some(value) = iter.next() else {
                                     bail!("{} requires a value", t);
                                 };
-                                rest.push(value);
+                                // A negative number would look like a flag
+                                // to clap; the combined form keeps it a
+                                // value.
+                                let negative = value
+                                    .to_str()
+                                    .is_some_and(|v| v.starts_with('-') && v != "-");
+                                if negative {
+                                    let mut combined = token.clone();
+                                    combined.push("=");
+                                    combined.push(&value);
+                                    rest.push(combined);
+                                } else {
+                                    rest.push(token.clone());
+                                    rest.push(value);
+                                }
+                            } else {
+                                rest.push(token.clone());
                             }
                         }
                         continue;
@@ -233,7 +267,9 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
             }
         }
         // A free token (or anything after `--`).
-        if !after_separator {
+        if after_separator {
+            post_separator.push(token.clone());
+        } else {
             free_pre.push(token.clone());
         }
         slots.push(Slot::Free(token));
@@ -241,11 +277,30 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
 
     let first = free_pre.first().and_then(|t| t.to_str());
 
+    // `aido help` / `aido version` are words, not tasks: show the real
+    // thing instead of "unknown task 'help' (did you mean 'help'?)".
+    if matches!(first, Some("help") | Some("version")) {
+        let flag = if first == Some("help") {
+            "--help"
+        } else {
+            "--version"
+        };
+        return Ok(Normalized {
+            task: None,
+            specs: Vec::new(),
+            argv: vec![OsString::from(flag)],
+        });
+    }
+
     // Management commands go to clap as subcommands: the words themselves
     // must stay in the argv (flags may precede them, which clap accepts).
     if let Some(word) = first {
         if matches!(word, "tasks" | "profiles" | "config" | "history") {
+            if prompt_seen {
+                bail!("`-p` has no effect on management commands; pass the instruction to a task run instead");
+            }
             rest.extend(free_pre.clone());
+            rest.extend(post_separator);
             return Ok(Normalized {
                 task: None,
                 specs: specs_from(slots, usize::MAX),
@@ -254,9 +309,16 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         }
     }
     if let Some("last") = first {
+        // `last` redelivers a recorded run; it takes no fresh material.
+        if !specs_from(slots, 1).is_empty() {
+            bail!(
+                "`aido last` takes no input; it redelivers the most recent \
+                 completed run (output flags like -o/--out-dir still apply)"
+            );
+        }
         return Ok(Normalized {
             task: Some(LAST_TASK.to_string()),
-            specs: specs_from(slots, 1),
+            specs: Vec::new(),
             argv: {
                 let mut argv = vec![OsString::from("--__task"), OsString::from(LAST_TASK)];
                 argv.extend(rest);
@@ -264,8 +326,6 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
             },
         });
     }
-
-    let all_tasks = crate::tasks::load_all()?;
 
     // `run NAME` — NAME is the next free token.
     if first == Some("run") {
@@ -285,29 +345,34 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     let task = if let Some(word) = first {
         if word == "ask" {
             Some("ask".to_string())
-        } else if all_tasks.contains_key(word) {
-            Some(word.to_string())
-        } else if prompt_seen {
-            // -p selects `ask`; positionals are files.
-            None
-        } else if looks_like_path(word) {
-            bail!(
-                "file input requires a task or -p, e.g. `aido ocr {word}` or \
-                 `aido -p \"<instructions>\" {word}` (see `aido tasks list`)"
-            );
         } else {
-            let mut names: Vec<&str> = all_tasks.keys().map(String::as_str).collect();
-            names.extend(RESERVED_WORDS);
-            names.sort_unstable();
-            names.dedup();
-            let hint = crate::tasks::closest(word, &names)
-                .map(|best| format!(" (did you mean '{best}'?)"))
-                .unwrap_or_default();
-            bail!(
-                "unknown task '{word}'; available: {}{hint} \
-                 (or pass -p \"<instruction>\" for an ad-hoc run)",
-                names.join(", ")
-            );
+            // Loaded lazily: `aido --help` must not parse user task files
+            // (a broken one would print a warning on a pure help request).
+            let all_tasks = crate::tasks::load_all()?;
+            if all_tasks.contains_key(word) {
+                Some(word.to_string())
+            } else if prompt_seen {
+                // -p selects `ask`; positionals are files.
+                None
+            } else if looks_like_path(word) {
+                bail!(
+                    "file input requires a task or -p, e.g. `aido ocr {word}` or \
+                     `aido -p \"<instructions>\" {word}` (see `aido tasks list`)"
+                );
+            } else {
+                let mut names: Vec<&str> = all_tasks.keys().map(String::as_str).collect();
+                names.extend(RESERVED_WORDS);
+                names.sort_unstable();
+                names.dedup();
+                let hint = crate::tasks::closest(word, &names)
+                    .map(|best| format!(" (did you mean '{best}'?)"))
+                    .unwrap_or_default();
+                bail!(
+                    "unknown task '{word}'; available: {}{hint} \
+                     (or pass -p \"<instruction>\" for an ad-hoc run)",
+                    names.join(", ")
+                );
+            }
         }
     } else {
         None
@@ -366,22 +431,31 @@ fn looks_like_path(word: &str) -> bool {
         || std::path::Path::new(word).exists()
 }
 
-fn short_attached(token: &str) -> Option<String> {
-    for short in ["-p", "-m", "-o"] {
-        if let Some(value) = token.strip_prefix(short) {
-            if !value.is_empty() && !value.starts_with('=') {
-                return Some(value.to_string());
+/// Short flags that take a value, and the long flag each stands for.
+const SHORT_VALUE_FLAGS: &[(&str, &str)] =
+    &[("-p", "--prompt"), ("-m", "--model"), ("-o", "--output")];
+
+/// An attached short value and the long flag it stands for: `-pfoo` →
+/// `("--prompt", "foo")`, `-mfoo` → `("--model", "foo")`, `-ofile` →
+/// `("--output", "file")`. The `=` form (`-p=foo`) resolves the same way.
+fn short_attached(token: &str) -> Option<(&'static str, String)> {
+    for (short, long) in SHORT_VALUE_FLAGS {
+        let Some(value) = token.strip_prefix(short) else {
+            continue;
+        };
+        if let Some(v) = value.strip_prefix('=') {
+            if !v.is_empty() {
+                return Some((long, v.to_string()));
             }
+        } else if !value.is_empty() {
+            return Some((long, value.to_string()));
         }
     }
     None
 }
 
-fn take_value(iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>) -> String {
-    match iter.next() {
-        Some(v) => v.to_string_lossy().into_owned(),
-        None => String::new(),
-    }
+fn take_value(iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>) -> Option<String> {
+    iter.next().map(|v| v.to_string_lossy().into_owned())
 }
 
 /// Turn slots into specs, skipping the first `skip` free tokens (the task
@@ -779,5 +853,96 @@ mod tests {
     fn bare_argv_yields_no_task() {
         let n = normalize(os(&[])).unwrap();
         assert_eq!(n.task, None);
+    }
+
+    #[test]
+    fn attached_short_values_map_to_their_own_flags() {
+        // -mVALUE must reach --model, never collapse into --prompt.
+        let n = normalize(os(&["summarize", "-mmodel-x", "--text", "hi"])).unwrap();
+        let i = n.argv.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(n.argv[i + 1], OsString::from("model-x"));
+        assert!(
+            !n.argv.contains(&OsString::from("--prompt")),
+            "{:?}",
+            n.argv
+        );
+        // -oVALUE reaches --output.
+        let n = normalize(os(&["ask", "-phi", "-ofile.mp3"])).unwrap();
+        let i = n.argv.iter().position(|a| a == "--output").unwrap();
+        assert_eq!(n.argv[i + 1], OsString::from("file.mp3"));
+        let i = n.argv.iter().position(|a| a == "--prompt").unwrap();
+        assert_eq!(n.argv[i + 1], OsString::from("hi"));
+    }
+
+    #[test]
+    fn attached_short_equals_form_resolves() {
+        let n = normalize(os(&["summarize", "-m=model-x"])).unwrap();
+        let i = n.argv.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(n.argv[i + 1], OsString::from("model-x"));
+    }
+
+    #[test]
+    fn text_flag_accepts_the_equals_form() {
+        let n = normalize(os(&["ask", "--text=hi"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Text("hi".into())]);
+    }
+
+    #[test]
+    fn value_flags_require_their_values() {
+        let err = normalize(os(&["ask", "--text"])).unwrap_err();
+        assert!(err.to_string().contains("--text requires a value"), "{err}");
+        let err = normalize(os(&["ask", "-p"])).unwrap_err();
+        assert!(err.to_string().contains("requires a value"), "{err}");
+    }
+
+    #[test]
+    fn unknown_flag_with_value_is_not_a_file() {
+        let n = normalize(os(&["summarize", "--text", "hi", "--typo=x"])).unwrap();
+        // The token stays in the clap argv (which rejects it); it never
+        // becomes an input file.
+        assert!(n.argv.contains(&OsString::from("--typo=x")), "{:?}", n.argv);
+        assert!(n.specs.iter().all(|s| !matches!(s, SourceSpec::File(_))));
+    }
+
+    #[test]
+    fn negative_numbers_stay_flag_values() {
+        let n = normalize(os(&["ask", "-p", "hi", "--temperature", "-0.5"])).unwrap();
+        assert!(
+            n.argv.contains(&OsString::from("--temperature=-0.5")),
+            "{:?}",
+            n.argv
+        );
+    }
+
+    #[test]
+    fn help_and_version_are_words_not_tasks() {
+        let n = normalize(os(&["help"])).unwrap();
+        assert_eq!(n.argv, vec![OsString::from("--help")]);
+        let n = normalize(os(&["version"])).unwrap();
+        assert_eq!(n.argv, vec![OsString::from("--version")]);
+    }
+
+    #[test]
+    fn last_rejects_input_material() {
+        let err = normalize(os(&["last", "notes.txt"])).unwrap_err();
+        assert!(err.to_string().contains("takes no input"), "{err}");
+        let n = normalize(os(&["last", "--copy"])).unwrap();
+        assert_eq!(n.task.as_deref(), Some(LAST_TASK));
+    }
+
+    #[test]
+    fn prompt_has_no_effect_on_management_commands() {
+        let err = normalize(os(&["-p", "hi", "tasks", "list"])).unwrap_err();
+        assert!(err.to_string().contains("no effect"), "{err}");
+    }
+
+    #[test]
+    fn management_keeps_post_separator_literals() {
+        let n = normalize(os(&["history", "show", "--", "--weird-id"])).unwrap();
+        assert!(
+            n.argv.contains(&OsString::from("--weird-id")),
+            "{:?}",
+            n.argv
+        );
     }
 }

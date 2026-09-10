@@ -54,12 +54,39 @@ struct ManifestArtifact {
     size: u64,
 }
 
-/// A fresh run id (sortable, millisecond resolution).
+/// A fresh run id (sortable, millisecond resolution). When the history
+/// directory is writable the run directory is created here, exclusively:
+/// two processes can never share (and clobber) one run directory. An
+/// unwritable history dir never fails the run — saving reports it later,
+/// best-effort.
 pub fn new_run_id() -> String {
+    let dir = history_dir();
     let mut elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    loop {
+        let id = stamp(elapsed);
+        let Some(d) = &dir else {
+            return id; // no history dir: the id is for reports only
+        };
+        match std::fs::create_dir(d.join(&id)) {
+            Ok(()) => return id,
+            // Lost a millisecond-stamp race with another process: bump.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                elapsed += Duration::from_millis(1);
+            }
+            Err(_) => return id,
+        }
+    }
+}
+
+/// A run id that creates nothing (used when history is off and the id
+/// only labels a report). Legacy flat entries are still avoided.
+pub fn stamp_now() -> String {
     let dir = history_dir();
+    let mut elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     loop {
         let id = stamp(elapsed);
         let taken = dir
@@ -72,10 +99,13 @@ pub fn new_run_id() -> String {
     }
 }
 
-/// Save a finished generation (before delivery). Artifacts are only saved
-/// for runs whose generation completed: a truncated or failed run keeps
-/// its metadata for diagnosis, never a "recoverable" partial binary.
-pub fn save_generation(record: &RunRecord) -> Result<()> {
+/// Save a finished generation (before delivery). Artifacts are saved for
+/// complete runs; `keep_artifacts` extends that to runs whose generation
+/// finished cleanly but did not satisfy the request (e.g. a short image
+/// count) — their bytes stay in the clearly-marked record instead of
+/// being dropped. Truncated streams keep metadata only: partial text is
+/// never a "recoverable" artifact.
+pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
     let Some(dir) = history_dir() else {
         eprintln!("warning: cannot determine a history directory; result not kept on disk");
         return Ok(());
@@ -87,9 +117,9 @@ pub fn save_generation(record: &RunRecord) -> Result<()> {
     set_mode(&run_dir, 0o700);
 
     let mut artifacts = Vec::new();
-    if record.generation.is_complete() {
+    if record.generation.is_complete() || keep_artifacts {
         for artifact in &record.artifacts {
-            let file = format!("{}.{}", artifact.id, extension_for(artifact));
+            let file = crate::output::artifact_file_name(artifact);
             let path = run_dir.join(&file);
             std::fs::write(&path, &artifact.bytes)
                 .with_context(|| format!("failed to write {}", path.display()))?;
@@ -136,8 +166,18 @@ pub fn update_deliveries(record: &RunRecord) -> Result<()> {
 
 fn write_manifest(run_dir: &Path, manifest: &Manifest) -> Result<()> {
     // The manifest commits last: a run dir without one is unfinished.
+    // The temp file is fsynced so a crash cannot leave an empty or
+    // truncated manifest behind a successful rename.
     let tmp = run_dir.join("manifest.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.write_all(&serde_json::to_vec_pretty(manifest)?)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("cannot flush {}", tmp.display()))?;
+    }
     #[cfg(unix)]
     set_mode(&tmp, 0o600);
     std::fs::rename(&tmp, run_dir.join("manifest.json"))
@@ -186,7 +226,9 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
     }))
 }
 
-/// The most recent complete generation.
+/// The most recent complete generation. A damaged entry is skipped (with
+/// a note on stderr) instead of bricking recovery: older complete runs
+/// stay reachable.
 pub fn last_complete() -> Result<Option<RunRecord>> {
     let Some(dir) = history_dir() else {
         return Ok(None);
@@ -194,9 +236,14 @@ pub fn last_complete() -> Result<Option<RunRecord>> {
     let mut ids = all_ids(&dir)?;
     ids.reverse(); // newest first
     for id in ids {
-        if let Some(record) =
-            load(&id).with_context(|| format!("cannot read the history entry {id}"))?
-        {
+        let record = match load(&id) {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("warning: skipping unreadable history entry {id}: {e:#}");
+                continue;
+            }
+        };
+        if let Some(record) = record {
             if record.generation.is_complete() {
                 return Ok(Some(record));
             }
@@ -254,11 +301,13 @@ fn is_stamp(s: &str) -> bool {
 }
 
 /// Enforce both budgets: newest runs first, older ones removed. In-flight
-/// dirs (no manifest) are never touched.
+/// dirs (no manifest) are never touched by the budgets — but long-abandoned
+/// ones (crashed before their manifest committed) are reclaimed.
 pub fn prune(keep: usize, budget: u64) {
     let Some(dir) = history_dir() else {
         return;
     };
+    reclaim_abandoned(&dir);
     let Ok(mut ids) = all_ids(&dir) else {
         return;
     };
@@ -267,17 +316,52 @@ pub fn prune(keep: usize, budget: u64) {
         let oldest = ids.remove(0);
         remove_run(&dir, &oldest);
     }
-    // Byte budget over the remaining runs.
+    // Byte budget over the remaining runs. The newest entry is always
+    // kept: it is the run just saved, and the recovery promise ("a failed
+    // clipboard write is recoverable via `aido last`") depends on it —
+    // even when a single artifact exceeds the whole budget.
     let mut total = 0u64;
     let mut dirs: Vec<PathBuf> = ids.iter().map(|id| dir.join(id)).collect();
     dirs.sort(); // stamp order
     for path in &dirs {
         total += dir_size(path);
     }
-    while total > budget && !dirs.is_empty() {
+    while total > budget && dirs.len() > 1 {
         let oldest = dirs.remove(0);
         total = total.saturating_sub(dir_size(&oldest));
         remove_run(&dir, &oldest.to_string_lossy());
+    }
+}
+
+/// A run directory without a manifest was left by a process that died
+/// between creating the dir and committing the manifest. Once it is too
+/// old to be in-flight, it is litter (possibly full artifact bytes) that
+/// listing, recovery and the budgets would otherwise ignore forever.
+fn reclaim_abandoned(dir: &Path) {
+    const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_stamp(name) || path.join("manifest.json").exists() {
+            continue;
+        }
+        let age_ok = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > ABANDONED_AFTER);
+        if age_ok {
+            remove_run(dir, name);
+        }
     }
 }
 
@@ -305,15 +389,6 @@ fn remove_run(dir: &Path, id: &str) {
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-}
-
-/// Run directories are `YYYYMMDD-HHMMSS.mmm`; only such directories belong
-/// to the history — anything else in the dir is the user's.
-fn extension_for(artifact: &Artifact) -> String {
-    match artifact.kind {
-        MediaKind::Text => "txt".into(),
-        _ => artifact.format.clone(),
-    }
 }
 
 /// Milliseconds since the epoch as a sortable stamp.

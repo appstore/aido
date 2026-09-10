@@ -20,9 +20,11 @@ pub(super) fn encode(spec: &GenerateRequest<'_>, stream: bool) -> Result<Value> 
             MediaKind::Audio => bail!("the responses adapter does not take audio input"),
         }
     }
-    if parts.is_empty() {
-        // An instruction-only run (`ask -p ...` with no material) is a
-        // valid request: the instruction is the whole user turn.
+    // An instruction-only run (`ask -p ...` with no material) is a valid
+    // request: the instruction is the whole user turn. It must not ALSO
+    // go into the `instructions` field — the model would see it twice.
+    let instruction_only = parts.is_empty();
+    if instruction_only {
         let instructions = spec.instruction_channel();
         if instructions.is_empty() {
             bail!("no input content to send");
@@ -34,9 +36,11 @@ pub(super) fn encode(spec: &GenerateRequest<'_>, stream: bool) -> Result<Value> 
         "input": [{"role": "user", "content": parts}],
         "store": false,
     });
-    let instructions = spec.instruction_channel();
-    if !instructions.is_empty() {
-        body["instructions"] = json!(instructions);
+    if !instruction_only {
+        let instructions = spec.instruction_channel();
+        if !instructions.is_empty() {
+            body["instructions"] = json!(instructions);
+        }
     }
     if let Some(tokens) = spec.max_tokens {
         body["max_output_tokens"] = json!(tokens);
@@ -160,6 +164,7 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
             result.warnings.join("; ")
         );
     }
+    result.note_incomplete();
     Ok(result)
 }
 

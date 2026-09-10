@@ -54,7 +54,9 @@ pub struct ExecutionPlan {
     pub requirement: Option<String>,
     pub inputs: Vec<InputPart>,
     pub steps: Vec<RequestStep>,
-    pub produce: Vec<MediaKind>,
+    /// The processing strategy actually selected for this run (the task's
+    /// choice, overridden by `--no-split`).
+    pub processor: ProcessorKind,
     pub format: Option<OutputFormat>,
     pub destinations: Vec<Destination>,
     pub overwrite: bool,
@@ -100,12 +102,18 @@ pub fn build(
     let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
 
     // --- inputs -----------------------------------------------------------
-    let inputs = input::gather(specs, task.requires_material, cfg.settings.input_bytes, env)
-        .map_err(|e| AppError::usage(e.to_string()))?;
+    let inputs = input::gather(
+        specs,
+        task.requires_material,
+        cfg.settings.input_bytes,
+        cli.dry_run,
+        env,
+    )
+    .map_err(|e| AppError::usage(e.to_string()))?;
     validate_inputs(task, &resolved, &inputs)?;
     let processor = select_processor(cli, task);
-    let steps =
-        processors::plan_steps(&inputs, processor).map_err(|e| AppError::usage(e.to_string()))?;
+    let steps = processors::plan_steps(&inputs, processor, cli.quiet)
+        .map_err(|e| AppError::usage(e.to_string()))?;
 
     // --- artifacts and encodings -------------------------------------------
     validate_outputs(cli, &mut resolved, &steps, terminal)?;
@@ -114,7 +122,9 @@ pub fn build(
     let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
 
     // --- transport and limits ------------------------------------------------
-    let stream_requested = cli.stream || cli.no_stream;
+    // `--stream` demands a streaming adapter and is refused otherwise;
+    // `--no-stream` forces buffering and is always valid — on an adapter
+    // that never streams it is simply a no-op.
     if cli.stream && !resolved.adapter.streams() {
         return Err(AppError::usage(format!(
             "adapter '{}' does not support --stream; use --no-stream or omit the flag",
@@ -130,19 +140,13 @@ pub fn build(
         destinations.contains(&Destination::Stdout) && resolved.produce == [MediaKind::Text];
     let delivery = if cli.stream {
         DeliveryMode::Live
-    } else if cli.no_stream || !stdout_text || cli.json {
+    } else if cli.no_stream || !stdout_text || cli.json || cfg.settings.stream == Some(false) {
         DeliveryMode::Buffered
     } else if terminal.stdout {
         DeliveryMode::Live
     } else {
         DeliveryMode::Buffered
     };
-    if stream_requested && !resolved.adapter.streams() {
-        return Err(AppError::usage(format!(
-            "adapter '{}' does not support streaming",
-            resolved.adapter
-        )));
-    }
 
     let timeout = Duration::from_secs(cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120));
     let total_timeout = cli
@@ -167,7 +171,7 @@ pub fn build(
             .unwrap_or(false)
     });
 
-    let param_sources = describe_param_sources(cli, task, cfg);
+    let param_sources = describe_param_sources(cli, task, &resolved);
 
     Ok(ExecutionPlan {
         task: task.clone(),
@@ -176,7 +180,7 @@ pub fn build(
         requirement,
         inputs,
         steps,
-        produce: Vec::new(),
+        processor,
         format: cli.format,
         destinations,
         overwrite: cli.overwrite,
@@ -550,20 +554,13 @@ fn resolve_destinations(
 fn describe_param_sources(
     cli: &Cli,
     task: &Task,
-    cfg: &Config,
+    resolved: &Resolved,
 ) -> Vec<(String, String, ParamSource)> {
     let mut out = Vec::new();
     out.push((
         "model".into(),
-        cli.model
-            .clone()
-            .or_else(|| cfg.profiles.values().find_map(|p| p.model.clone()))
-            .unwrap_or_else(|| "adapter default".into()),
-        if cli.model.is_some() {
-            ParamSource::Cli
-        } else {
-            ParamSource::Profile
-        },
+        resolved.model.clone(),
+        resolved.model_source,
     ));
     if let Some(max) = cli.max_tokens {
         out.push(("max_tokens".into(), max.to_string(), ParamSource::Cli));
@@ -629,7 +626,7 @@ pub fn describe(plan: &ExecutionPlan) -> String {
     }
     out.push_str(&format!(
         "processing:  {}\n",
-        match plan.task.processor {
+        match plan.processor {
             ProcessorKind::Single => "single request".to_string(),
             ProcessorKind::OcrTiles => {
                 let mut parts = Vec::new();
@@ -761,7 +758,7 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
             })
             .collect(),
         processor: Some(
-            match plan.task.processor {
+            match plan.processor {
                 ProcessorKind::Single => "single",
                 ProcessorKind::OcrTiles => "ocr-tiles",
             }

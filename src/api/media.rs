@@ -1,15 +1,16 @@
 //! Buffered media protocols. Generation options are serialized structurally,
 //! never interpolated into JSON templates.
-use super::{merged_text, single_audio, GenerateRequest, GenerateResult};
+use super::{merged_text, plain_text, single_audio, GenerateRequest, GenerateResult};
 use crate::domain::{Artifact, MediaKind};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-/// Speech: the material is the text to read; the instruction channel
+/// Speech: the material is the text to read (plain, never file-name
+/// labels — the voice would read those aloud); the instruction channel
 /// (task direction and -p) goes to `instructions`, never into the speech.
 pub(super) fn encode_speech(spec: &GenerateRequest<'_>) -> Result<Value> {
-    let input = merged_text(spec.inputs)?;
+    let input = plain_text(spec.inputs)?;
     let mut body = json!({
         "model": spec.model,
         "input": input,

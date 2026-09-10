@@ -67,6 +67,10 @@ pub struct Settings {
     pub input_bytes: Option<u64>,
 }
 
+/// Clipboard hold duration when `settings.hold_secs` is unset: on Linux
+/// the clipboard is kept alive this long after a copy.
+pub const DEFAULT_HOLD_SECS: u64 = 45;
+
 /// Pre-2.0 globals that no longer apply; kept explicit so the user hears
 /// about the change instead of the value being used silently.
 pub const DEPRECATED_ENV_VARS: &[&str] = &[
@@ -113,11 +117,27 @@ pub fn load() -> Result<Config> {
 fn parse_config(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).with_context(|| {
-        format!(
+    let cfg: Config = toml::from_str(&raw).map_err(|e| {
+        let mut message = format!(
             "failed to parse config {} (run `aido config init` for a valid sample)",
             path.display()
-        )
+        );
+        // Pre-2.0 configs nested connection fields under [profiles.*] and
+        // used --input-mode/--output-mode style keys; name the migration
+        // instead of a bare unknown-field list.
+        if ["input_modes", "output_mode", "api_key ="]
+            .iter()
+            .any(|marker| raw.contains(marker))
+        {
+            message.push_str(
+                "\n\nthis looks like a pre-2.0 config: base_url/api_key/adapter moved \
+                 from [profiles.*] to [providers.*] (with [providers.X.routes] for \
+                 per-operation adapters), input_modes/output_mode are gone (tasks \
+                 declare their contracts), and presets are now tasks \
+                 (`aido tasks list`)",
+            );
+        }
+        anyhow::anyhow!("{message}: {e}")
     })?;
     Ok(cfg)
 }
@@ -144,24 +164,7 @@ pub fn default_config() -> Config {
     cfg
 }
 
-/// Resolve the credential value at send time (never earlier: dry-run and
-/// reports only ever see the variable name).
-pub fn resolve_api_key(provider: &Provider) -> Option<String> {
-    let name = provider.api_key_env.as_deref().unwrap_or("AIDO_API_KEY");
-    let key = std::env::var(name).ok().filter(|k| !k.trim().is_empty());
-    key.or_else(|| {
-        // The default provider also accepts the conventional OpenAI name.
-        if name == "AIDO_API_KEY" {
-            std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-        } else {
-            None
-        }
-    })
-}
-
-/// Validate a whole config: used by `config check`.
+/// Validate a whole config: used by `aido config check`.
 pub fn check(cfg: &Config) -> Vec<String> {
     let mut issues = Vec::new();
     for (name, profile) in &cfg.profiles {
@@ -179,6 +182,15 @@ pub fn check(cfg: &Config) -> Vec<String> {
                         "provider '{provider_name}' (used by '{name}'): missing base_url"
                     ));
                 }
+                for key in provider.routes.keys() {
+                    if crate::tasks::Operation::from_name(key).is_none() {
+                        issues.push(format!(
+                            "provider '{provider_name}': route '{key}' is not an \
+                             operation (generate, speech, transcribe, image) and \
+                             would never be used"
+                        ));
+                    }
+                }
             }
         }
         if profile.model.is_none() {
@@ -187,12 +199,22 @@ pub fn check(cfg: &Config) -> Vec<String> {
             ));
         }
     }
-    if let Some(name) = &cfg.default_profile {
-        if !cfg.profiles.contains_key(name) && name != "default" {
-            issues.push(format!(
-                "default_profile '{name}' is not defined in [profiles]"
-            ));
-        }
+    // The profile resolution will actually use: an explicit
+    // default_profile, else the implicit "default". The built-in default
+    // profile exists only when no providers are configured at all — the
+    // same rule resolution applies at run time, so `config check` and a
+    // real run never disagree.
+    let default_name = cfg
+        .default_profile
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let resolvable = cfg.profiles.contains_key(&default_name)
+        || (default_name == "default" && cfg.providers.is_empty());
+    if !resolvable {
+        issues.push(format!(
+            "default profile '{default_name}' is not defined in [profiles]; \
+             set default_profile or add [profiles.{default_name}]"
+        ));
     }
     issues
 }
@@ -225,7 +247,7 @@ const SAMPLE_CONFIG: &str = r#"# aido configuration.
 default_profile = "default"
 
 [settings]
-# stream = true            # live stdout delivery (terminal); pipes are buffered
+# stream = false           # force buffered stdout even on a terminal (default: live on a tty)
 # timeout_secs = 120       # header wait + network idle limit
 # hold_secs = 45           # Linux: keep the clipboard alive this long
 # history_keep = 50        # runs kept on disk; 0 disables history

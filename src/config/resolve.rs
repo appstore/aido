@@ -233,7 +233,8 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         }
     }
 
-    // Generation parameters: CLI → task defaults → profile → program.
+    // Generation parameters: CLI → profile → program (tasks declare no
+    // generation defaults).
     let max_tokens = cli
         .max_tokens
         .map(|v| (v, ParamSource::Cli))

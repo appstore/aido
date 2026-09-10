@@ -179,20 +179,24 @@ impl GenerateResult {
 }
 
 impl GenerateResult {
-    pub fn diagnostics(&self) -> Vec<String> {
-        let mut warnings = self.warnings.clone();
+    /// Surface truncation/refusal diagnostics as user-visible warnings,
+    /// so an incomplete run explains what to do about it (the runner
+    /// prints warnings and keeps them in the run record).
+    pub fn note_incomplete(&mut self) {
         if let GenerationStatus::Incomplete { reason } = &self.status {
-            warnings.push(match reason.as_str() {
+            let hint = match reason.as_str() {
                 "length" | "max_output_tokens" => {
                     "reply hit the token limit and was truncated; set --max-tokens \
                      higher if text is missing"
-                        .into()
+                        .to_string()
                 }
                 "content_filter" => "reply was cut short by the server's content filter".into(),
                 _ => format!("reply is incomplete: {reason}"),
-            });
+            };
+            if !self.warnings.contains(&hint) {
+                self.warnings.push(hint);
+            }
         }
-        warnings
     }
 }
 
@@ -224,10 +228,25 @@ pub(crate) fn labeled_texts(inputs: &[InputPart]) -> Vec<String> {
         .collect()
 }
 
-/// Text-field routes (speech, image prompts) take one string: text parts
-/// in order, joined with a blank line.
+/// Text-field routes (image prompts) take one string: text parts in
+/// order, joined with a blank line. File-sourced parts are labeled so the
+/// model can tell them apart.
 pub(crate) fn merged_text(inputs: &[InputPart]) -> Result<String> {
     let parts = labeled_texts(inputs);
+    if parts.is_empty() {
+        bail!("this operation requires text material");
+    }
+    Ok(parts.join("\n\n"))
+}
+
+/// Speech input: the text parts in order, joined with a blank line — no
+/// file-name labels, which the voice would read aloud.
+pub(crate) fn plain_text(inputs: &[InputPart]) -> Result<String> {
+    let parts: Vec<String> = inputs
+        .iter()
+        .filter(|p| p.kind == MediaKind::Text)
+        .map(|p| p.text().unwrap_or_default().to_string())
+        .collect();
     if parts.is_empty() {
         bail!("this operation requires text material");
     }

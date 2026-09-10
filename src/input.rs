@@ -34,8 +34,6 @@ pub struct InputEnv<'a> {
 impl InputEnv<'static> {
     pub fn real() -> Self {
         // Leaks nothing: stdin and the clipboard live for the process.
-        static INIT: std::sync::Once = std::sync::Once::new();
-        let _ = INIT;
         Self {
             stdin_is_terminal: std::io::stdin().is_terminal(),
             stdin: Box::leak(Box::new(std::io::stdin())),
@@ -68,11 +66,14 @@ impl<'a> InputEnv<'a> {
 
 /// Read every spec into an ordered list of parts. `requires_material`
 /// decides whether a task with no specs and a terminal stdin may run on
-/// the instruction alone.
+/// the instruction alone. Under `dry_run` the clipboard is never touched:
+/// paste slots become clearly-labeled placeholders so a plan can be
+/// checked without reading (or depending on) desktop state.
 pub fn gather(
     specs: &[SourceSpec],
     requires_material: bool,
     total_limit: Option<u64>,
+    dry_run: bool,
     env: &mut InputEnv<'_>,
 ) -> Result<Vec<InputPart>> {
     if specs
@@ -103,6 +104,9 @@ pub fn gather(
             return Ok(vec![classify("stdin", bytes, InputSource::Stdin, 0)?]);
         }
         if requires_material {
+            if dry_run {
+                return Ok(vec![dry_run_clipboard_part(0)]);
+            }
             let content = env
                 .read_clipboard()
                 .map_err(|e| crate::domain::AppError::usage(format!("clipboard: {e}")))?;
@@ -136,6 +140,10 @@ pub fn gather(
                 classify("stdin", bytes, InputSource::Stdin, parts.len())?
             }
             SourceSpec::Paste => {
+                if dry_run {
+                    parts.push(dry_run_clipboard_part(parts.len()));
+                    continue;
+                }
                 let content = env
                     .read_clipboard()
                     .map_err(|e| crate::domain::AppError::usage(format!("clipboard: {e}")))?;
@@ -168,6 +176,20 @@ fn part_size(part: &InputPart) -> usize {
     match &part.content {
         InputContent::Text(s) => s.len(),
         InputContent::Media(b) => b.len(),
+    }
+}
+
+/// A stand-in for clipboard material under `--dry-run`: the plan can be
+/// checked without reading (or requiring) desktop clipboard state. The
+/// real run still reads the clipboard and still fails on an empty one.
+fn dry_run_clipboard_part(id: usize) -> InputPart {
+    InputPart {
+        id,
+        source: InputSource::Clipboard,
+        name: "clipboard (not read under --dry-run)".into(),
+        kind: MediaKind::Text,
+        mime: "text/plain".into(),
+        content: InputContent::Text(String::new()),
     }
 }
 
@@ -340,7 +362,7 @@ mod tests {
     #[test]
     fn piped_stdin_alone_is_material() {
         let mut e = env(b"hello\n", false);
-        let parts = gather(&[], true, None, &mut e).unwrap();
+        let parts = gather(&[], true, None, false, &mut e).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].text(), Some("hello\n"));
         assert_eq!(parts[0].source, InputSource::Stdin);
@@ -349,14 +371,14 @@ mod tests {
     #[test]
     fn empty_piped_stdin_is_an_error_without_clipboard_fallback() {
         let mut e = env(b"", false);
-        let err = gather(&[], true, None, &mut e).unwrap_err();
+        let err = gather(&[], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("stdin is empty"));
     }
 
     #[test]
     fn unconsumed_pipe_with_explicit_material_is_an_error() {
         let mut e = env(b"pipe data\n", false);
-        let err = gather(&[file("a.txt")], true, None, &mut e).unwrap_err();
+        let err = gather(&[file("a.txt")], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("add `-`"));
     }
 
@@ -371,6 +393,7 @@ mod tests {
             &[SourceSpec::File(a.clone()), SourceSpec::Stdin],
             true,
             None,
+            false,
             &mut e,
         )
         .unwrap();
@@ -383,7 +406,7 @@ mod tests {
     #[test]
     fn terminal_stdin_falls_back_to_clipboard_only_without_specs() {
         let mut e = env(b"", true);
-        let parts = gather(&[], true, None, &mut e).unwrap();
+        let parts = gather(&[], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].text(), Some("clip"));
         assert_eq!(parts[0].source, InputSource::Clipboard);
     }
@@ -391,7 +414,7 @@ mod tests {
     #[test]
     fn no_material_task_runs_on_instruction_alone() {
         let mut e = env(b"", true);
-        let parts = gather(&[], false, None, &mut e).unwrap();
+        let parts = gather(&[], false, None, false, &mut e).unwrap();
         assert!(parts.is_empty());
     }
 
@@ -402,12 +425,19 @@ mod tests {
         let empty = dir.join("empty.txt");
         std::fs::write(&empty, b"").unwrap();
         let mut e = env(b"", true);
-        let err = gather(&[SourceSpec::File(empty.clone())], true, None, &mut e).unwrap_err();
+        let err = gather(
+            &[SourceSpec::File(empty.clone())],
+            true,
+            None,
+            false,
+            &mut e,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
         let real = dir.join("real.txt");
         std::fs::write(&real, b"real\n").unwrap();
         let mut e = env(b"", true);
-        let parts = gather(&[SourceSpec::File(real.clone())], true, None, &mut e).unwrap();
+        let parts = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap();
         assert_eq!(parts.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -427,7 +457,7 @@ mod tests {
         let path = dir.join("shot.jpg");
         std::fs::write(&path, &jpg).unwrap();
         let mut e = env(b"", true);
-        let parts = gather(&[SourceSpec::File(path)], true, None, &mut e).unwrap();
+        let parts = gather(&[SourceSpec::File(path)], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].kind, MediaKind::Image);
         assert_eq!(parts[0].mime, "image/jpeg");
         assert_eq!(parts[0].content, InputContent::Media(jpg));
@@ -437,10 +467,22 @@ mod tests {
     #[test]
     fn duplicate_stdin_and_paste_rejected() {
         let mut e = env(b"x", false);
-        let err = gather(&[SourceSpec::Stdin, SourceSpec::Stdin], true, None, &mut e);
+        let err = gather(
+            &[SourceSpec::Stdin, SourceSpec::Stdin],
+            true,
+            None,
+            false,
+            &mut e,
+        );
         assert!(err.is_err());
         let mut e = env(b"", true);
-        let err = gather(&[SourceSpec::Paste, SourceSpec::Paste], true, None, &mut e);
+        let err = gather(
+            &[SourceSpec::Paste, SourceSpec::Paste],
+            true,
+            None,
+            false,
+            &mut e,
+        );
         assert!(err.is_err());
     }
 
@@ -448,7 +490,31 @@ mod tests {
     fn paste_is_material_and_consumes_the_pipe_check() {
         // paste + piped stdin without `-` is still "unconsumed pipe"
         let mut e = env(b"pipe\n", false);
-        let err = gather(&[SourceSpec::Paste], true, None, &mut e).unwrap_err();
+        let err = gather(&[SourceSpec::Paste], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("add `-`"));
+    }
+
+    #[test]
+    fn dry_run_never_touches_the_clipboard() {
+        // The closure would panic if called; the placeholder keeps the
+        // plan checkable without desktop clipboard state.
+        let mut e = InputEnv {
+            stdin: Box::leak(Box::new(Cursor::new(b""))),
+            stdin_is_terminal: true,
+            clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
+        };
+        let parts = gather(&[SourceSpec::Paste], true, None, true, &mut e).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].source, InputSource::Clipboard);
+        assert!(parts[0].name.contains("dry-run"), "{}", parts[0].name);
+
+        let mut e = InputEnv {
+            stdin: Box::leak(Box::new(Cursor::new(b""))),
+            stdin_is_terminal: true,
+            clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
+        };
+        let parts = gather(&[], true, None, true, &mut e).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].source, InputSource::Clipboard);
     }
 }

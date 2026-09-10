@@ -63,7 +63,8 @@ pub struct ImageUrl {
 /// Build the message list from the instruction channel and the ordered
 /// material. The instruction and this run's requirement share the system
 /// role (the chat protocol's instruction channel); material parts keep
-/// their order and are never regrouped by type.
+/// their order and are never regrouped by type — a `text, image, text`
+/// input goes on the wire in exactly that order.
 pub fn build_messages(
     instruction: Option<&str>,
     requirement: Option<&str>,
@@ -73,6 +74,9 @@ pub fn build_messages(
         .iter()
         .all(|p| p.kind != MediaKind::Text && p.kind != MediaKind::Image)
     {
+        if inputs.iter().any(|p| p.kind == MediaKind::Audio) {
+            bail!("the chat adapter does not take audio input");
+        }
         // An instruction-only run is a valid request.
         let joined: Vec<&str> = [instruction, requirement]
             .into_iter()
@@ -90,12 +94,10 @@ pub fn build_messages(
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .collect();
-    if let Some(first) = system.first() {
+    if !system.is_empty() {
         // Fixed instruction and -p are stored separately; the chat wire
         // has one system channel, so they are concatenated there.
-        let joined = system.join("\n\n");
-        messages.push(Message::system(joined));
-        let _ = first;
+        messages.push(Message::system(system.join("\n\n")));
     }
     let images = inputs.iter().any(|p| p.kind == MediaKind::Image);
     if !images {
@@ -109,26 +111,40 @@ pub fn build_messages(
         messages.push(Message::user(Content::Text(joined)));
         return Ok(messages);
     }
-    // With images the content must be a typed part array. A text part is
-    // included because some servers reject image-only messages.
+    // With images the content must be a typed part array. Parts keep the
+    // material's order, text and images interleaved as they were given.
     let texts = labeled_texts(inputs);
-    let text = if texts.is_empty() {
-        let system = instruction.is_some_and(|s| !s.trim().is_empty());
-        if system {
-            "Process the attached image(s) according to the system instructions.".to_string()
-        } else {
-            "Describe the attached image(s).".to_string()
+    let mut next_text = texts.into_iter();
+    let mut parts: Vec<Part> = Vec::new();
+    for part in inputs {
+        match part.kind {
+            MediaKind::Text => {
+                if let Some(text) = next_text.next() {
+                    parts.push(Part::Text { text });
+                }
+            }
+            MediaKind::Image => parts.push(Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: png_data_url(&image_as_png(part)?),
+                },
+            }),
+            MediaKind::Audio => bail!("the chat adapter does not take audio input"),
         }
-    } else {
-        texts.join("\n\n")
-    };
-    let mut parts = vec![Part::Text { text }];
-    for part in inputs.iter().filter(|p| p.kind == MediaKind::Image) {
-        parts.push(Part::ImageUrl {
-            image_url: ImageUrl {
-                url: png_data_url(&image_as_png(part)?),
+    }
+    // Some servers reject image-only messages: at least one text part
+    // must precede the images.
+    if !parts.iter().any(|p| matches!(p, Part::Text { .. })) {
+        let filler = if system.is_empty() {
+            "Describe the attached image(s)."
+        } else {
+            "Process the attached image(s) according to the system instructions."
+        };
+        parts.insert(
+            0,
+            Part::Text {
+                text: filler.to_string(),
             },
-        });
+        );
     }
     messages.push(Message::user(Content::Parts(parts)));
     Ok(messages)
@@ -211,12 +227,14 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
             truncate_chars(body, 300)
         );
     };
-    Ok(GenerateResult {
+    let mut result = GenerateResult {
         text: choice.message.content.unwrap_or_default(),
         status: status(choice.finish_reason.as_deref()),
         warnings: Vec::new(),
         artifacts: Vec::new(),
-    })
+    };
+    result.note_incomplete();
+    Ok(result)
 }
 
 #[derive(Default)]
@@ -267,6 +285,7 @@ impl Stream {
             );
         }
         self.result.status = status(self.finish_reason.as_deref());
+        self.result.note_incomplete();
         Ok(self.result)
     }
 }
@@ -349,12 +368,30 @@ mod tests {
         let Content::Parts(content) = &messages[1].content else {
             panic!("expected parts");
         };
-        // texts are folded into the leading text part, then the image part
-        assert_eq!(content.len(), 2);
+        // text, image, text goes on the wire in exactly that order
+        assert_eq!(content.len(), 3);
         let Part::Text { text } = &content[0] else {
             panic!("expected a text part first");
         };
-        assert_eq!(text, "one\n\ntwo");
+        assert_eq!(text, "one");
         assert!(matches!(content[1], Part::ImageUrl { .. }));
+        let Part::Text { text } = &content[2] else {
+            panic!("expected the trailing text part");
+        };
+        assert_eq!(text, "two");
+    }
+
+    #[test]
+    fn audio_only_input_is_refused_not_dropped() {
+        let audio = InputPart {
+            id: 0,
+            source: crate::domain::InputSource::File("a.mp3".into()),
+            name: "a.mp3".into(),
+            kind: MediaKind::Audio,
+            mime: "audio/mpeg".into(),
+            content: crate::domain::InputContent::Media(vec![1, 2, 3]),
+        };
+        let err = build_messages(Some("sys"), None, &[audio]).unwrap_err();
+        assert!(err.to_string().contains("audio"), "{err}");
     }
 }
