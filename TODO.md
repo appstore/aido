@@ -222,7 +222,7 @@
   - 方案（※补全）：保序去重——遍历时用 `HashSet<MediaKind>` 记录已见，跳过重复项。**不要** sort+dedup，因为 produce 顺序有意义（决定产物顺序），排序会改变行为。
   - 测试：`--produce image,text,image` 不再报 format 歧义、计数正确、产物顺序为 image→text。
 
-- [ ] **F17 · 中 · `src/output.rs:381` · 所有输出文件被固定成 0600，无视 umask**
+- [x] **F17 · 中 · `src/output.rs:381` · 所有输出文件被固定成 0600，无视 umask**
   - 问题：`write_file_atomic()` 给临时文件设了 `0o600`，而无论是 hard-link 提交还是 rename 提交都会保留这个 inode 的权限位。于是 `aido translate a.md -o b.md` 产出的是一个 0600 文件。历史目录用 0600 是合理的（那是隐私数据），但用户显式指定的 `-o` 目标是普通产物——写进共享目录、构建产物目录或静态站点目录时，这个权限会造成意外。`set_permissions` 的返回值也被丢弃了，失败时无声。
   - 方案：`write_file_atomic` 增加一个参数 `mode: FileMode { Private, Default }`：
     - `history.rs` 走 `Private`（保持 0600）。

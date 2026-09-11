@@ -522,3 +522,69 @@ fn attached_short_o_delivers_to_the_named_file() {
     out.assert_code(0);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "FILED");
 }
+
+#[cfg(unix)]
+#[test]
+fn output_file_mode_follows_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // The child inherits this process's umask; read it the way the
+    // delivery code does — umask(0) also sets, so restore immediately.
+    let mask = unsafe { libc::umask(0) };
+    unsafe { libc::umask(mask) };
+    let server = Server::json(chat_body("UMASKED"));
+    let dir = temp_dir("out-umask");
+    let file = dir.join("summary.md");
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o666 & !mask, "delivered files follow the umask");
+}
+
+#[cfg(unix)]
+#[test]
+fn history_artifacts_stay_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let server = Server::json(chat_body("KEPT"));
+    let history = temp_dir("history-mode");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 2\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{url}\"",
+        url = server.url()
+    ));
+    let out = run(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+    // save_generation stores the artifact bytes as text.txt inside the
+    // one run directory, next to the run manifest.
+    let mut entries: Vec<_> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one run dir, got {entries:?}");
+    let run_dir = entries.pop().unwrap();
+    let mode = std::fs::metadata(run_dir.join("text.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "history artifacts stay owner-only");
+}

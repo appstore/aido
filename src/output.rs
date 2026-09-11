@@ -154,7 +154,7 @@ fn deliver_inner(
     // --- single file
     if let Some(path) = &file_dest {
         let artifact = delivered[0];
-        match write_file_atomic(&artifact.bytes, path, args.overwrite) {
+        match write_file_atomic(&artifact.bytes, path, args.overwrite, FileMode::Default) {
             Ok(()) => {
                 if !args.quiet {
                     eprintln!("saved result to {}", path.display());
@@ -360,12 +360,62 @@ fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The permission policy for an atomically written file.
+pub(crate) enum FileMode {
+    /// Owner-only (0600), whatever the umask allows.
+    Private,
+    /// Inherit the process umask (`0666 & !umask`, what a plain `open`
+    /// would give): user-facing artifacts landing in shared, build or
+    /// static-site directories stay usable by other tools. An unusual
+    /// umask (e.g. 077) still yields a sane file.
+    Default,
+}
+
+#[cfg(unix)]
+impl FileMode {
+    fn bits(self) -> u32 {
+        match self {
+            FileMode::Private => 0o600,
+            FileMode::Default => 0o666 & !current_umask(),
+        }
+    }
+}
+
+/// The process umask. `umask(0)` reads it but also sets it, so the read
+/// is immediately restored; that brief window is the standard price of
+/// reading a umask (what other Rust tools do).
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    let mask = unsafe { libc::umask(0) };
+    unsafe { libc::umask(mask) };
+    mask
+}
+
+/// Apply `mode` to a written file.
+#[cfg(unix)]
+fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode.bits()))
+}
+
+/// No mode bits off unix; the call is a no-op there.
+#[cfg(not(unix))]
+fn apply_file_mode(_path: &Path, _mode: FileMode) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Write bytes via a same-directory temp file, then commit without
 /// clobbering an existing target: the no-clobber commit is a fresh hard
 /// link (it fails atomically when the target exists — no check-then-rename
 /// race), with the temp file unlinked afterwards. `--overwrite` swaps the
-/// commit for an atomic rename.
-pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) -> AppResult<()> {
+/// commit for an atomic rename. The delivered file's mode follows `mode`;
+/// a failed chmod warns on stderr but never loses the artifact.
+pub(crate) fn write_file_atomic(
+    bytes: &[u8],
+    target: &Path,
+    overwrite: bool,
+    mode: FileMode,
+) -> AppResult<()> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(dir) = parent {
         std::fs::create_dir_all(dir)
@@ -386,12 +436,19 @@ pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) ->
             .truncate(true)
             .open(&temp)
             .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
+        // The temp name is predictable, so the file is made owner-only
+        // right away: no window where partially written bytes are
+        // readable under the open mode's default (a no-op off unix).
+        let _ = apply_file_mode(&temp, FileMode::Private);
         file.write_all(bytes)
             .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt as _;
-        #[cfg(unix)]
-        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        // A wrong final mode must not lose the artifact: warn, keep going.
+        if let Err(e) = apply_file_mode(&temp, mode) {
+            eprintln!(
+                "warning: could not set permissions on {}: {e}",
+                target.display()
+            );
+        }
         file.sync_all()
             .map_err(|e| AppError::delivery(format!("cannot flush {}: {e}", temp.display())))?;
         Ok(())
@@ -482,7 +539,7 @@ fn write_directory(
     for artifact in artifacts {
         let name = artifact_file_name(artifact);
         let path = dir.join(&name);
-        write_file_atomic(&artifact.bytes, &path, overwrite)
+        write_file_atomic(&artifact.bytes, &path, overwrite, FileMode::Default)
             .map_err(|e| AppError::delivery(format!("{}: {}", path.display(), e.chain())))?;
         if !quiet {
             eprintln!("saved result to {}", path.display());
@@ -509,6 +566,7 @@ fn write_directory(
             .as_bytes(),
         &manifest_path,
         overwrite, // the preflight above guards the no-overwrite pass
+        FileMode::Default,
     )?;
     Ok(saved)
 }
@@ -674,11 +732,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.txt");
         std::fs::write(&target, "original").unwrap();
-        let err = write_file_atomic(b"new", &target, false).unwrap_err();
+        let err = write_file_atomic(b"new", &target, false, FileMode::Default).unwrap_err();
         assert!(err.chain().contains("already exists"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-        write_file_atomic(b"new", &target, true).unwrap();
+        write_file_atomic(b"new", &target, true, FileMode::Default).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_mode_follows_the_file_mode_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("aido-out-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let private = dir.join("private.txt");
+        write_file_atomic(b"x", &private, false, FileMode::Private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let default = dir.join("default.txt");
+        write_file_atomic(b"x", &default, false, FileMode::Default).unwrap();
+        assert_eq!(
+            std::fs::metadata(&default).unwrap().permissions().mode() & 0o777,
+            0o666 & !current_umask(),
+            "Default inherits the umask, whatever it is"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
