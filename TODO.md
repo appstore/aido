@@ -272,9 +272,10 @@
   - 验证（※补全）：`cargo tree` 无 aws-lc-sys、测试全绿。
   - 状态（2026-09-11 修复）：依赖侧经实测**不可行**——`kothok-edge-tts 0.2.10` 自身声明零 feature（`default-features = false` 为 no-op），aws-lc-sys 由它对 `tokio-rustls` 的默认特性传递引入（`tokio-rustls default = [logging, tls12, aws_lc_rs]`），Cargo 无下游关闭他人默认特性的机制；上游 0.2.10 已是最新版。README 已补零配置默认路由的隐私说明与改用 OpenAI 语音的方法（快速开始 + Edge TTS 两节）；测试全绿。
 
-- [ ] **F25 · 低 · PR description · PR 描述里的测试数字过期**
+- [x] **F25 · 低 · PR description · PR 描述里的测试数字过期**
   - 问题：描述写「71 单元 + 71 集成测试」，实际是 116 + 97。后续 4 个 commit 补了测试但没更新描述。
   - 处置（※补全）：PR #25 已合并（`50c6559`），PR 描述本身无处再改；记录实际数字即可（追加审阅时点为 146 单元 + 121 集成 = 267 全绿）。
+  - 状态（2026-09-11 本 TODO 收尾时点）：本轮 31 条修复全部落盘后实测 **177 单元 + 160 集成 = 337 通过、0 失败、1 忽略**（忽略项为既有的 live Edge 端点用例）。
 
 - [x] **F26 · 低 · `src/api/transport.rs:47` · `http://` 的远程 `base_url` 会明文发送 API key，无任何提示**
   - 问题：`normalize_base_url` 接受 http 是对的（本地推理服务器就是 http）。但对非 loopback 的 http 地址，密钥走 Authorization 头明文出去，连一行 warning 都没有。
