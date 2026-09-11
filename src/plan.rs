@@ -144,6 +144,7 @@ pub fn build(
         processors::plan_steps(&inputs, processor, cli.quiet)
     }
     .map_err(|e| AppError::usage(e.to_string()))?;
+    assert_parts_contiguous(&steps)?;
     // A batch is real only with more than one part: a single file plans
     // and delivers exactly as before.
     let mut part_ids = steps.iter().filter_map(|s| s.part).collect::<Vec<usize>>();
@@ -271,6 +272,33 @@ pub fn build(
         credentials_available,
         terminal,
     })
+}
+
+/// The runner closes a per-part group whenever the next step's `part`
+/// differs from the group's, so same-part steps must be contiguous: a
+/// step that returns to an earlier part would silently split that part
+/// into several groups whose artifacts collide on one stem.
+/// `perpart::plan_steps` appends per part in order so the invariant holds
+/// today, but `RequestStep.part` is public — this check turns a future
+/// reorder's violation into an explicit error instead. Untagged steps
+/// (`part: None`, the non-batch path) are ignored: only the tagged
+/// sequence is constrained.
+fn assert_parts_contiguous(steps: &[RequestStep]) -> AppResult<()> {
+    let mut last: Option<usize> = None;
+    for step in steps {
+        let Some(id) = step.part else {
+            continue;
+        };
+        if last.is_some_and(|prev| id < prev) {
+            return Err(AppError::usage(format!(
+                "request steps must be ordered by part (step {} returns to part \
+                 {id}); this is a processor bug",
+                step.index
+            )));
+        }
+        last = Some(id);
+    }
+    Ok(())
 }
 
 fn validate_task_params(cli: &Cli, task: &Task) -> AppResult<()> {
@@ -982,6 +1010,59 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ErrorKind;
+
+    fn step(index: usize, part: Option<usize>) -> RequestStep {
+        RequestStep {
+            index,
+            inputs: Vec::new(),
+            label: "all material".into(),
+            hard_cut_end: false,
+            part,
+            artifact_stem: None,
+            role: crate::processors::StepRole::Map,
+        }
+    }
+
+    #[test]
+    fn interleaved_parts_fail_naming_the_step_that_returns() {
+        let steps = vec![step(0, Some(0)), step(1, Some(1)), step(2, Some(0))];
+        let err = assert_parts_contiguous(&steps).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message.contains("step 2 returns to part 0"),
+            "message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("processor bug"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn contiguous_parts_pass_even_with_untagged_steps_mixed_in() {
+        // A multi-step part repeats its id (chunk strategies plan several
+        // requests per part); None-part steps are the non-batch path and
+        // constrain nothing.
+        let steps = vec![
+            step(0, None),
+            step(1, Some(0)),
+            step(2, Some(0)),
+            step(3, None),
+            step(4, Some(1)),
+            step(5, Some(2)),
+            step(6, None),
+        ];
+        assert_parts_contiguous(&steps).unwrap();
+    }
+
+    #[test]
+    fn empty_and_untagged_step_lists_pass() {
+        assert_parts_contiguous(&[]).unwrap();
+        assert_parts_contiguous(&[step(0, None), step(1, None)]).unwrap();
+    }
     #[test]
     fn redact_url_hides_userinfo_credentials() {
         assert_eq!(

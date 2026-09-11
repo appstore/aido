@@ -342,7 +342,7 @@
   - 方案：建议后续在单请求材料接近上限时给出 warning 或拒绝。
   - 测试（※补全）：超限组合 → 有 warning。
 
-- [ ] **F33 · 低 · `src/runner.rs:247` · group 生命周期隐式假设 steps 按 part 连续排列**
+- [x] **F33 · 低 · `src/runner.rs:247` · group 生命周期隐式假设 steps 按 part 连续排列**
   - 问题：runner 以「`g.id != step.part` 即边界」来 close group，要求同一 part 的 steps 必须连续。当前 `perpart::plan_steps` 按 part 顺序 append，保证成立；但 `RequestStep.part` 是公开字段，未来任何 processor 或对 steps 的重排/过滤一旦交错 part，行为不是报错而是静默错误：同 part 被拆成多个 group、同 stem 产出两个同名 artifact，在 `write_directory` 里互相冲突。
   - 方案：建议在 plan 构建后加一条顺序断言（part id 非降序），把违约变成显式 usage 错误。
   - 测试（※补全）：构造交错 steps（单测）→ 报错。
