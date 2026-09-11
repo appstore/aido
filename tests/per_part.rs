@@ -705,6 +705,102 @@ fn json_report_on_a_partial_batch_carries_the_failures() {
 }
 
 #[test]
+fn a_recorded_partial_batch_restores_with_its_failure_list() {
+    // The original run's report names the failed part and exits 6; the
+    // restored report (`last --json`) must say the same about the run
+    // instead of presenting a clean success.
+    let (a, b) = two_images("perpart-lastjson");
+    let out_dir = temp_dir("perpart-lastjson-out");
+    let restore_dir = temp_dir("perpart-lastjson-restore");
+    let server = MultiServer::start_statuses(&[
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"boom"}}"#,
+        ),
+        ("200 OK", chat_body("text of B")),
+    ]);
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"test-model\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let history = temp_dir("perpart-lastjson-hist");
+    let arg = cfg.display().to_string();
+    let hist = history.display().to_string();
+    let envs = [
+        ("AIDO_CONFIG", arg.as_str()),
+        ("AIDO_HISTORY_DIR", hist.as_str()),
+    ];
+    let out = run_tty_with(
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &envs,
+        cfg.clone(),
+    );
+    out.assert_code(6);
+
+    // The record's manifest carries the structured failures next to the
+    // warning strings, so a restore can reproduce the original report.
+    let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1, "the batch is recorded once");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    let recorded = manifest["failed_parts"].as_array().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0][0], "a.png");
+    assert!(recorded[0][1].as_str().unwrap().contains("boom"));
+    assert_eq!(manifest["parts_total"], 2);
+    // The human warning string stays as-is alongside the structured pairs.
+    let warnings = manifest["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("part 'a.png' failed")),
+        "{warnings:?}"
+    );
+
+    // The restored JSON report matches the original run's: the failed
+    // part named, the partial error set, the survivor still delivered.
+    let out = run_tty_with(
+        &["last", "--json", "--out-dir", restore_dir.to_str().unwrap()],
+        &envs,
+        cfg,
+    );
+    out.assert_code(0);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["error"]["kind"], "partial");
+    assert_eq!(
+        report["error"]["message"],
+        "1 input part(s) failed; the rest were delivered"
+    );
+    let failed = report["failed_parts"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["part"], "a.png");
+    assert!(failed[0]["error"].as_str().unwrap().contains("boom"));
+    assert_eq!(report["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(report["artifacts"][0]["id"], "b");
+    assert_eq!(
+        std::fs::read_to_string(restore_dir.join("b.txt")).unwrap(),
+        "text of B"
+    );
+}
+
+#[test]
 fn a_batch_cannot_target_the_clipboard() {
     let (a, b) = two_images("perpart-copy");
     let out_dir = temp_dir("perpart-copy-out");

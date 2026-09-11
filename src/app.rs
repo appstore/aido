@@ -103,6 +103,8 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
                     generation: GenerationStatus::Cancelled,
                     artifacts: Vec::new(),
                     warnings: vec!["interrupted by Ctrl+C".into()],
+                    failed_parts: Vec::new(),
+                    parts_total: 0,
                     deliveries: Vec::new(),
                 };
                 best_effort(
@@ -263,6 +265,12 @@ async fn dispatch(
         generation,
         artifacts: output.artifacts.clone(),
         warnings: output.warnings.clone(),
+        failed_parts: output
+            .failed_parts
+            .iter()
+            .map(|f| (f.name.clone(), f.error.clone()))
+            .collect(),
+        parts_total: output.parts_total,
         deliveries: Vec::new(),
     };
     if !record.generation.is_complete() {
@@ -478,11 +486,20 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
             for (n, id) in ids.iter().rev().enumerate() {
                 let n = n + 1;
                 match history::load(id) {
-                    Ok(Some(record)) => println!(
-                        "{n:>width$}  {id}  {:<12} {}",
-                        record.task.as_deref().unwrap_or("-"),
-                        generation_label(&record.generation)
-                    ),
+                    Ok(Some(record)) => {
+                        let mut label = generation_label(&record.generation);
+                        if !record.failed_parts.is_empty() {
+                            label.push_str(&format!(
+                                "; {}/{} input part(s) failed",
+                                record.failed_parts.len(),
+                                record.parts_total.max(record.failed_parts.len())
+                            ));
+                        }
+                        println!(
+                            "{n:>width$}  {id}  {:<12} {label}",
+                            record.task.as_deref().unwrap_or("-")
+                        );
+                    }
                     Ok(None) => println!("{n:>width$}  {id}  (unreadable)"),
                     Err(e) => println!("{n:>width$}  {id}  (error: {e:#})"),
                 }
@@ -580,7 +597,9 @@ async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppRes
         json: options.json,
         run_id: &record.run_id,
         task: record.task.as_deref(),
-        failed_parts: &[],
+        // The restored report describes the run as it was: a partially
+        // failed batch must not read as a full success here either.
+        failed_parts: &record.failed_parts,
     };
     output::deliver(&args).result().map(|_| ())
 }

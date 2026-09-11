@@ -38,6 +38,13 @@ struct Manifest {
     generation: GenerationStatus,
     #[serde(default)]
     warnings: Vec<String>,
+    /// Per-part batches only: the structured (part, error) pairs. Defaults
+    /// keep manifests written before this field parsing.
+    #[serde(default)]
+    failed_parts: Vec<(String, String)>,
+    /// Total parts of the per-part batch (0 outside one).
+    #[serde(default)]
+    parts_total: usize,
     #[serde(default)]
     deliveries: Vec<DeliveryState>,
     #[serde(default)]
@@ -143,6 +150,8 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
         summary: record.summary.clone(),
         generation: record.generation.clone(),
         warnings: record.warnings.clone(),
+        failed_parts: record.failed_parts.clone(),
+        parts_total: record.parts_total,
         deliveries: Vec::new(),
         artifacts,
     };
@@ -222,6 +231,8 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
         generation: manifest.generation,
         artifacts,
         warnings: manifest.warnings,
+        failed_parts: manifest.failed_parts,
+        parts_total: manifest.parts_total,
         deliveries: manifest.deliveries,
     }))
 }

@@ -233,6 +233,15 @@ pub struct RunRecord {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Per-part batches only: the (part name, error) pairs that failed
+    /// while the surviving parts delivered, so a restored run's report can
+    /// name them instead of reading as a full success. The defaults keep
+    /// records written before this field parsing.
+    #[serde(default)]
+    pub failed_parts: Vec<(String, String)>,
+    /// Total parts of the per-part batch (0 outside one).
+    #[serde(default)]
+    pub parts_total: usize,
     #[serde(default)]
     pub deliveries: Vec<DeliveryState>,
 }
@@ -486,6 +495,8 @@ mod tests {
                 provenance: Provenance::Request { index: 0 },
             }],
             warnings: Vec::new(),
+            failed_parts: Vec::new(),
+            parts_total: 0,
             deliveries: vec![DeliveryState {
                 destination: Destination::Clipboard,
                 status: DeliveryStatus::Failed {

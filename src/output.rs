@@ -35,7 +35,8 @@ pub struct DeliverArgs<'a> {
     /// Per-part batches only: the (part, error) pairs that failed while
     /// the surviving parts delivered normally. They reach the JSON report
     /// (which would otherwise present a partial run as a full success);
-    /// empty everywhere else.
+    /// empty everywhere else. A restored delivery (`last`, `history show`)
+    /// passes the recorded run's pairs so its report matches the original.
     pub failed_parts: &'a [(String, String)],
 }
 

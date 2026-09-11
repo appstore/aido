@@ -322,7 +322,7 @@
     - 保留豁免 + 提示：维持现状，`describe()` 在 `batch` 且交付目标不合法时追加一行「实际执行将拒绝：需 --out-dir」。
   - 测试：按所选方向更新 `tests/per_part.rs` 的 `dry_run_shows_the_batch_plan_without_requesting`。
 
-- [ ] **F29 · 低 · `src/app.rs:531` · `src/history.rs` · `failed_parts`/`parts_total` 不进运行记录，恢复交付的 JSON 报告不对称**
+- [x] **F29 · 低 · `src/app.rs:531` · `src/history.rs` · `failed_parts`/`parts_total` 不进运行记录，恢复交付的 JSON 报告不对称**
   - 问题：`FailedPart` 只活在 `RunOutput` 与 `--json` 报告里；`RunRecord` 没有对应字段，历史里只能靠 warnings 字符串（`part 'a.png' failed: …`）间接还原失败清单。`deliver_restored` 给 `DeliverArgs` 传 `failed_parts: &[]`，于是同一个 run：原始执行的 `--json` 报告带 `error.kind = "partial"` 与 `failed_parts` 数组，`aido last --json` 恢复交付的报告两者皆无。恢复交付本身成功没有错，但两次报告对「这次跑成没跑全」给出不同答案，脚本会误判。
   - 方案：给 `RunRecord` 加 `failed_parts: Vec<(String, String)>` 字段并在 `deliver_restored` 回填。
   - 测试（※补全）：`last --json` 恢复报告含失败清单。
