@@ -28,6 +28,14 @@ pub struct RunOutput {
     pub failed_parts: Vec<FailedPart>,
     /// Total parts in a per-part batch (0 outside one).
     pub parts_total: usize,
+    /// The request error that stopped a single-document run mid-way; a
+    /// batch never sets this (its failures are per-part). Whatever text
+    /// already merged still reached `artifacts`, so the caller records
+    /// the partial run and classifies the exit code from this error.
+    pub failure: Option<AppError>,
+    /// Steps whose replies completed, of `steps_total` planned requests.
+    pub steps_done: usize,
+    pub steps_total: usize,
 }
 
 /// One failed part of a per-part batch, named by its input file
@@ -132,6 +140,11 @@ impl SliceMerger {
 /// error or truncated reply — is dropped with a warning and the run
 /// continues with the next part; the caller reports exit 6 after
 /// delivering the survivors.
+///
+/// Outside a batch, a request error stops the run but never discards it:
+/// the output is `Ok` with status `Incomplete`, the merged text of the
+/// replies that did arrive, and the error itself in `failure` — the
+/// caller records the partial generation instead of losing it.
 pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let api_key = plan.resolved.api_key_env.as_deref().and_then(|name| {
         // The default provider also accepts the conventional OpenAI name.
@@ -188,6 +201,8 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let mut overall = GenerationStatus::Complete;
     let mut artifacts: Vec<Artifact> = Vec::new();
     let mut failed_parts: Vec<FailedPart> = Vec::new();
+    let mut failure: Option<AppError> = None;
+    let mut steps_done = 0usize;
 
     // The part currently receiving replies. Outside a batch this is one
     // unnamed group spanning every step — the exact pre-batch behavior.
@@ -362,6 +377,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         };
         match result {
             Ok(reply) => {
+                steps_done += 1;
                 // A buffered reply arrives whole: run it through the same
                 // path the deltas would take.
                 if !plan.transport_stream && !reply.text.is_empty() {
@@ -388,8 +404,31 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             Err(e) => {
                 let error = AppError::from(e);
                 if !batch {
-                    spinner.stop();
-                    return Err(error);
+                    // The remaining requests stop here, but the replies that
+                    // already arrived are real generated content: the run
+                    // ends incomplete (naming the failed request), keeps
+                    // whatever merged, and the caller records it instead of
+                    // discarding it — re-running does not have to pay for
+                    // the requests that succeeded.
+                    overall = GenerationStatus::Incomplete {
+                        reason: format!(
+                            "request {}/{} failed: {}",
+                            step.index + 1,
+                            plan.steps.len(),
+                            error.chain()
+                        ),
+                    };
+                    // A reduce run has no final result without its reduce
+                    // reply: map replies are intermediate material and a
+                    // half-streamed reduce reply is not the consolidation
+                    // either, so nothing is kept as the artifact.
+                    if reduce_plan {
+                        if let Some(g) = group.as_mut() {
+                            g.sink.borrow_mut().merged.clear();
+                        }
+                    }
+                    failure = Some(error);
+                    break;
                 }
                 let g = group.take().unwrap();
                 let message = error.chain();
@@ -429,6 +468,9 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         live_stdout,
         failed_parts,
         parts_total: if batch { parts_total } else { 0 },
+        failure,
+        steps_done,
+        steps_total: plan.steps.len(),
     })
 }
 

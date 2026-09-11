@@ -117,7 +117,7 @@
 
   - 测试：`tests/config.rs` 增加「跑 `config init` → 再跑 `tts --dry-run` → 计划里的 route 是 edge-tts 且 credentials 显示 none required」。这正好补上 `:387` 那个测试的盲区。
 
-- [ ] **F06 · 高 · `src/runner.rs:215` · 多请求运行中途失败会丢掉已生成的内容，且不留历史**
+- [x] **F06 · 高 · `src/runner.rs:215` · 多请求运行中途失败会丢掉已生成的内容，且不留历史**
   - 问题：一张长截图切成 5 片，第 4 片请求失败 → `execute()` 立刻 `return Err`，前 3 片的文本全部丢弃，`save_generation` 一次都没被调用。用户重跑要重新付 5 次请求的钱。更糟的是流式场景：前 3 片的文本已经打到 stdout 上了，但进程以退出码 3 结束、历史里什么都没有。这恰好违背了这次重构自己立的核心承诺——「生成状态与交付状态分离，生成成功的内容一定可恢复」。
   - 方案：`runner.rs:215` 的 `return Err` 改成记录并终止：
     - 捕获错误后不直接返回，而是 `overall = GenerationStatus::Incomplete { reason: format!("request {}/{} failed: {e}", ...) }`，break 出循环。

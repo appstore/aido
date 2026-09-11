@@ -226,24 +226,50 @@ async fn dispatch(
         if plan.record_history {
             // `output.status` is Complete for an unsatisfied generation:
             // its validated artifacts stay in the record's directory
-            // instead of being dropped. A truncated stream keeps metadata
-            // only — partial text is never presented as recoverable.
+            // instead of being dropped. A run whose requests died mid-way
+            // keeps the same promise for whatever text did arrive — but a
+            // first-request failure has no text to keep, so it records
+            // metadata only, exactly like a truncated stream.
+            let keep_artifacts = output.status.is_complete()
+                || (output.failure.is_some() && !output.artifacts.is_empty());
             best_effort(
-                history::save_generation(&record, output.status.is_complete()),
+                history::save_generation(&record, keep_artifacts),
                 "failed to record the run",
             );
+            // Text that already streamed live cannot be taken back; point
+            // the user at the record that now holds it. Only a run that
+            // actually streamed whole replies into a kept artifact can
+            // make that claim — a reduce run streams no map reply and
+            // keeps no artifact, and a truncated stream records metadata
+            // only (no `failure`, no warning).
+            if output.live_stdout
+                && output.failure.is_some()
+                && output.steps_done > 0
+                && !output.artifacts.is_empty()
+            {
+                eprintln!(
+                    "warning: 已输出前 {}/{} 个分片的结果；完整记录见 aido history show {}",
+                    output.steps_done, output.steps_total, run_id
+                );
+            }
         }
         let reason = match &record.generation {
             GenerationStatus::Incomplete { reason } => format!(" ({reason})"),
             _ => String::new(),
         };
-        let message = if unsatisfied.is_some() {
+        let message = if unsatisfied.is_some() && output.failure.is_none() {
             format!(
                 "the generation did not satisfy the request{reason}; the result is not delivered"
             )
         } else {
             format!("the generation did not complete{reason}; the result is not delivered")
         };
+        if let Some(failure) = output.failure.as_ref() {
+            // The failed request's own class decides the exit code (a 500
+            // is a service error, 3) instead of a blanket generation
+            // failure; only a failure-less incompleteness stays exit 4.
+            return Err(AppError::new(failure.kind, message));
+        }
         return Err(AppError::generation(message));
     }
 

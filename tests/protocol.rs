@@ -138,6 +138,151 @@ fn truncated_reply_is_not_delivered_and_exits_four() {
     );
 }
 
+// --- mid-run failures ------------------------------------------------------
+
+/// Three paragraphs of exactly 2000 chars each: any two overflow the
+/// 4000-char packing target, so the text chunks into exactly three (the
+/// same shape as tests/chunk.rs's `three_chunk_text`).
+fn three_chunk_text() -> String {
+    (0..3)
+        .map(|i| format!("第{i}部分。{}", "甲".repeat(1995)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[test]
+fn mid_run_failure_keeps_finished_replies_recoverable_and_exits_three() {
+    // The third of three chunk requests dies with a 500: the first two
+    // replies are real generated content — the run records them instead of
+    // discarding them, and the exit code is the failed request's own class
+    // (service error, 3), not a blanket generation failure.
+    let file = temp_file("book.txt", three_chunk_text().as_bytes());
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("第一块的结果")),
+        ("200 OK", chat_body("第二块的结果")),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"service exploded"}}"#,
+        ),
+    ]);
+    let dir = temp_dir("hist-midrun");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            file.to_str().unwrap(),
+        ],
+        &[],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(3);
+    assert!(
+        out.stdout().is_empty(),
+        "an incomplete run delivers nothing"
+    );
+    let err = out.stderr();
+    assert!(err.contains("request 3/3 failed"), "{err}");
+    assert!(err.contains("service exploded"), "{err}");
+    assert_eq!(
+        server.requests().len(),
+        3,
+        "the run stops at the failed request"
+    );
+
+    // one incomplete record holding the two replies that did arrive
+    let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1, "the partial run is recorded");
+    let run = &runs[0];
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    assert!(manifest["generation"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("request 3/3 failed"));
+    assert_eq!(manifest["artifacts"][0]["file"], "text.txt");
+    assert_eq!(
+        std::fs::read_to_string(run.join("text.txt")).unwrap(),
+        "第一块的结果\n\n第二块的结果",
+        "the joined replies of chunks 1 and 2 stay recoverable"
+    );
+}
+
+#[test]
+fn live_partial_run_warns_where_the_full_record_lives() {
+    // The same failure while the replies stream live: stdout keeps what it
+    // already printed, and stderr names how much streamed and which record
+    // now holds the partial text.
+    let file = temp_file("book.txt", three_chunk_text().as_bytes());
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("第一块的结果")),
+        ("200 OK", chat_body("第二块的结果")),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"service exploded"}}"#,
+        ),
+    ]);
+    let dir = temp_dir("hist-midrun-live");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--stream",
+            file.to_str().unwrap(),
+        ],
+        &[],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(3);
+    assert!(
+        out.stdout().contains("第一块的结果"),
+        "streamed text cannot be taken back: {}",
+        out.stdout()
+    );
+    let err = out.stderr();
+    assert!(err.contains("已输出前 2/3 个分片的结果"), "{err}");
+    let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1);
+    let id = runs[0].file_name().unwrap().to_str().unwrap();
+    assert!(
+        err.contains(&format!("aido history show {id}")),
+        "warning names the record: {err}"
+    );
+}
+
 #[test]
 fn empty_reply_is_a_generation_failure() {
     let server = Server::json(chat_body(""));
