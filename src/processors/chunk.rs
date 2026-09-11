@@ -65,6 +65,8 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             inputs: inputs.to_vec(),
             label: "all material".into(),
             hard_cut_end: false,
+            part: None,
+            artifact_stem: None,
         }]);
     }
 
@@ -94,6 +96,8 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
                 // Context carry keeps the outputs duplication-free; there
                 // is no overlap band, so the join never needs a dedup gate.
                 hard_cut_end: false,
+                part: None,
+                artifact_stem: None,
             });
         }
     }

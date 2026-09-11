@@ -57,6 +57,9 @@ pub struct ExecutionPlan {
     /// The processing strategy actually selected for this run (the task's
     /// choice, overridden by `--no-split`).
     pub processor: ProcessorKind,
+    /// Per-part batching: the strategy planned once per file part, one
+    /// artifact (and one failure) per part.
+    pub per_part: bool,
     pub format: Option<OutputFormat>,
     pub destinations: Vec<Destination>,
     pub overwrite: bool,
@@ -132,14 +135,48 @@ pub fn build(
         }
     }
     let processor = select_processor(cli, task);
-    let steps = processors::plan_steps(&inputs, processor, cli.quiet)
-        .map_err(|e| AppError::usage(e.to_string()))?;
+    let steps = if task.per_part {
+        processors::perpart::plan_steps(&inputs, processor, cli.quiet)
+    } else {
+        processors::plan_steps(&inputs, processor, cli.quiet)
+    }
+    .map_err(|e| AppError::usage(e.to_string()))?;
+    // A batch is real only with more than one part: a single file plans
+    // and delivers exactly as before.
+    let mut part_ids = steps.iter().filter_map(|s| s.part).collect::<Vec<usize>>();
+    part_ids.sort_unstable();
+    part_ids.dedup();
+    let batch = part_ids.len() > 1;
+    // Delivery-target rules don't bind a --dry-run: it only shows the plan.
+    if batch && !cli.dry_run {
+        if cli.output.is_some() {
+            return Err(AppError::usage(
+                "a single -o FILE cannot take one artifact per input part; use --out-dir",
+            ));
+        }
+        if cli.out_dir.is_none() {
+            return Err(AppError::usage(format!(
+                "{} inputs are processed one request each; use --out-dir to collect \
+                 one result per input",
+                part_ids.len()
+            )));
+        }
+    }
 
     // --- artifacts and encodings -------------------------------------------
     validate_outputs(cli, &mut resolved, &steps, terminal)?;
 
     // --- destinations -------------------------------------------------------
     let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
+    if batch
+        && !cli.dry_run
+        && (destinations.contains(&Destination::Stdout) && !cli.json
+            || destinations.contains(&Destination::Clipboard))
+    {
+        return Err(AppError::usage(
+            "several artifacts cannot share one stdout or the clipboard; use --out-dir",
+        ));
+    }
 
     // --- transport and limits ------------------------------------------------
     // `--stream` demands a streaming adapter and is refused otherwise;
@@ -166,6 +203,13 @@ pub fn build(
         DeliveryMode::Live
     } else {
         DeliveryMode::Buffered
+    };
+    // A batch never streams live: replies belong to named artifacts in a
+    // directory, and a failed part must not have already hit stdout.
+    let delivery = if batch {
+        DeliveryMode::Buffered
+    } else {
+        delivery
     };
 
     let timeout = Duration::from_secs(cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120));
@@ -207,6 +251,7 @@ pub fn build(
         inputs,
         steps,
         processor,
+        per_part: task.per_part,
         format: cli.format,
         destinations,
         overwrite: cli.overwrite,
@@ -653,38 +698,52 @@ pub fn describe(plan: &ExecutionPlan) -> String {
             })
         ));
     }
-    out.push_str(&format!(
-        "processing:  {}\n",
-        match plan.processor {
-            ProcessorKind::Single => "single request".to_string(),
-            ProcessorKind::OcrTiles => {
-                let mut parts = Vec::new();
-                for step in &plan.steps {
-                    if step.label != "all material" {
-                        parts.push(step.label.clone());
-                    }
-                }
-                if parts.is_empty() {
-                    "ocr-tiles (no image needs slicing)".to_string()
-                } else {
-                    format!("ocr-tiles — {}", parts.join("; "))
-                }
-            }
-            ProcessorKind::ChunkMapReduce => {
-                let mut parts = Vec::new();
-                for step in &plan.steps {
-                    if step.label != "all material" {
-                        parts.push(step.label.clone());
-                    }
-                }
-                if parts.is_empty() {
-                    "chunk-map-reduce (no text needs chunking)".to_string()
-                } else {
-                    format!("chunk-map-reduce — {}", parts.join("; "))
-                }
+    let strategy = match plan.processor {
+        ProcessorKind::Single => {
+            let parts: Vec<&str> = plan
+                .steps
+                .iter()
+                .map(|s| s.label.as_str())
+                .filter(|l| *l != "all material")
+                .collect();
+            if parts.is_empty() {
+                "single request".to_string()
+            } else {
+                parts.join("; ")
             }
         }
-    ));
+        ProcessorKind::OcrTiles => {
+            let mut parts = Vec::new();
+            for step in &plan.steps {
+                if step.label != "all material" {
+                    parts.push(step.label.clone());
+                }
+            }
+            if parts.is_empty() {
+                "ocr-tiles (no image needs slicing)".to_string()
+            } else {
+                format!("ocr-tiles — {}", parts.join("; "))
+            }
+        }
+        ProcessorKind::ChunkMapReduce => {
+            let mut parts = Vec::new();
+            for step in &plan.steps {
+                if step.label != "all material" {
+                    parts.push(step.label.clone());
+                }
+            }
+            if parts.is_empty() {
+                "chunk-map-reduce (no text needs chunking)".to_string()
+            } else {
+                format!("chunk-map-reduce — {}", parts.join("; "))
+            }
+        }
+    };
+    if plan.per_part {
+        out.push_str(&format!("processing:  per-part batch — {strategy}\n"));
+    } else {
+        out.push_str(&format!("processing:  {strategy}\n"));
+    }
     out.push_str(&format!(
         "produce:     {}\n",
         plan.resolved

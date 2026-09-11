@@ -277,7 +277,7 @@ pub enum GenerationEvent {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// The four failure classes a run can end in; each maps to a distinct exit
+/// The failure classes a run can end in; each maps to a distinct exit
 /// code so scripts can tell "you made a mistake" from "the service broke"
 /// from "the result was bad" from "the result is fine but could not be
 /// delivered".
@@ -291,6 +291,10 @@ pub enum ErrorKind {
     Generation,
     /// An explicit output target failed after a successful generation. Exit 5.
     Delivery,
+    /// A per-part batch finished with every successful part delivered but
+    /// at least one part failed; the failures are listed in the message
+    /// and the run's warnings. Exit 6.
+    Partial,
 }
 
 impl ErrorKind {
@@ -300,6 +304,7 @@ impl ErrorKind {
             Self::Service => 3,
             Self::Generation => 4,
             Self::Delivery => 5,
+            Self::Partial => 6,
         }
     }
 }
@@ -336,6 +341,10 @@ impl AppError {
 
     pub fn delivery(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Delivery, message)
+    }
+
+    pub fn partial(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Partial, message)
     }
 
     /// The full message plus every underlying cause, one per line.
@@ -473,7 +482,8 @@ mod tests {
             ErrorKind::Service.exit_code(),
             ErrorKind::Generation.exit_code(),
             ErrorKind::Delivery.exit_code(),
+            ErrorKind::Partial.exit_code(),
         ];
-        assert_eq!(codes, [2, 3, 4, 5]);
+        assert_eq!(codes, [2, 3, 4, 5, 6]);
     }
 }

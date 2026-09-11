@@ -144,6 +144,10 @@ struct TaskFile {
     requires_material: bool,
     #[serde(default)]
     processor: ProcessorKind,
+    /// Batch mode: plan the declared processor once per file part instead
+    /// of one sequence over all material, one artifact per part.
+    #[serde(default)]
+    per_part: bool,
     #[serde(default)]
     params: Vec<String>,
     #[serde(default)]
@@ -168,6 +172,7 @@ pub struct Task {
     pub output_types: Vec<MediaKind>,
     pub requires_material: bool,
     pub processor: ProcessorKind,
+    pub per_part: bool,
     pub params: Vec<TaskParam>,
     pub defaults: BTreeMap<String, serde_json::Value>,
     pub options: BTreeMap<String, serde_json::Value>,
@@ -274,6 +279,7 @@ fn parse_task(name: &str, src: &str, builtin: bool) -> Result<Task> {
         output_types: file.output_types,
         requires_material: file.requires_material,
         processor: file.processor,
+        per_part: file.per_part,
         params,
         defaults,
         options,

@@ -12,3 +12,6 @@ output_types = ["text"]
 # Tall screenshots are sliced into legibility-sized requests; replies merge
 # at slice boundaries. Disable per-run with --no-split.
 processor = "ocr-tiles"
+# Multiple images become one request sequence (and one result file) per
+# image — out/a.png lands as out/a.txt. Requires --out-dir.
+per_part = true

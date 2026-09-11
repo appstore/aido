@@ -14,6 +14,9 @@ params = ["to"]
 # carries the tail of the previous one as context, so the joined
 # translation stays coherent; disable per-run with --no-split.
 processor = "chunk-map-reduce"
+# Multiple files are translated one request sequence per file — the
+# result of a.md lands beside it as a.txt. Requires --out-dir.
+per_part = true
 
 [defaults]
 to = "auto"

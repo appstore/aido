@@ -30,6 +30,11 @@ pub struct DeliverArgs<'a> {
     pub json: bool,
     pub run_id: &'a str,
     pub task: Option<&'a str>,
+    /// Per-part batches only: the (part, error) pairs that failed while
+    /// the surviving parts delivered normally. They reach the JSON report
+    /// (which would otherwise present a partial run as a full success);
+    /// empty everywhere else.
+    pub failed_parts: &'a [(String, String)],
 }
 
 pub struct DeliveryOutcome {
@@ -461,6 +466,7 @@ fn write_directory(
             "mime": artifact.mime,
             "file": name,
             "size": artifact.bytes.len(),
+            "provenance": artifact.provenance,
         }));
         saved.push((artifact.id.clone(), absolute(&path)));
     }
@@ -480,27 +486,41 @@ fn write_directory(
     Ok(saved)
 }
 
-/// Program-generated names; a service-returned file name can never escape
-/// the target directory. History uses the same scheme so records and
-/// deliveries never disagree about where an artifact lives.
-pub(crate) fn artifact_file_name(artifact: &Artifact) -> String {
-    let extension = match artifact.kind {
-        MediaKind::Text => "txt",
-        _ => artifact.format.as_str(),
-    };
-    // Service-generated ids never choose the path: keep it a single name.
-    let safe: String = artifact
-        .id
+/// The file-name-safe form of an id or input stem: letters and digits
+/// keep their Unicode form so `截图` stays readable; separators (`/`,
+/// `.`, …) become `-`; a stem of only separators would hide the file
+/// behind a leading dot, so it is named instead. Callers that turn
+/// several inputs into files must dedup on THIS form, not on the raw
+/// stem — it is the name that lands in the directory.
+pub(crate) fn sanitize_stem(id: &str) -> String {
+    let safe: String = id
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
                 c
             } else {
                 '-'
             }
         })
         .collect();
-    format!("{}.{}", safe.trim_matches('-'), extension)
+    let stem = safe.trim_matches('-');
+    if stem.is_empty() {
+        "artifact".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Names derive from service-generated ids or from an input file's stem
+/// (per-part batches); either way a service or a path can never choose a
+/// file outside the target directory. History uses the same scheme so
+/// records and deliveries never disagree about where an artifact lives.
+pub(crate) fn artifact_file_name(artifact: &Artifact) -> String {
+    let extension = match artifact.kind {
+        MediaKind::Text => "txt",
+        _ => artifact.format.as_str(),
+    };
+    format!("{}.{}", sanitize_stem(&artifact.id), extension)
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -540,21 +560,45 @@ fn json_report(
             })
         })
         .collect();
+    let report_error = error.map(|e| {
+        serde_json::json!({
+            "kind": match e.kind {
+                crate::domain::ErrorKind::Usage => "usage",
+                crate::domain::ErrorKind::Service => "service",
+                crate::domain::ErrorKind::Generation => "generation",
+                crate::domain::ErrorKind::Delivery => "delivery",
+                crate::domain::ErrorKind::Partial => "partial",
+            },
+            "message": e.chain(),
+        })
+    });
+    // A delivered batch with failed parts must not read as a full
+    // success: the report carries the failures even though the delivery
+    // itself succeeded (the run still exits 6).
+    let report_error = report_error.or_else(|| {
+        (!args.failed_parts.is_empty()).then(|| {
+            serde_json::json!({
+                "kind": "partial",
+                "message": format!(
+                    "{} input part(s) failed; the rest were delivered",
+                    args.failed_parts.len()
+                ),
+            })
+        })
+    });
+    let failed_parts: Vec<serde_json::Value> = args
+        .failed_parts
+        .iter()
+        .map(|(name, error)| serde_json::json!({"part": name, "error": error}))
+        .collect();
     serde_json::json!({
         "version": 1,
         "run_id": args.run_id,
         "task": args.task,
         "artifacts": artifacts,
         "deliveries": deliveries,
-        "error": error.map(|e| serde_json::json!({
-            "kind": match e.kind {
-                crate::domain::ErrorKind::Usage => "usage",
-                crate::domain::ErrorKind::Service => "service",
-                crate::domain::ErrorKind::Generation => "generation",
-                crate::domain::ErrorKind::Delivery => "delivery",
-            },
-            "message": e.chain(),
-        })),
+        "failed_parts": failed_parts,
+        "error": report_error,
     })
 }
 
@@ -587,6 +631,7 @@ mod tests {
             json: false,
             run_id: "t",
             task: Some("t"),
+            failed_parts: &[],
         };
         // Deliver to a real stdout is awkward in-process; the states tell
         // the story.
@@ -653,5 +698,18 @@ mod tests {
         let name = artifact_file_name(&artifact);
         assert!(!name.contains(".."), "{name}");
         assert!(!name.contains('/'), "{name}");
+    }
+
+    #[test]
+    fn unicode_stems_survive_and_separators_do_not() {
+        let artifact = text_artifact("截图", "body");
+        assert_eq!(artifact_file_name(&artifact), "截图.txt");
+        let artifact = text_artifact("shots/a..png", "body");
+        let name = artifact_file_name(&artifact);
+        assert_eq!(name, "shots-a--png.txt");
+        assert!(!name.contains('/'));
+        // A stem of only separators still yields a usable, visible name.
+        let artifact = text_artifact("···", "body");
+        assert_eq!(artifact_file_name(&artifact), "artifact.txt");
     }
 }

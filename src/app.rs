@@ -186,11 +186,28 @@ async fn dispatch(
     // (missing kind, short count) is recorded, clearly marked as
     // incomplete, and not delivered.
     let unsatisfied = output.unsatisfied_reason(&plan);
-    let generation = match (&output.status, &unsatisfied) {
-        (GenerationStatus::Complete, Some(reason)) => GenerationStatus::Incomplete {
-            reason: reason.clone(),
-        },
-        (status, _) => status.clone(),
+    let unsatisfied = if output.artifacts.is_empty() && !output.failed_parts.is_empty() {
+        Some(format!(
+            "all {} input part(s) failed — first error: {}",
+            output.failed_parts.len(),
+            output.failed_parts[0].error
+        ))
+    } else {
+        unsatisfied
+    };
+    // In a batch with surviving parts, part failures live in the record's
+    // warnings and surface as exit 6 after normal delivery; they do not
+    // taint the survivors' generation.
+    let batch_partial = !output.failed_parts.is_empty() && !output.artifacts.is_empty();
+    let generation = if batch_partial {
+        GenerationStatus::Complete
+    } else {
+        match (&output.status, &unsatisfied) {
+            (GenerationStatus::Complete, Some(reason)) => GenerationStatus::Incomplete {
+                reason: reason.clone(),
+            },
+            (status, _) => status.clone(),
+        }
     };
 
     // Truncated or otherwise incomplete generations are recorded but not
@@ -240,6 +257,11 @@ async fn dispatch(
     }
 
     let hold_secs = cfg.settings.hold_secs.unwrap_or(config::DEFAULT_HOLD_SECS);
+    let failed_parts: Vec<(String, String)> = output
+        .failed_parts
+        .iter()
+        .map(|f| (f.name.clone(), f.error.clone()))
+        .collect();
     let deliver_args = DeliverArgs {
         artifacts: &output.artifacts,
         produce: &plan.resolved.produce,
@@ -251,6 +273,7 @@ async fn dispatch(
         json: cli.json,
         run_id: &run_id,
         task: Some(&task.name),
+        failed_parts: &failed_parts,
     };
     // The outcome keeps every destination's real state, on success and on
     // failure alike: partial deliveries are the recoverable path when a
@@ -271,7 +294,25 @@ async fn dispatch(
     }
     match outcome.error {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => {
+            // Every destination got its artifact; the non-zero exit is
+            // only about the parts that failed along the way.
+            if batch_partial {
+                let listed = output
+                    .failed_parts
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, f.error))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(AppError::partial(format!(
+                    "{}/{} input part(s) failed; the rest were delivered — {}",
+                    output.failed_parts.len(),
+                    output.parts_total.max(output.failed_parts.len()),
+                    listed
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -487,6 +528,7 @@ async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppRes
         json: options.json,
         run_id: &record.run_id,
         task: record.task.as_deref(),
+        failed_parts: &[],
     };
     output::deliver(&args).result().map(|_| ())
 }
@@ -615,7 +657,11 @@ fn manage_tasks(cmd: &TasksCmd) -> AppResult<()> {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            println!("processor:   {}", processor_name(task.processor));
+            println!(
+                "processor:   {}{}",
+                processor_name(task.processor),
+                if task.per_part { " (per-part)" } else { "" }
+            );
             if !task.params.is_empty() {
                 println!(
                     "parameters:  {}",

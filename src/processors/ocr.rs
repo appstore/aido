@@ -59,6 +59,8 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             inputs: inputs.to_vec(),
             label: "all material".into(),
             hard_cut_end: false,
+            part: None,
+            artifact_stem: None,
         }]);
     }
 
@@ -84,6 +86,8 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
                 // the step whose bottom edge it cuts, and a tail slice
                 // has no next step at all.
                 hard_cut_end: hard_flags[i],
+                part: None,
+                artifact_stem: None,
             });
         }
     }

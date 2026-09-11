@@ -59,18 +59,28 @@ pub struct MultiServer {
 
 impl MultiServer {
     pub fn start(bodies: &[&str]) -> Self {
+        let all_ok: Vec<(&str, &str)> = bodies.iter().map(|b| ("200 OK", *b)).collect();
+        Self::start_statuses(&all_ok)
+    }
+
+    /// One (status, body) per request, in order — lets a test fail
+    /// selected requests of a multi-request run (per-part batches).
+    pub fn start_statuses(bodies: &[(&str, &str)]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let bodies: Vec<String> = bodies.iter().map(|s| s.to_string()).collect();
+        let bodies: Vec<(String, String)> = bodies
+            .iter()
+            .map(|(s, b)| (s.to_string(), b.to_string()))
+            .collect();
         let handle = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut requests = Vec::new();
-            for body in &bodies {
+            for (status, body) in &bodies {
                 let mut stream = accept(&listener, deadline);
                 stream.set_nonblocking(false).unwrap();
                 requests.push(read_request(&mut stream));
-                write_response(&mut stream, "200 OK", body);
+                write_response(&mut stream, status, body);
             }
             requests
         });
