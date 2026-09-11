@@ -356,7 +356,10 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 let message = error.chain();
                 let name = part_name(plan, g.id, &g.stem);
                 warnings.push(format!("part '{name}' failed: {message}"));
-                failed_parts.push(FailedPart { name, error: message });
+                failed_parts.push(FailedPart {
+                    name,
+                    error: message,
+                });
                 skip_part = step.part;
             }
         }

@@ -692,7 +692,10 @@ mod tests {
         let pattern = format!("{}/*.txt", dir.display());
         let mut e = env(b"", true);
         let parts = gather(
-            &[SourceSpec::Glob(pattern), SourceSpec::File(dir.join("c.md"))],
+            &[
+                SourceSpec::Glob(pattern),
+                SourceSpec::File(dir.join("c.md")),
+            ],
             true,
             None,
             false,
@@ -749,7 +752,11 @@ mod tests {
     fn directory_expands_one_level_sorted() {
         let dir = write_dir(
             "dir-sorted",
-            &[("b.txt", b"b\n"), ("a.txt", b"a\n"), (".hidden.txt", b"h\n")],
+            &[
+                ("b.txt", b"b\n"),
+                ("a.txt", b"a\n"),
+                (".hidden.txt", b"h\n"),
+            ],
         );
         let mut e = env(b"", true);
         let parts = gather(&[SourceSpec::File(dir.clone())], true, None, false, &mut e).unwrap();
@@ -879,17 +886,13 @@ mod tests {
 
     #[test]
     fn total_budget_covers_expanded_files() {
-        let dir = write_dir("expansion-budget", &[("a.txt", b"aaaa\n"), ("b.txt", b"bbbb\n")]);
+        let dir = write_dir(
+            "expansion-budget",
+            &[("a.txt", b"aaaa\n"), ("b.txt", b"bbbb\n")],
+        );
         let pattern = format!("{}/*.txt", dir.display());
         let mut e = env(b"", true);
-        let err = gather(
-            &[SourceSpec::Glob(pattern)],
-            true,
-            Some(8),
-            false,
-            &mut e,
-        )
-        .unwrap_err();
+        let err = gather(&[SourceSpec::Glob(pattern)], true, Some(8), false, &mut e).unwrap_err();
         assert!(err.to_string().contains("exceed the total"), "{err}");
     }
 

@@ -68,10 +68,9 @@ fn two_images_become_two_requests_and_two_named_files() {
     assert_eq!(count_images(&requests[0]), 1);
     assert_eq!(count_images(&requests[1]), 1);
     // The manifest explains where every artifact came from.
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(out_dir.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(manifest["artifacts"][0]["id"], "a");
     assert_eq!(manifest["artifacts"][0]["provenance"]["type"], "request");
     assert_eq!(manifest["artifacts"][1]["id"], "b");
@@ -404,7 +403,11 @@ fn a_recorded_batch_is_recovered_with_the_same_names() {
     );
     out.assert_code(0);
     // The batch restores as a unit, under its original per-part names.
-    let out = run_tty_with(&["last", "--out-dir", restore_dir.to_str().unwrap()], &envs, cfg);
+    let out = run_tty_with(
+        &["last", "--out-dir", restore_dir.to_str().unwrap()],
+        &envs,
+        cfg,
+    );
     out.assert_code(0);
     assert_eq!(
         std::fs::read_to_string(restore_dir.join("a.txt")).unwrap(),
@@ -509,7 +512,10 @@ fn a_multi_request_part_failing_mid_slices_drops_whole_part() {
     // delivers nothing even though its first slice succeeded.
     let server = MultiServer::start_statuses(&[
         ("200 OK", chat_body("first slice of a")),
-        ("500 Internal Server Error", r#"{"error":{"message":"boom"}}"#),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"boom"}}"#,
+        ),
         ("200 OK", chat_body("text of B")),
     ]);
     let cfg = batch_cfg(&server.url());
@@ -628,7 +634,10 @@ fn json_report_on_a_partial_batch_carries_the_failures() {
     let (a, b) = two_images("perpart-jsonp");
     let out_dir = temp_dir("perpart-jsonp-out");
     let server = MultiServer::start_statuses(&[
-        ("500 Internal Server Error", r#"{"error":{"message":"boom"}}"#),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"boom"}}"#,
+        ),
         ("200 OK", chat_body("text of B")),
     ]);
     let cfg = batch_cfg(&server.url());
