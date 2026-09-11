@@ -173,7 +173,7 @@
   - 测试：`tests/chunk.rs` 断言第 2、3 个请求的材料里都含术语表内容，且材料顺序与命令行顺序一致。
   - 批次 2 说明：会改变 translate 的实际输出，同 commit 连带更新 README 行为说明。
 
-- [ ] **F10 · 中 · `src/output.rs:90, :101, :110` · 交付期的错误被分类成退出码 2，与契约冲突**
+- [x] **F10 · 中 · `src/output.rs:90, :101, :110` · 交付期的错误被分类成退出码 2，与契约冲突**
   - 问题：`deliver_inner()` 里「多个产物塞不进一个文件」「多个产物共享裸 stdout」「扩展名与编码不符」这三条发生在生成完成之后，却用了 `AppError::usage`（退出 2）。同一个函数里，剪贴板的同类检查用的是 `AppError::delivery`（退出 5）。README 定义的是「2 = 用法/预检、5 = 交付失败」。脚本看到退出 2 会以为「命令写错了，什么都没发生」，实际上模型已经跑完、内容已经存进历史了。
   - 方案：三处 `AppError::usage` 改成 `AppError::delivery`。判据很清晰：这个函数只在生成成功之后才会被调用，所以它产生的任何错误都是交付失败。同时把这三条早退改成「记录 `DeliveryState::Failed` 后再返回」，否则 `record.deliveries` 是空的，历史里看不出交付尝试过。可以给这三条构造一个 `Destination` 已知的 state 再 push。
   - 测试：`tests/output.rs` 增加「服务返回 2 张图但只给了 `-o one.png` → 退出 5、历史记录里 file 目标标记为 failed、`aido last --out-dir` 能恢复」。

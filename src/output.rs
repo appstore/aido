@@ -4,7 +4,9 @@
 //! commit files and directories (atomic, no-clobber by default), then the
 //! clipboard. A failure in one destination keeps earlier successes and
 //! fails the run with exit code 5; the result itself stays recoverable in
-//! history.
+//! history. The late re-validation refusals count as delivery failures
+//! too: delivery only runs after the generation succeeded, so exit 2
+//! (usage) would claim nothing happened when the model already ran.
 
 use crate::clipboard;
 use crate::domain::{
@@ -86,16 +88,31 @@ fn deliver_inner(
         .filter(|a| args.produce.contains(&a.kind))
         .collect();
     if delivered.is_empty() {
-        return Err(AppError::usage(
-            "nothing to deliver: the run produced none of the requested kinds",
-        ));
+        // Post-generation: the run could not have reached delivery without
+        // artifacts in hand, so this is a delivery refusal, not a usage
+        // error. Every asked destination records the failed attempt.
+        let message = "nothing to deliver: the run produced none of the requested kinds";
+        for destination in args.destinations {
+            states.push(DeliveryState {
+                destination: destination.clone(),
+                status: DeliveryStatus::Failed {
+                    error: message.to_string(),
+                },
+            });
+        }
+        return Err(AppError::delivery(message));
     }
 
-    // Late re-validation: what came back must fit the destinations.
+    // Late re-validation: what came back must fit the destinations. The
+    // generation already ran, so every refusal below is a delivery
+    // failure (exit 5) with the refused destination recorded — never a
+    // usage error, which would read as "wrong command, nothing happened".
     let has_stdout = args.destinations.contains(&Destination::Stdout);
     if has_stdout && !args.json && delivered.len() > 1 {
-        return Err(AppError::usage(
+        return Err(refuse_delivery(
+            Destination::Stdout,
             "several artifacts cannot share bare stdout; use --out-dir",
+            states,
         ));
     }
     let file_dest = args.destinations.iter().find_map(|d| match d {
@@ -104,15 +121,23 @@ fn deliver_inner(
     });
     if let Some(path) = &file_dest {
         if delivered.len() != 1 {
-            return Err(AppError::usage(format!(
-                "{} artifacts cannot go to one file ({}); use --out-dir",
-                delivered.len(),
-                path.display()
-            )));
+            return Err(refuse_delivery(
+                Destination::File { path: path.clone() },
+                format!(
+                    "{} artifacts cannot go to one file ({}); use --out-dir",
+                    delivered.len(),
+                    path.display()
+                ),
+                states,
+            ));
         }
         let artifact = delivered[0];
         if let Err(e) = check_extension(artifact, path) {
-            return Err(AppError::usage(e));
+            return Err(refuse_delivery(
+                Destination::File { path: path.clone() },
+                e,
+                states,
+            ));
         }
     }
     let dir_dest = args.destinations.iter().find_map(|d| match d {
@@ -283,6 +308,26 @@ fn deliver_inner(
         }
     }
     Ok(())
+}
+
+/// A refused delivery attempt, recorded and classified. `deliver_inner`
+/// runs only after the generation succeeded, so a late refusal is a
+/// delivery failure (exit 5), never a usage error — the result is already
+/// recoverable in history, and the refused destination is recorded there
+/// as failed so the attempt shows.
+fn refuse_delivery(
+    destination: Destination,
+    message: impl Into<String>,
+    states: &mut Vec<DeliveryState>,
+) -> AppError {
+    let message = message.into();
+    states.push(DeliveryState {
+        destination,
+        status: DeliveryStatus::Failed {
+            error: message.clone(),
+        },
+    });
+    AppError::delivery(message)
 }
 
 /// One artifact to the clipboard. Returns the copied char count for text

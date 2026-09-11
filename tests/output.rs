@@ -438,7 +438,8 @@ fn json_conflicts_with_explicit_stdout() {
 
 #[test]
 fn several_artifacts_cannot_share_bare_stdout() {
-    // produce two kinds and pipe stdout: the late check catches it.
+    // produce two kinds and pipe stdout: the late check catches it — as a
+    // delivery failure (exit 5), since the generation already ran.
     let body = serde_json::json!({"status":"completed","output":[
         {"type":"message","content":[{"type":"output_text","text":"text part"}]},
         {"type":"image_generation_call","result":encode_png()}
@@ -465,11 +466,89 @@ fn several_artifacts_cannot_share_bare_stdout() {
         &[("AIDO_CONFIG", cfg.to_str().unwrap())],
         cfg.clone(),
     );
-    assert_eq!(out.code(), 2, "stderr: {}", out.stderr());
+    assert_eq!(out.code(), 5, "stderr: {}", out.stderr());
     assert!(out
         .stderr()
         .contains("several artifacts cannot share bare stdout"));
     assert!(out.stdout().is_empty());
+}
+
+#[test]
+fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
+    // The service returns two images but only `-o one.png` was given: the
+    // generation succeeded, so the refusal is a delivery failure (exit 5),
+    // the run's history records the failed file attempt, and
+    // `aido last --out-dir` recovers both artifacts without the model.
+    let png = solid_png(2, 2);
+    let encoded = encode_png();
+    let body = serde_json::json!({"data":[{"b64_json":encoded},{"b64_json":encoded}]}).to_string();
+    let server = Server::json(&body);
+    let history = temp_dir("delivery-history");
+    let file = temp_dir("delivery-target").join("one.png");
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(5);
+    let err = out.stderr();
+    assert!(err.contains("2 artifacts cannot go to one file"), "{err}");
+    assert!(
+        !file.exists(),
+        "the refused target must not have been written"
+    );
+
+    // The run's manifest shows a complete generation and the failed file
+    // delivery, next to the kept artifacts.
+    let mut entries: Vec<_> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one run dir, got {entries:?}");
+    let run_dir = entries.pop().unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "complete");
+    assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 2);
+    let deliveries = manifest["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1, "deliveries: {deliveries:?}");
+    assert_eq!(deliveries[0]["destination"]["type"], "file");
+    assert!(deliveries[0]["status"]["failed"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("one file"));
+
+    // Recovery: redeliver the recorded run into a fresh directory.
+    let recovered = temp_dir("delivery-recovered");
+    let out = run(
+        &["last", "--out-dir", recovered.to_str().unwrap()],
+        b"",
+        &[
+            ("AIDO_CONFIG", empty_config().to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read(recovered.join("image-1.png")).unwrap(), png);
+    assert_eq!(std::fs::read(recovered.join("image-2.png")).unwrap(), png);
 }
 
 pub fn encode_png() -> String {
