@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// The three content kinds aido understands on either side of a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Text,

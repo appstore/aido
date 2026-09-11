@@ -7,7 +7,7 @@ use crate::cli::Cli;
 use crate::domain::MediaKind;
 use crate::tasks::{Operation, Task};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Where a merged parameter came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,7 +236,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     } else {
         cli.produce.clone()
     };
-    produce.dedup();
+    produce = dedup_preserving_order(produce);
     if produce.is_empty() {
         bail!("the requested output types are empty after applying the profile");
     }
@@ -308,6 +308,54 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     })
 }
 
+/// Order-preserving dedup: keep the first occurrence of each kind. The
+/// produce order drives artifact ordering, so this must not sort, and
+/// `Vec::dedup` would only collapse *adjacent* repeats — `image,text,image`
+/// must resolve to two entries, not three.
+fn dedup_preserving_order(produce: Vec<MediaKind>) -> Vec<MediaKind> {
+    let mut seen = HashSet::new();
+    produce
+        .into_iter()
+        .filter(|kind| seen.insert(*kind))
+        .collect()
+}
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dedup_keeps_first_occurrence_order() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Image, MediaKind::Text, MediaKind::Image]),
+            vec![MediaKind::Image, MediaKind::Text]
+        );
+    }
+    #[test]
+    fn dedup_collapses_adjacent_and_non_adjacent_repeats_alike() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Text, MediaKind::Text]),
+            vec![MediaKind::Text]
+        );
+        assert_eq!(
+            dedup_preserving_order(vec![
+                MediaKind::Audio,
+                MediaKind::Text,
+                MediaKind::Audio,
+                MediaKind::Text
+            ]),
+            vec![MediaKind::Audio, MediaKind::Text]
+        );
+    }
+    #[test]
+    fn dedup_keeps_distinct_kinds_and_the_empty_list() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Text, MediaKind::Image, MediaKind::Audio]),
+            vec![MediaKind::Text, MediaKind::Image, MediaKind::Audio]
+        );
+        assert!(dedup_preserving_order(Vec::new()).is_empty());
+    }
 }

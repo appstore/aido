@@ -649,3 +649,78 @@ fn edge_tts_refuses_a_task_fixed_instruction_and_names_the_source() {
         out.stderr()
     );
 }
+
+/// A generate profile routed to the responses adapter, whose outputs cover
+/// both text and image, so `--produce image,text,image` passes capability
+/// checks (base_url is never dialed: both tests below stop at plan time).
+fn responses_profile_config() -> std::path::PathBuf {
+    settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"\n\
+         [providers.srv.routes]\ngenerate = \"openai-responses\"",
+    )
+}
+
+#[test]
+fn produce_repeats_dedup_to_first_occurrence_order() {
+    // `image,text,image` used to survive `Vec::dedup` (it only collapses
+    // *adjacent* repeats), so the resolved produce list kept three entries
+    // and downstream checks double-counted the image kind. Each kind must
+    // appear once, in first-occurrence order — that order drives artifact
+    // ordering, so no sorting.
+    let cfg = responses_profile_config();
+    let out = run(
+        &[
+            "ask",
+            "--profile",
+            "test",
+            "--text",
+            "hi",
+            "-p",
+            "hi",
+            "--produce",
+            "image,text,image",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("produce:     image,text"), "{stdout}");
+    assert!(!stdout.contains("image,text,image"), "{stdout}");
+}
+
+#[test]
+fn repeated_produce_kinds_no_longer_make_format_ambiguous() {
+    // With the duplicate entry still present, `--format` saw two image
+    // kinds in `image,text,image` and refused the run as ambiguous. After
+    // the dedup only one image kind remains, so the ambiguity gate passes;
+    // what is left is the ordinary multi-kind --format mismatch, naming
+    // the deduped, order-preserved produce list.
+    let cfg = responses_profile_config();
+    let out = run(
+        &[
+            "ask",
+            "--profile",
+            "test",
+            "--text",
+            "hi",
+            "-p",
+            "hi",
+            "--produce",
+            "image,text,image",
+            "--format",
+            "png",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(!err.contains("ambiguous"), "{err}");
+    assert!(
+        err.contains("does not match the produced type(s) [image,text]"),
+        "{err}"
+    );
+}

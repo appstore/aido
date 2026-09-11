@@ -217,7 +217,7 @@
     - **备选**：改 normalize，把已被顶层吃掉的重复旗标从 rest 剥离/正确映射到子命令。但 clap 的解析顺序决定了顶层优先，改动面更大。
   - 测试：`aido history show 1 --copy` 行为不变；grep 确认 `Show` 无不可达字段。
 
-- [ ] **F16 · 中 · `src/config/resolve.rs:239` · `produce.dedup()` 只去掉相邻重复**
+- [x] **F16 · 中 · `src/config/resolve.rs:239` · `produce.dedup()` 只去掉相邻重复**
   - 问题：`Vec::dedup` 的语义是「移除连续重复项」。`--produce image,text,image` 原样保留三项，随后 `validate_outputs` 数出 2 个媒体类型，错误地报「`--format` 在产出多种媒体类型时有歧义」；`expected_counts` 也会重复计算。
   - 方案（※补全）：保序去重——遍历时用 `HashSet<MediaKind>` 记录已见，跳过重复项。**不要** sort+dedup，因为 produce 顺序有意义（决定产物顺序），排序会改变行为。
   - 测试：`--produce image,text,image` 不再报 format 歧义、计数正确、产物顺序为 image→text。
