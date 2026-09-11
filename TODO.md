@@ -305,7 +305,7 @@
   - 方案：`src/runner.rs:342` 的错误文案从 `reply.status` 取值：`Incomplete { reason }` → 用 reason；`Failed`/`Cancelled` → 变体名；「truncated」只留给真正 length 截断映射出的那类状态。`close_group!` 里「no usable text」的文案不动。
   - 测试：`tests/per_part.rs` 的 `a_truncated_part_fails_alone_and_the_rest_deliver` 改断言具体 reason；加一个 `Failed` 状态的用例断言不出现 "truncated"。
 
-- [ ] **F28 · 中 · `src/plan.rs:153` · dry-run 会展示一个真实执行会被拒绝的交付计划**
+- [x] **F28 · 中 · `src/plan.rs:153` · dry-run 会展示一个真实执行会被拒绝的交付计划**
   - 问题：batch 的三条交付目标规则（`-o` 拒绝、缺 `--out-dir` 拒绝、stdout/clipboard 拒绝）全部包在 `if batch && !cli.dry_run` 里。于是：
 
     ```console

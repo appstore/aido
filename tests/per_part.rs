@@ -311,8 +311,11 @@ fn no_split_still_batches_one_request_per_file() {
 }
 
 #[test]
-fn dry_run_shows_the_batch_plan_without_requesting() {
-    let (a, b) = two_images("perpart-dry");
+fn a_dry_run_batch_without_out_dir_is_refused_like_the_real_run() {
+    // The delivery-target rules are pure prechecks, so --dry-run does not
+    // exempt a batch from them: no plan is shown for a run that would be
+    // rejected anyway.
+    let (a, b) = two_images("perpart-dry-nodir");
     let cfg = batch_cfg("http://127.0.0.1:1");
     let out = run_ocr(
         &cfg,
@@ -325,11 +328,43 @@ fn dry_run_shows_the_batch_plan_without_requesting() {
             b.to_str().unwrap(),
         ],
     );
+    out.assert_code(2);
+    assert!(out.stderr().contains("--out-dir"), "{}", out.stderr());
+    assert!(!out.stdout().contains("per-part batch"), "{}", out.stdout());
+}
+
+#[test]
+fn dry_run_shows_the_batch_plan_without_requesting() {
+    // The dead base_url is the point: a valid batch dry-runs to a printed
+    // plan and exit 0, so no request can have gone anywhere.
+    let (a, b) = two_images("perpart-dry");
+    let out_dir = temp_dir("perpart-dry-out");
+    let cfg = batch_cfg("http://127.0.0.1:1");
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--dry-run",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
     out.assert_code(0);
     let stdout = out.stdout();
     assert!(stdout.contains("per-part batch"), "{stdout}");
     assert!(stdout.contains("a.png"), "{stdout}");
     assert!(stdout.contains("b.png"), "{stdout}");
+    // The plan's destinations name the collection directory.
+    assert!(
+        stdout.contains(&format!("directory {}", out_dir.display())),
+        "{stdout}"
+    );
+    // And nothing was delivered: the directory stays empty.
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
 }
 
 #[test]

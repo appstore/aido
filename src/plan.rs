@@ -150,8 +150,10 @@ pub fn build(
     part_ids.sort_unstable();
     part_ids.dedup();
     let batch = part_ids.len() > 1;
-    // Delivery-target rules don't bind a --dry-run: it only shows the plan.
-    if batch && !cli.dry_run {
+    // Delivery-target rules bind a --dry-run too: they are pure prechecks
+    // with no side effects, and a plan the real run would reject must not
+    // be shown as if it were deliverable.
+    if batch {
         if cli.output.is_some() {
             return Err(AppError::usage(
                 "a single -o FILE cannot take one artifact per input part; use --out-dir",
@@ -172,7 +174,6 @@ pub fn build(
     // --- destinations -------------------------------------------------------
     let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
     if batch
-        && !cli.dry_run
         && (destinations.contains(&Destination::Stdout) && !cli.json
             || destinations.contains(&Destination::Clipboard))
     {
