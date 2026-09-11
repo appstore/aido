@@ -401,6 +401,37 @@ fn zero_config_tts_defaults_to_keyless_edge_tts() {
 }
 
 #[test]
+fn config_init_keeps_tts_keyless() {
+    // The sample's [providers.openai] shadows the built-in provider, so it
+    // must carry the same speech route: following README step 1 (`aido
+    // config init`) should not turn a keyless `aido tts` into a missing
+    // AIDO_API_KEY error.
+    let dir = temp_dir("config-init-tts");
+    let cfg_path = dir.join("config.toml");
+    let out = run(
+        &["config", "init"],
+        b"",
+        &[("AIDO_CONFIG", cfg_path.to_str().unwrap())],
+    );
+    out.assert_code(0);
+
+    let out = run_with(
+        &["tts", "--text", "你好，世界", "--dry-run"],
+        b"",
+        &[],
+        &cfg_path,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("(route: edge-tts)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("credentials: none required"),
+        "stdout: {stdout}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn config_check_requires_base_url_when_an_operation_escapes_the_edge_route() {
     // The speech route points at edge-tts (which owns its endpoint), but
     // the profile also allows an unrouted operation whose conventional

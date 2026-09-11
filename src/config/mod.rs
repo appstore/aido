@@ -274,6 +274,12 @@ default_profile = "default"
 base_url = "https://api.openai.com/v1"
 api_key_env = "AIDO_API_KEY"
 
+# Speech routes to the keyless Edge Read Aloud protocol (Microsoft's
+# unofficial endpoint; the text is sent there, no API key). Delete the
+# speech line to use OpenAI's speech API, which needs the key above.
+[providers.openai.routes]
+speech = "edge-tts"
+
 [profiles.default]
 provider = "openai"
 model = "YOUR_MODEL"

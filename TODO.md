@@ -98,7 +98,7 @@
     - `ocr.rs:113` 的 `slice_if_tall` 相应改成先 `image_dimensions(原始 bytes)` 判断尺寸和是否需要切分，确定要切了才调 `image_as_png`。这同时修掉了现在非 PNG 图片被解码两次的浪费，也让那句「读 IHDR 不用完整解码」的注释重新成立。
   - 测试：构造一个声明 20000×20000 的小 JPEG，断言退出 2 且内存不爆（测试里用 `--dry-run` 即可触发切分规划）。
 
-- [ ] **F05 · 高 · `src/config/mod.rs:160 vs :273` · 跑一次 `aido config init`，零配置 TTS 就坏了**
+- [x] **F05 · 高 · `src/config/mod.rs:160 vs :273` · 跑一次 `aido config init`，零配置 TTS 就坏了**
   - 问题：`default_config()`（无配置文件时使用）给 openai provider 挂了 `routes = { speech = "edge-tts" }`，所以 `aido tts` 不需要任何 API key。但 `config init` 写出的 `SAMPLE_CONFIG` 里没有这段 routes。于是用户按 README 的「第一步：`aido config init`」操作完，`aido tts` 就从「开箱即用」变成「报错：缺少 `AIDO_API_KEY`」。测试 `tests/config.rs:387` 恰好只覆盖了「完全没有配置文件」这一种情况，所以 CI 看不到。
   - 方案：在 `SAMPLE_CONFIG` 的 `[providers.openai]` 下补上与 `default_config()` 一致的路由，并解释为什么：
 
