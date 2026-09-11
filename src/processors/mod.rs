@@ -118,7 +118,7 @@ pub(crate) fn carry_guard(untouched: &[InputPart], quiet: bool) -> bool {
 
 /// Total text characters across parts — the measure the carry budget is
 /// stated in (media parts carry no text and add nothing).
-fn text_chars(parts: &[InputPart]) -> usize {
+pub(crate) fn text_chars(parts: &[InputPart]) -> usize {
     parts
         .iter()
         .map(|p| p.text().unwrap_or_default().chars().count())

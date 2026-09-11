@@ -282,6 +282,107 @@ fn shared_text_rides_with_every_part() {
 }
 
 #[test]
+fn shared_text_past_the_carry_budget_warns_once_per_plan() {
+    // The carry budget is half the 4000-char chunk target, so 2001 shared
+    // chars repeat in every part's request past it: the plan notes the
+    // cost once — sharing continues, nothing is dropped.
+    let (a, b) = two_images("perpart-warnbig");
+    let out_dir = temp_dir("perpart-warnbig-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let big = "词".repeat(2001);
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--text",
+            big.as_str(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert_eq!(
+        err.matches("rides with every part's request").count(),
+        1,
+        "{err}"
+    );
+    // And the batch still ran whole with the shared text in every request.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for raw in &requests {
+        assert!(
+            String::from_utf8_lossy(raw).contains("词词"),
+            "shared text rides with every part's request"
+        );
+    }
+}
+
+#[test]
+fn a_small_shared_text_and_quiet_keep_the_budget_note_silent() {
+    let (a, b) = two_images("perpart-warnsmall");
+    let out_dir = temp_dir("perpart-warnsmall-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--text",
+            "focus on headers",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(
+        !err.contains("rides with every part's request"),
+        "small shared text earns no note: {err}"
+    );
+
+    // The same oversized batch under --quiet suppresses the note too.
+    let (a, b) = two_images("perpart-warnquiet");
+    let out_dir = temp_dir("perpart-warnquiet-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let big = "词".repeat(2001);
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--quiet",
+            "--text",
+            big.as_str(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(
+        !err.contains("rides with every part's request"),
+        "--quiet suppresses the note: {err}"
+    );
+}
+
+#[test]
 fn no_split_still_batches_one_request_per_file() {
     let (a, b) = two_images("perpart-nosplit");
     let out_dir = temp_dir("perpart-nosplit-out");

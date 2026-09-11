@@ -13,13 +13,17 @@
 //! glossary must not become a request of its own. Fewer than two file
 //! parts is not a batch, and the strategy plans exactly as before.
 //!
+//! Sharing never drops material, so a shared text past the carry budget
+//! ([`MAX_CARRY_CHARS`]) only earns one stderr note per plan: every
+//! part's request still carries it, and the note warns about the cost.
+//!
 //! Input-extension contract (#35): when glob / directory / URL inputs
 //! land, they count as batch units through the same rule — material that
 //! carries a file name. A URL that downloads to a temp file or a
 //! dedicated `InputSource::Url` variant only needs a sensible name; no
 //! change here.
 
-use super::{dispatch, RequestStep};
+use super::{dispatch, text_chars, RequestStep, MAX_CARRY_CHARS};
 use crate::domain::{InputPart, InputSource};
 use crate::tasks::ProcessorKind;
 use anyhow::Result;
@@ -46,6 +50,7 @@ pub fn plan_steps(
         .cloned()
         .collect();
     let stems = unique_stems(&units);
+    warn_shared_budget(&shared, quiet);
 
     let mut steps = Vec::new();
     for (part, stem) in units.iter().zip(&stems) {
@@ -68,6 +73,21 @@ pub fn plan_steps(
         }
     }
     Ok(steps)
+}
+
+/// Unlike the chunk strategies' carry guard, shared material is never
+/// dropped: a glossary must not become a request of its own, so every
+/// part's request keeps carrying it. Past the carry budget
+/// ([`MAX_CARRY_CHARS`]) that repetition may crowd the model's context
+/// window, which is worth one note per plan (`quiet` suppresses it).
+fn warn_shared_budget(shared: &[InputPart], quiet: bool) {
+    let chars = text_chars(shared);
+    if chars > MAX_CARRY_CHARS && !quiet {
+        eprintln!(
+            "note: shared context material ({chars} chars) rides with every \
+             part's request and may exceed the model's context window"
+        );
+    }
 }
 
 /// Output stems (`a.png` → `a`), unique across the batch in input order:
