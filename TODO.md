@@ -140,7 +140,7 @@
     > 更好的做法（推荐）：在写任何文件之前先做一次预检：扫描目标目录，若 manifest 或任一目标文件名已存在且未给 `--overwrite`，立刻失败，一个字节都不写。现在的逐个写入会在中途失败时留下半个目录。
   - 测试：`tests/output.rs` 增加「对同一 out-dir 连跑两次、第二次不带 `--overwrite` → 退出 5、旧 manifest 内容不变」。
 
-- [ ] **F08 · 中 · `src/plan.rs:752` · `--dry-run` 会把 `base_url` 里的密码原样打出来**
+- [x] **F08 · 中 · `src/plan.rs:752` · `--dry-run` 会把 `base_url` 里的密码原样打出来**
   - 问题：`redact_url()` 只把 query 参数的值换成 `…`，不碰 URL 的 userinfo 段。配置里写 `base_url = "https://user:s3cret@gw.internal/v1"`（内网网关的常见写法），`--dry-run` 就会原样打印整串。PR 描述里说 dry-run「不展示密钥」，这条路径是个例外。
   - 方案：
 

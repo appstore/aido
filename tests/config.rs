@@ -337,6 +337,34 @@ fn dry_run_explains_the_plan_without_any_request() {
 }
 
 #[test]
+fn dry_run_hides_credentials_embedded_in_the_base_url() {
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"https://user:sup3rsecret@gw.internal/v1\"\napi_key_env = \"MY_KEY\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "-",
+            "--dry-run",
+        ],
+        b"piped notes\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("https://***:***@gw.internal/v1"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sup3rsecret"), "{stdout}");
+}
+
+#[test]
 fn config_check_flags_route_keys_that_are_not_operations() {
     // A typo'd route key (`speach`) would silently fall back to the
     // conventional adapter; `config check` must name it.

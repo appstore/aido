@@ -848,10 +848,17 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Strip potentially sensitive query values from URLs shown in reports.
+/// Strip credentials and potentially sensitive query values from URLs
+/// shown in reports.
 fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut u) => {
+            if !u.username().is_empty() {
+                let _ = u.set_username("***");
+            }
+            if u.password().is_some() {
+                let _ = u.set_password(Some("***"));
+            }
             let redacted: Vec<(String, String)> = u
                 .query_pairs()
                 .map(|(k, _)| (k.to_string(), "…".to_string()))
@@ -867,7 +874,7 @@ fn redact_url(url: &str) -> String {
             }
             u.into()
         }
-        Err(_) => url.to_string(),
+        Err(_) => "(unparseable base_url, hidden)".to_string(),
     }
 }
 
@@ -901,5 +908,47 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
             }
             .to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn redact_url_hides_userinfo_credentials() {
+        assert_eq!(
+            redact_url("https://user:s3cret@gw.internal/v1"),
+            "https://***:***@gw.internal/v1"
+        );
+        assert_eq!(
+            redact_url("https://user@gw.internal/v1"),
+            "https://***@gw.internal/v1"
+        );
+    }
+    #[test]
+    fn redact_url_still_masks_query_values() {
+        // the `…` marker is percent-encoded when the URL is serialized
+        assert_eq!(
+            redact_url("https://user:pw@gw.internal/v1?key=topsecret&x=1"),
+            "https://***:***@gw.internal/v1?key=%E2%80%A6&x=%E2%80%A6"
+        );
+    }
+    #[test]
+    fn redact_url_leaves_plain_urls_alone_apart_from_query() {
+        assert_eq!(
+            redact_url("https://gw.internal/v1"),
+            "https://gw.internal/v1"
+        );
+        assert_eq!(
+            redact_url("https://gw.internal/v1?key=secret"),
+            "https://gw.internal/v1?key=%E2%80%A6"
+        );
+    }
+    #[test]
+    fn redact_url_hides_unparseable_input() {
+        assert_eq!(
+            redact_url("not a url at all"),
+            "(unparseable base_url, hidden)"
+        );
     }
 }
