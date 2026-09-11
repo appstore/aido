@@ -8,7 +8,7 @@
 //! lines the overlap bands genuinely duplicated.
 
 use super::{carry_guard, step_material, synthetic_text, RequestStep, StepRole};
-use crate::api::image_as_png;
+use crate::api::{ensure_decode_size, image_as_png, image_dimensions};
 use crate::domain::{InputPart, MediaKind};
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -24,9 +24,6 @@ const MIN_TAIL: u32 = 128;
 /// A seam with no quiet row nearby cuts through content; re-showing a thin
 /// band lets the split line survive whole in at least one slice.
 const HARD_CUT_OVERLAP: u32 = 32;
-/// Refuse to decode absurdly large images even when the byte size is small
-/// (decompression-bomb guard).
-const MAX_DECODE_PIXELS: u64 = 200_000_000;
 
 /// Lines the merge gate holds back at a slice boundary while deciding
 /// whether the next slice repeats them.
@@ -114,22 +111,22 @@ fn slice_height_for(w: u32) -> u32 {
 }
 
 fn slice_if_tall(part: &InputPart, quiet: bool) -> Result<Option<(Vec<InputPart>, Vec<bool>)>> {
-    let png = image_as_png(part)?;
-    // Every image here is PNG, so the IHDR — always the first chunk —
-    // carries the dimensions without paying for a full decode first.
-    let Some((w, h)) = png_dimensions(&png) else {
-        return Ok(None);
+    let bytes = match &part.content {
+        crate::domain::InputContent::Media(b) => b,
+        _ => anyhow::bail!("'{}' is not an image", part.name),
     };
+    // Dimensions come from the container header alone (PNG IHDR, JPEG SOF,
+    // WebP VP8X), so the decompression-bomb guard runs before any pixel is
+    // decoded — and an image that needs no slicing is not decoded here at
+    // all; its full decode, if any, happens once at the adapter boundary.
+    let (w, h) = image_dimensions(bytes)
+        .with_context(|| format!("cannot read the dimensions of image '{}'", part.name))?;
+    ensure_decode_size(&part.name, w, h)?;
     if !needs_splitting(w, h) {
         return Ok(None);
     }
-    if w as u64 * h as u64 > MAX_DECODE_PIXELS {
-        anyhow::bail!(
-            "image '{}' is {w}\u{d7}{h}; refusing to decode images over 200 MP",
-            part.name
-        );
-    }
 
+    let png = image_as_png(part)?;
     let img =
         image::load_from_memory(&png).with_context(|| "failed to decode tall image for slicing")?;
     let rgba = img.to_rgba8();
@@ -201,17 +198,6 @@ fn encode_slice(
         mime: "image/png".into(),
         content: crate::domain::InputContent::Media(png),
     })
-}
-
-/// Read the size out of the PNG IHDR (the mandatory first chunk) without
-/// decoding the stream.
-fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
-    if png.len() < 24 || &png[12..16] != b"IHDR" {
-        return None;
-    }
-    let w = u32::from_be_bytes(png[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(png[20..24].try_into().ok()?);
-    Some((w, h))
 }
 
 /// Horizontal contrast per row: text lights a row up, blank and smoothly
@@ -474,6 +460,69 @@ mod tests {
         img.dimensions()
     }
 
+    /// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`:
+    /// the decompression-bomb shape — a few hundred bytes claiming a huge
+    /// canvas. The header read sees the patched size; a full decode would
+    /// have to honor it.
+    fn jpeg_declaring(w: u32, h: u32) -> Vec<u8> {
+        let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        // Baseline JPEGs carry one SOF0 (FF C0); byte stuffing means FF in
+        // entropy data is never followed by C0, so the first hit is it.
+        // Layout after the marker: length(2), precision(1), height(2 BE),
+        // width(2 BE).
+        let sof = jpg
+            .windows(2)
+            .position(|p| p == [0xFF, 0xC0])
+            .expect("encoder wrote a SOF0 marker");
+        jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+        jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+        jpg
+    }
+
+    fn jpeg_part(jpg: Vec<u8>) -> InputPart {
+        InputPart {
+            id: 0,
+            source: InputSource::File("long.jpg".into()),
+            name: "long.jpg".into(),
+            kind: MediaKind::Image,
+            unknown_kind: false,
+            mime: "image/jpeg".into(),
+            content: InputContent::Media(jpg),
+        }
+    }
+
+    #[test]
+    fn decompression_bomb_jpegs_are_refused_before_any_decode() {
+        // Square (would not even be split) and tall (would be sliced):
+        // both declare over 200 MP, and the header-only guard must refuse
+        // them before a multi-gigabyte decode — tall or not.
+        for (w, h) in [(20_000, 20_000), (4_000, 60_000)] {
+            let err = plan_steps(&[jpeg_part(jpeg_declaring(w, h))], true).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("refusing to decode"), "{msg}");
+            assert!(msg.contains(&format!("{w}\u{d7}{h}")), "{msg}");
+        }
+    }
+
+    #[test]
+    fn small_jpeg_needing_no_split_is_untouched_at_plan_time() {
+        // Below the split threshold the JPEG must not be decoded (and
+        // re-encoded) here at all — the step carries the original bytes,
+        // and only the adapter boundary decodes them.
+        let jpg = jpeg_declaring(2, 2);
+        let steps = plan_steps(&[jpeg_part(jpg.clone())], true).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "all material");
+        assert_eq!(steps[0].inputs[0].content, InputContent::Media(jpg));
+    }
+
     #[test]
     fn split_gates() {
         assert!(needs_splitting(100, 3200)); // tall strip
@@ -552,12 +601,6 @@ mod tests {
         let steps = plan_steps(&over, true).unwrap();
         assert!(steps[0].inputs.iter().any(|p| p.name == "notes"));
         assert!(!steps[1].inputs.iter().any(|p| p.name == "notes"));
-    }
-
-    #[test]
-    fn ihdr_dimensions() {
-        assert_eq!(png_dimensions(&solid_png(64, 33)), Some((64, 33)));
-        assert_eq!(png_dimensions(b"not a png"), None);
     }
 
     #[test]

@@ -308,6 +308,13 @@ mod tests {
     }
 
     fn png_part(id: usize) -> InputPart {
+        // Real (tiny) PNG bytes: the adapter boundary reads the header of
+        // every image now, so placeholder bytes would be rejected.
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
         InputPart {
             id,
             source: InputSource::File("a.png".into()),
@@ -315,7 +322,7 @@ mod tests {
             kind: MediaKind::Image,
             unknown_kind: false,
             mime: "image/png".into(),
-            content: InputContent::Media(vec![1, 2, 3]),
+            content: InputContent::Media(png),
         }
     }
 

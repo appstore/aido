@@ -90,7 +90,7 @@
 
   - 测试：`tests/output.rs` 增加 `image --text ... --copy` 在伪 tty 下 `--dry-run` 退出 0、且计划里列出 clipboard。
 
-- [ ] **F04 · 高 · `src/api/mod.rs:281` · `src/processors/ocr.rs:113` · 解压炸弹护栏对 JPEG / WebP 完全失效**
+- [x] **F04 · 高 · `src/api/mod.rs:281` · `src/processors/ocr.rs:113` · 解压炸弹护栏对 JPEG / WebP 完全失效**
   - 问题：`slice_if_tall()` 的第一行就是 `image_as_png(part)`，而它对非 PNG 输入会执行一次无像素上限的完整解码。`MAX_DECODE_PIXELS`（200 MP）的检查在这之后才跑——护栏永远来不及生效。输入侧只限制字节数（32 MB），而 JPEG 的压缩比足以让一个 40 KB 的文件声明 30000×30000。解到 RGBA 就是约 3.6 GB，进程直接 OOM。代码里那句「Every image here is PNG，所以读 IHDR 就能拿到尺寸、不用付完整解码的代价」的注释，对非 PNG 路径是不成立的。
   - 方案：让像素上限对所有格式生效，且在完整解码之前。改 `api/mod.rs`：
     - 新增 `pub(crate) fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)>`，用 `image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?.into_dimensions()?`——它只读头部，不解码像素。

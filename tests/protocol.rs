@@ -629,6 +629,27 @@ fn no_split_sends_the_whole_image() {
     assert_eq!(content.as_array().unwrap().len(), 2);
 }
 
+#[test]
+fn decompression_bomb_jpeg_is_refused_as_a_usage_error() {
+    // A real 2×2 JPEG whose SOF0 header declares 20 000×20 000 (400 MP):
+    // the whole file is a few hundred bytes, but the old path fully
+    // decoded it — the RGBA bitmap alone would need ~1.6 GB. The
+    // header-only guard must refuse it at plan time, before any pixel
+    // work, as a usage error.
+    let jpg = huge_jpeg(20_000, 20_000);
+    assert!(
+        jpg.len() < 4096,
+        "the bomb must stay tiny: {} bytes",
+        jpg.len()
+    );
+    let file = temp_file("huge.jpg", &jpg);
+    let out = run(&["ocr", "--dry-run", file.to_str().unwrap()], b"", &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("refusing to decode"), "{err}");
+    assert!(err.contains("20000"), "{err}");
+}
+
 // --- flag semantics -------------------------------------------------------
 
 #[test]

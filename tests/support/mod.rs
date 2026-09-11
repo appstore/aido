@@ -419,6 +419,28 @@ pub fn image_png(w: u32, h: u32) -> image::RgbaImage {
     image::RgbaImage::from_pixel(w, h, image::Rgba([255u8, 255, 255, 255]))
 }
 
+/// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`: the
+/// decompression-bomb shape — a few hundred bytes claiming a huge canvas.
+/// A header-only dimension read sees the patched size; honoring it with a
+/// full decode would allocate gigabytes.
+pub fn huge_jpeg(w: u32, h: u32) -> Vec<u8> {
+    let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+    let mut jpg = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    // Baseline JPEGs carry one SOF0 (FF C0); byte stuffing means FF in
+    // entropy data is never followed by C0, so the first hit is it. Layout
+    // after the marker: length(2), precision(1), height(2 BE), width(2 BE).
+    let sof = find_sub(&jpg, &[0xFF, 0xC0]).expect("encoder wrote a SOF0 marker");
+    jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+    jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+    jpg
+}
+
 /// Run aido with a pseudo-terminal as stdin, for tests of "terminal
 /// stdin" rows of the decision table (file material without `-`).
 /// Unix-only: CI runs the suite on Linux and macOS.
