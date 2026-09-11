@@ -370,12 +370,18 @@ impl AppError {
         Self::new(ErrorKind::Partial, message)
     }
 
-    /// The full message plus every underlying cause, one per line.
+    /// The message plus every underlying cause, one per line, following
+    /// `source()` to the end of the chain.
     pub fn chain(&self) -> String {
         let mut out = self.message.clone();
-        if let Some(err) = self.source.as_deref() {
-            out.push_str(": ");
+        let mut cause: Option<&dyn std::error::Error> = match &self.source {
+            Some(err) => Some(err.as_ref()),
+            None => None,
+        };
+        while let Some(err) = cause {
+            out.push('\n');
             out.push_str(&err.to_string());
+            cause = err.source();
         }
         out
     }
@@ -498,6 +504,43 @@ mod tests {
         let err = AppError::from(io_err);
         assert!(err.chain().contains("gone"));
         assert_eq!(err.kind.exit_code(), 3);
+    }
+
+    #[test]
+    fn app_error_chain_walks_every_cause_layer_one_per_line() {
+        // `From<io::Error>` only ever attaches one layer, so build a source
+        // chain two layers deep by hand: the walk must not stop after the
+        // first cause.
+        #[derive(Debug)]
+        struct Leaf;
+        impl std::fmt::Display for Leaf {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("leaf cause")
+            }
+        }
+        impl std::error::Error for Leaf {}
+
+        #[derive(Debug)]
+        struct Mid;
+        impl std::fmt::Display for Mid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("mid cause")
+            }
+        }
+        impl std::error::Error for Mid {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Leaf)
+            }
+        }
+
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "top message".into(),
+            source: Some(Box::new(Mid)),
+        };
+        let chain = err.chain();
+        let lines: Vec<&str> = chain.lines().collect();
+        assert_eq!(lines, ["top message", "mid cause", "leaf cause"]);
     }
 
     #[test]
