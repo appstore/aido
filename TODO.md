@@ -251,7 +251,7 @@
   - 方案（※补全）：保留并传递 `resolve.rs:255` 算出的 `ParamSource`，`describe_param_sources` 覆盖全部参数（model、max_tokens、temperature、to、voice、speed、count、size）。
   - 测试（※补全）：profile 设 max_tokens/temperature → 来源显示 profile。
 
-- [ ] **F21 · 低 · `src/plan.rs:206` · 硬编码的 50 没有引用 `history::DEFAULT_KEEP`**
+- [x] **F21 · 低 · `src/plan.rs:206` · 硬编码的 50 没有引用 `history::DEFAULT_KEEP`**
   - 问题：`record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(50) > 0`。数值目前和 `DEFAULT_KEEP` 一致，改常量时会分叉。
   - 方案（※补全）：替换为 `history::DEFAULT_KEEP`。
   - 验证（※补全）：编译 + 现有测试。

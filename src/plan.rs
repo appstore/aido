@@ -10,6 +10,7 @@ use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
 use crate::domain::{AppError, AppResult, Destination, InputPart, MediaKind, RunSummary};
+use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
 use crate::processors::{self, RequestStep};
 use crate::tasks::{ProcessorKind, Task, TaskParam};
@@ -262,7 +263,7 @@ pub fn build(
         delivery,
         timeout,
         total_timeout,
-        record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(50) > 0,
+        record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(DEFAULT_KEEP) > 0,
         quiet: cli.quiet,
         json: cli.json,
         param_sources,
