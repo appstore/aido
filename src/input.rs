@@ -304,6 +304,7 @@ pub fn gather(
                     source: InputSource::Literal,
                     name: format!("--text #{}", parts.len() + 1),
                     kind: MediaKind::Text,
+                    unknown_kind: false,
                     mime: "text/plain".into(),
                     content: InputContent::Text(value.clone()),
                 };
@@ -357,12 +358,15 @@ fn part_size(part: &InputPart) -> usize {
 /// A stand-in for clipboard material under `--dry-run`: the plan can be
 /// checked without reading (or requiring) desktop clipboard state. The
 /// real run still reads the clipboard and still fails on an empty one.
+/// `unknown_kind` marks the kind above as a placeholder: type validation
+/// cannot judge what has not been read, so the plan stays checkable.
 fn dry_run_clipboard_part(id: usize) -> InputPart {
     InputPart {
         id,
         source: InputSource::Clipboard,
         name: "clipboard (not read under --dry-run)".into(),
         kind: MediaKind::Text,
+        unknown_kind: true,
         mime: "text/plain".into(),
         content: InputContent::Text(String::new()),
     }
@@ -379,6 +383,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 source: InputSource::Clipboard,
                 name: "clipboard".into(),
                 kind: MediaKind::Text,
+                unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(t),
             })
@@ -392,6 +397,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 source: InputSource::Clipboard,
                 name: "clipboard.png".into(),
                 kind: MediaKind::Image,
+                unknown_kind: false,
                 mime: "image/png".into(),
                 content: InputContent::Media(png),
             })
@@ -556,6 +562,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             source,
             name,
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
         });
@@ -566,6 +573,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             source,
             name,
             kind: MediaKind::Audio,
+            unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
         });
@@ -580,6 +588,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
                 source,
                 name,
                 kind: MediaKind::Text,
+                unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(text),
             })

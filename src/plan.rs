@@ -409,6 +409,13 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     for part in inputs {
+        // An unknown-kind part is the --dry-run clipboard placeholder:
+        // its real kind is decided when the clipboard is read, so neither
+        // the allowed input types nor the adapter's accepted types can
+        // judge it yet — the actual run validates the real kind.
+        if part.unknown_kind {
+            continue;
+        }
         if let Some(allowed) = &resolved.allowed_inputs {
             if !allowed.contains(&part.kind) {
                 return Err(AppError::usage(format!(
@@ -431,7 +438,9 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     for required in &task.required_types {
-        if !inputs.iter().any(|p| p.kind == *required) {
+        // The placeholder may well turn out to be the required kind once
+        // the clipboard is read, so it satisfies the requirement here.
+        if !inputs.iter().any(|p| p.unknown_kind || p.kind == *required) {
             return Err(AppError::usage(format!(
                 "task '{}' requires {required} input; none of the material is {required}",
                 task.name
@@ -691,11 +700,18 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         out.push_str("  (none — the instruction alone drives this run)\n");
     }
     for part in &plan.inputs {
+        // The --dry-run clipboard placeholder has no kind yet; say so
+        // instead of printing the stand-in "text".
+        let kind = if part.unknown_kind {
+            "unknown (decided at runtime)"
+        } else {
+            part.kind.as_str()
+        };
         out.push_str(&format!(
             "  {}. {}  {}  {}  [{}]\n",
             part.id + 1,
             part.name,
-            part.kind,
+            kind,
             part.source,
             human_bytes(match &part.content {
                 crate::domain::InputContent::Text(s) => s.len() as u64,

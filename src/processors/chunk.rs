@@ -126,6 +126,7 @@ fn chunk_part(part: &InputPart, i: usize, total: usize, text: &str) -> InputPart
         source: part.source.clone(),
         name: format!("{} [chunk {}/{}]", part.name, i + 1, total),
         kind: MediaKind::Text,
+        unknown_kind: false,
         mime: part.mime.clone(),
         content: InputContent::Text(text.into()),
     }
@@ -401,6 +402,7 @@ mod tests {
             source: InputSource::File(name.into()),
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(text.into()),
         }

@@ -392,9 +392,15 @@ fn dry_run_does_not_touch_the_clipboard() {
     let out = run_tty(&["ocr", "--paste", "--dry-run"], &[]);
     let err = out.stderr();
     assert!(!err.contains("clipboard:"), "{err}");
-    // the placeholder keeps the type checks honest: ocr needs an image
-    assert_eq!(out.code(), 2, "{err}");
-    assert!(err.contains("image"), "{err}");
+    // ocr requires image material, but the unread clipboard's kind is
+    // decided at runtime — the plan must preview, not fail the type check.
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("clipboard (not read under --dry-run)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unknown (decided at runtime)"), "{stdout}");
 }
 
 fn expansion_dir(name: &str) -> std::path::PathBuf {

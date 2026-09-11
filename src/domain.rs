@@ -67,6 +67,11 @@ pub struct InputPart {
     /// clipboard get a synthesized one), used for labels and history.
     pub name: String,
     pub kind: MediaKind,
+    /// Set only by the `--dry-run` clipboard placeholder: `kind` above is
+    /// a stand-in (text), not the real kind, which the actual run learns
+    /// when it reads the clipboard. Validation treats such a part as
+    /// acceptable to any task instead of judging the stand-in kind.
+    pub unknown_kind: bool,
     pub mime: String,
     pub content: InputContent,
 }
@@ -404,6 +409,7 @@ mod tests {
             source: InputSource::Literal,
             name: format!("part-{id}"),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
@@ -415,6 +421,7 @@ mod tests {
             source: InputSource::File("a.png".into()),
             name: "a.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
         }

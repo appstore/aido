@@ -189,6 +189,7 @@ fn encode_slice(
         source: part.source.clone(),
         name: format!("{} [slice {}..{}]", part.name, start, end),
         kind: MediaKind::Image,
+        unknown_kind: false,
         mime: "image/png".into(),
         content: crate::domain::InputContent::Media(png),
     })
@@ -441,6 +442,7 @@ mod tests {
             source: InputSource::File("long.png".into()),
             name: "long.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(png),
         }

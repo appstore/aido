@@ -301,6 +301,7 @@ mod tests {
             source: InputSource::Literal,
             name: format!("t{id}"),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
@@ -312,6 +313,7 @@ mod tests {
             source: InputSource::File("a.png".into()),
             name: "a.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
         }
@@ -388,6 +390,7 @@ mod tests {
             source: crate::domain::InputSource::File("a.mp3".into()),
             name: "a.mp3".into(),
             kind: MediaKind::Audio,
+            unknown_kind: false,
             mime: "audio/mpeg".into(),
             content: crate::domain::InputContent::Media(vec![1, 2, 3]),
         };

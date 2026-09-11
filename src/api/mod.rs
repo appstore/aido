@@ -309,6 +309,7 @@ mod tests {
             source,
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }

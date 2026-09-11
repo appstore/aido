@@ -68,6 +68,7 @@ pub(crate) fn synthetic_text(id: usize, name: &str, text: &str) -> InputPart {
         source: crate::domain::InputSource::Literal,
         name: name.into(),
         kind: MediaKind::Text,
+        unknown_kind: false,
         mime: "text/plain".into(),
         content: InputContent::Text(text.into()),
     }

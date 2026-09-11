@@ -117,6 +117,7 @@ mod tests {
             source: InputSource::File(std::path::PathBuf::from(path)),
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(format!("material of {name}")),
         }
@@ -128,6 +129,7 @@ mod tests {
             source: InputSource::Literal,
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(format!("shared {name}")),
         }

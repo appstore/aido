@@ -183,7 +183,7 @@
   - 方案：把 JSON 报告的生成从 `output.rs` 里抽出来成 `pub fn error_report(kind, message, run_id, task) -> serde_json::Value`，与现有的成功报告共用 `version: 1` 和字段名。`app.rs` 的 `fail()` 需要知道当前是否 `--json`。最简单的接法：`run()` 解析出 cli 后把 `cli.json` 存进一个局部变量，传给 `fail()`；为 true 时把报告打到 stdout、把人类可读的一行仍然打到 stderr。`normalize` 阶段就失败的情况（clap 之前）拿不到 `cli.json`，可以在 `run()` 开头对 argv 做一次朴素扫描：含 `--json` 就置位。
   - 测试：`tests/output.rs` 对退出码 2、3、4 各断言一次 stdout 是合法 JSON 且 `error.kind` 分别为 usage/service/generation。
 
-- [ ] **F12 · 中 · `src/input.rs:178` · OCR 的旗舰工作流没法用 `--dry-run` 检查**
+- [x] **F12 · 中 · `src/input.rs:178` · OCR 的旗舰工作流没法用 `--dry-run` 检查**
   - 问题：`dry_run_clipboard_part()` 造的占位输入固定是 `MediaKind::Text`，而 ocr 声明了 `required_types = ["image"]`。所以：
 
     ```console
