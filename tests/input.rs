@@ -364,3 +364,87 @@ fn dry_run_does_not_touch_the_clipboard() {
     assert_eq!(out.code(), 2, "{err}");
     assert!(err.contains("image"), "{err}");
 }
+
+fn expansion_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("aido-it-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_and_directory_expand_sorted_into_the_plan() {
+    let dir = expansion_dir("glob-plan");
+    std::fs::write(dir.join("b.txt"), b"beta\n").unwrap();
+    std::fs::write(dir.join("a.txt"), b"alpha\n").unwrap();
+    std::fs::write(dir.join(".hidden.txt"), b"no\n").unwrap();
+
+    // run() pipes stdin, so a material spec without `-` would trip the
+    // unconsumed-pipe check: file material tests use a tty stdin.
+    let pattern = format!("{}/*.txt", dir.display());
+    let out = run_tty(&["summarize", "--dry-run", &pattern], &[]);
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("1. a.txt"), "{stdout}");
+    assert!(stdout.contains("2. b.txt"), "{stdout}");
+    assert!(!stdout.contains(".hidden"), "{stdout}");
+
+    // A directory argument: same one-level sorted list.
+    let out = run_tty(&["summarize", "--dry-run", dir.to_str().unwrap()], &[]);
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("a.txt"), "{stdout}");
+    assert!(stdout.contains("b.txt"), "{stdout}");
+    assert!(!stdout.contains(".hidden"), "{stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_without_matches_fails_before_any_request() {
+    let out = run_tty(&["summarize", "--dry-run", "no-such-input-*.png"], &[]);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no files match"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_with_subdirectory_fails_with_a_glob_hint() {
+    let dir = expansion_dir("dirsub");
+    std::fs::create_dir(dir.join("raw")).unwrap();
+    std::fs::write(dir.join("a.txt"), b"a\n").unwrap();
+    let out = run_tty(&["summarize", "--dry-run", dir.to_str().unwrap()], &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("expands one level"), "{err}");
+    assert!(err.contains("glob"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_material_reaches_the_request_in_order() {
+    let server = Server::json(chat_body("ok"));
+    let dir = expansion_dir("globreq");
+    std::fs::write(dir.join("b.txt"), b"beta\n").unwrap();
+    std::fs::write(dir.join("a.txt"), b"alpha\n").unwrap();
+    let pattern = format!("{}/*.txt", dir.display());
+    let cfg = server_config(&server.url(), "");
+    let out = run_tty(
+        &["summarize", &pattern],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let req = request_json(&server.request());
+    let content = req["messages"][1]["content"].as_str().unwrap();
+    let a = content.find("alpha").unwrap();
+    let b = content.find("beta").unwrap();
+    assert!(a < b, "{content}");
+    std::fs::remove_dir_all(&dir).ok();
+}

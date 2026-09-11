@@ -36,6 +36,9 @@ pub const LAST_TASK: &str = "__last";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSpec {
     File(PathBuf),
+    /// A glob pattern that reached aido unexpanded (quoted on Unix, always
+    /// on Windows); expanded into files at gather time, never here.
+    Glob(String),
     Stdin,
     Paste,
     Text(String),
@@ -124,6 +127,9 @@ const REMOVED_FLAGS: &[(&str, &str)] = &[
 #[derive(Debug)]
 enum Slot {
     Free(OsString),
+    /// A free token that followed `--`: a literal path, never a pattern
+    /// to expand (`-` still reads stdin, as at every other position).
+    Literal(OsString),
     Text(String),
     Paste,
 }
@@ -269,10 +275,11 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         // A free token (or anything after `--`).
         if after_separator {
             post_separator.push(token.clone());
+            slots.push(Slot::Literal(token));
         } else {
             free_pre.push(token.clone());
+            slots.push(Slot::Free(token));
         }
-        slots.push(Slot::Free(token));
     }
 
     let first = free_pre.first().and_then(|t| t.to_str());
@@ -383,7 +390,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         let example = slots
             .iter()
             .find_map(|s| match s {
-                Slot::Free(p) => p.to_str().map(|s| s.to_string()),
+                Slot::Free(p) | Slot::Literal(p) => p.to_str().map(|s| s.to_string()),
                 _ => None,
             })
             .unwrap_or_else(|| "input.txt".to_string());
@@ -460,28 +467,47 @@ fn take_value(iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>) -> O
 
 /// Turn slots into specs, skipping the first `skip` free tokens (the task
 /// token and friends) while keeping text/paste slots in place. `skip`
-/// beyond the slot count drops every free token.
+/// beyond the slot count drops every free token. A free token with glob
+/// metacharacters becomes a `Glob` spec for gather-time expansion; tokens
+/// that followed `--` stay literal files.
 fn specs_from(slots: Vec<Slot>, skip: usize) -> Vec<SourceSpec> {
     let mut skipped = 0;
     let mut specs = Vec::new();
     for slot in slots {
-        match slot {
-            Slot::Free(token) => {
-                if skipped < skip {
-                    skipped += 1;
-                    continue;
-                }
-                if token == "-" {
-                    specs.push(SourceSpec::Stdin);
-                } else {
-                    specs.push(SourceSpec::File(PathBuf::from(token)));
-                }
+        let (token, literal) = match slot {
+            Slot::Text(value) => {
+                specs.push(SourceSpec::Text(value));
+                continue;
             }
-            Slot::Text(value) => specs.push(SourceSpec::Text(value)),
-            Slot::Paste => specs.push(SourceSpec::Paste),
+            Slot::Paste => {
+                specs.push(SourceSpec::Paste);
+                continue;
+            }
+            Slot::Free(token) => (token, false),
+            Slot::Literal(token) => (token, true),
+        };
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        if token == "-" {
+            specs.push(SourceSpec::Stdin);
+        } else if !literal && token.to_str().is_some_and(has_glob_metachars) {
+            specs.push(SourceSpec::Glob(token.to_string_lossy().into_owned()));
+        } else {
+            specs.push(SourceSpec::File(PathBuf::from(token)));
         }
     }
     specs
+}
+
+/// True when a token may be an unexpanded pattern: the shell either was
+/// not asked (`*` stayed quoted) or cannot expand at all (Windows). A
+/// literal filename that happens to contain these characters still wins
+/// if it exists — that is checked at gather time, where the filesystem
+/// is available.
+fn has_glob_metachars(token: &str) -> bool {
+    token.contains('*') || token.contains('?') || token.contains('[')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -521,7 +547,7 @@ impl std::fmt::Display for OutputFormat {
     version,
     about = "Send material to an AI task, deliver the result",
     override_usage = "aido <TASK> [INPUT...] [OPTIONS]\n    aido run <TASK> [INPUT...] [OPTIONS]\n    aido ask [INPUT...] -p <INSTRUCTION> [OPTIONS]\n    aido -p <INSTRUCTION> [INPUT...] [OPTIONS]",
-    after_help = "INPUT is one or more of:\n  FILE            input file(s) in the order given\n  -               read stdin at this position (at most once)\n  --text TEXT     literal text material (repeatable)\n  --paste         read the clipboard at this position\n  -p TEXT         instruction for this run (not material)\n\nManagement: aido tasks|profiles|config|history ... and aido last\n\nExamples:\n  aido ocr screenshot.png --copy\n  git diff | aido code-review -\n  aido translate article.md --to zh-CN\n  aido tts --text \"你好\" -o hello.mp3\n  aido image --text \"a dog\" --count 2 --out-dir dogs/\n  aido ask a.png b.png -p \"比较两图\"\n  aido ocr screenshot.png --dry-run"
+    after_help = "INPUT is one or more of:\n  FILE            input file(s) in the order given\n  GLOB            pattern aido expands itself (quote it when the shell must not):\n                  matches in sorted order; no match is an error\n  DIR             directory: its files one level deep, sorted;\n                  dotfiles are skipped, subdirectories are refused\n                  (use a glob to descend)\n  -               read stdin at this position (at most once)\n  --text TEXT     literal text material (repeatable)\n  --paste         read the clipboard at this position\n  -p TEXT         instruction for this run (not material)\n\nManagement: aido tasks|profiles|config|history ... and aido last\n\nExamples:\n  aido ocr screenshot.png --copy\n  aido ocr \"shots/*.png\" --copy\n  aido ocr shots/\n  git diff | aido code-review -\n  aido translate article.md --to zh-CN\n  aido tts --text \"你好\" -o hello.mp3\n  aido image --text \"a dog\" --count 2 --out-dir dogs/\n  aido ask a.png b.png -p \"比较两图\"\n  aido ocr screenshot.png --dry-run"
 )]
 pub struct Cli {
     /// Task name, set by the normalizer (use `aido run NAME` explicitly)
@@ -806,6 +832,37 @@ mod tests {
             n.specs,
             vec![SourceSpec::File(PathBuf::from("./-strange-name.png"))]
         );
+    }
+
+    #[test]
+    fn glob_tokens_become_glob_specs() {
+        let n = normalize(os(&["ocr", "shots/*.png"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Glob("shots/*.png".into())]);
+        // `?` and `[` are metacharacters too.
+        let n = normalize(os(&["ocr", "shot-?.png"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Glob("shot-?.png".into())]);
+        // A directory argument parses as a plain File; expansion is
+        // gather's job, where the filesystem lives.
+        let n = normalize(os(&["ocr", "shots/"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::File(PathBuf::from("shots/"))]);
+        // `--text` values are literal text, never patterns.
+        let n = normalize(os(&["ask", "--text", "a*b"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Text("a*b".into())]);
+    }
+
+    #[test]
+    fn separator_tokens_stay_literal_files() {
+        let n = normalize(os(&["ocr", "--", "shots/*.png"])).unwrap();
+        assert_eq!(
+            n.specs,
+            vec![SourceSpec::File(PathBuf::from("shots/*.png"))]
+        );
+        // `-` stays stdin even after `--`, as at every other position.
+        let n = normalize(os(&["ocr", "--", "-"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Stdin]);
+        // The ask path produces the same Glob spec.
+        let n = normalize(os(&["-p", "hi", "shots/*.png"])).unwrap();
+        assert_eq!(n.specs, vec![SourceSpec::Glob("shots/*.png".into())]);
     }
 
     #[test]
