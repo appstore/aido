@@ -709,8 +709,11 @@ fn output_file_mode_follows_the_umask() {
     use std::os::unix::fs::PermissionsExt as _;
     // The child inherits this process's umask; read it the way the
     // delivery code does — umask(0) also sets, so restore immediately.
-    let mask = unsafe { libc::umask(0) };
-    unsafe { libc::umask(mask) };
+    let raw = unsafe { libc::umask(0) };
+    unsafe { libc::umask(raw) };
+    // mode_t is u16 on macOS and u32 on Linux; widen for the mode math.
+    #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
+    let mask = raw as u32;
     let server = Server::json(chat_body("UMASKED"));
     let dir = temp_dir("out-umask");
     let file = dir.join("summary.md");

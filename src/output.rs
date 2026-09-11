@@ -429,11 +429,15 @@ impl FileMode {
 
 /// The process umask. `umask(0)` reads it but also sets it, so the read
 /// is immediately restored; that brief window is the standard price of
-/// reading a umask (what other Rust tools do).
+/// reading a umask (what other Rust tools do). `mode_t` is `u16` on macOS
+/// and `u32` on Linux, so the widening cast is required — and is a no-op
+/// on Linux, where the lint must be silenced.
 #[cfg(unix)]
 fn current_umask() -> u32 {
-    let mask = unsafe { libc::umask(0) };
-    unsafe { libc::umask(mask) };
+    let raw = unsafe { libc::umask(0) };
+    unsafe { libc::umask(raw) };
+    #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
+    let mask = raw as u32;
     mask
 }
 
