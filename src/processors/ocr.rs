@@ -7,7 +7,7 @@
 //! those limits; slice replies merge at their boundaries, removing only
 //! lines the overlap bands genuinely duplicated.
 
-use super::{synthetic_text, RequestStep};
+use super::{synthetic_text, RequestStep, StepRole};
 use crate::api::image_as_png;
 use crate::domain::{InputPart, MediaKind};
 use anyhow::{Context, Result};
@@ -61,6 +61,7 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             hard_cut_end: false,
             part: None,
             artifact_stem: None,
+            role: StepRole::Map,
         }]);
     }
 
@@ -88,6 +89,7 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
                 hard_cut_end: hard_flags[i],
                 part: None,
                 artifact_stem: None,
+                role: StepRole::Map,
             });
         }
     }

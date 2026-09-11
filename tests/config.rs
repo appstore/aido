@@ -240,7 +240,7 @@ fn tasks_list_and_show_cover_the_builtins() {
     let out = run(&["tasks", "show", "summarize"], b"", &[]);
     out.assert_code(0);
     let stdout = out.stdout();
-    assert!(stdout.contains("chunk-map-reduce"), "{stdout}");
+    assert!(stdout.contains("chunk-reduce"), "{stdout}");
     assert!(stdout.contains("text"), "{stdout}");
 
     let out = run(&["tasks", "show", "nope"], b"", &[]);

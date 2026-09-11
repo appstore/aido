@@ -204,4 +204,31 @@ mod tests {
         assert_eq!(steps[0].artifact_stem, Some("a-b".into()));
         assert_eq!(steps[1].artifact_stem, Some("a-b-2".into()));
     }
+
+    #[test]
+    fn a_reduce_step_belongs_to_its_part() {
+        // A long text chunks into three, so each part plans three map
+        // steps plus its own reduce step — the consolidation happens per
+        // part, not once over every part's replies.
+        let long = |id: usize, path: &str| InputPart {
+            id,
+            source: InputSource::File(std::path::PathBuf::from(path)),
+            name: path.into(),
+            kind: MediaKind::Text,
+            unknown_kind: false,
+            mime: "text/plain".into(),
+            content: InputContent::Text("字".repeat(9000)),
+        };
+        let inputs = [long(1, "a.md"), long(2, "b.md")];
+        let steps = plan_steps(&inputs, ProcessorKind::ChunkReduce, true).unwrap();
+        assert_eq!(steps.len(), 8, "3 map + 1 reduce per part");
+        for (reduce, id) in [(&steps[3], 1), (&steps[7], 2)] {
+            assert_eq!(reduce.role, crate::processors::StepRole::Reduce);
+            assert_eq!(reduce.part, Some(id));
+        }
+        assert!(steps[..3]
+            .iter()
+            .chain(&steps[4..7])
+            .all(|s| s.role == crate::processors::StepRole::Map));
+    }
 }

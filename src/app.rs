@@ -681,7 +681,8 @@ fn processor_name(kind: crate::tasks::ProcessorKind) -> &'static str {
     match kind {
         crate::tasks::ProcessorKind::Single => "single",
         crate::tasks::ProcessorKind::OcrTiles => "ocr-tiles",
-        crate::tasks::ProcessorKind::ChunkMapReduce => "chunk-map-reduce",
+        crate::tasks::ProcessorKind::ChunkJoin => "chunk-join",
+        crate::tasks::ProcessorKind::ChunkReduce => "chunk-reduce",
     }
 }
 

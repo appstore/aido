@@ -54,7 +54,7 @@
     - 退一步方案（不想引入 poll 时）：先把 stdin 读进缓冲，为空就当作「没有管道」继续执行，非空才要求 `-`。行为等价，代价是最多缓存 32 MB，且会消耗掉 stdin（对这个工具无所谓）。
   - 测试：`tests/input.rs` 增加「stdin 重定向自 `/dev/null` + 显式文件 → 退出 0」，以及「stdin 是非空管道 + 显式文件 → 仍然报 `add -`」。现有的 `unconsumed_pipe_with_explicit_material_is_an_error` 保留。
 
-- [ ] **F02 · 高 · `src/processors/chunk.rs:306` · `src/runner.rs:141` · 名为 chunk-map-reduce 的处理器没有 reduce 步骤**
+- [x] **F02 · 高 · `src/processors/chunk.rs:306` · `src/runner.rs:141` · 名为 chunk-map-reduce 的处理器没有 reduce 步骤**
   - 问题：`ChunkGate` 只做一件事：把各分块的回复用空行拼起来。没有任何汇总请求。对 translate 这没问题（逐段翻译再拼接是对的），但 summarize 默认也挂了这个处理器。结果是：一篇 12000 字的文档被切成 3 块，用户拿到的是 3 段各自独立的「一句话总结 + 3-6 条要点」，而不是一份整体摘要。issue #24 里明确写了「长文摘要：若将来支持分段，需要『分段摘要再汇总』的策略」——这一条没有实现，但处理器的名字和 README 都在暗示它实现了。
   - 方案：不是「补一个 reduce」，而是把一个名字拆成两个策略：
     - `ProcessorKind::ChunkJoin` —— 现有行为，逐块处理后顺序拼接。`translate.toml` 改用它。

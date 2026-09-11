@@ -1,11 +1,16 @@
-//! The chunk map-reduce strategy for long text.
+//! The chunk strategies for long text: `chunk-join` and `chunk-reduce`.
 //!
 //! Text that outgrows the model's context window — or, for tasks whose
 //! reply scales with the input like translation, its output budget —
-//! fails as one request. This strategy splits oversized text parts at
-//! paragraph boundaries, sends one request per chunk (the runner attaches
-//! the task's instruction to every request), and joins the replies in
-//! order.
+//! fails as one request. Both strategies split oversized text parts at
+//! paragraph boundaries and send one request per chunk (the runner
+//! attaches the task's instruction to every request). They differ in how
+//! the per-chunk replies become the result: `chunk-join` (translate)
+//! joins them in order — a translation's pieces are the final text —
+//! while `chunk-reduce` (summarize) sends one more request whose material
+//! is the collected chunk replies, so the task's instruction is applied
+//! once more to the whole document and the reply is a single consolidated
+//! result, not one section per chunk.
 //!
 //! Continuity across a cut comes from *context carry*, not output overlap:
 //! every chunk after the first also sees a short excerpt of the previous
@@ -13,10 +18,10 @@
 //! processable text would have to be deduplicated from the replies, and
 //! exact-match dedup only works when the reply is a deterministic
 //! transcription (OCR) — a translation renders the same source differently
-//! each time. With context carry the outputs never repeat, so the reduce
-//! step is a plain join with a paragraph break.
+//! each time. With context carry the outputs never repeat, so the join
+//! step of `chunk-join` is a plain join with a paragraph break.
 
-use super::{synthetic_text, RequestStep};
+use super::{synthetic_text, RequestStep, StepRole};
 use crate::domain::{InputContent, InputPart, MediaKind};
 use anyhow::Result;
 
@@ -33,13 +38,59 @@ pub const CHUNK_NOTE: &str = "This text is one chunk of a longer document, split
      request stays within the context window; the results of all chunks are joined in \
      order. Process only the chunk text.";
 
+const CHUNK_REDUCE_NOTE: &str = "This text is one chunk of a longer document, split so each \
+     request stays within the context window; the results of all chunks are consolidated \
+     into one final result. Process only the chunk text.";
+
+/// The reduce request's material opens with this explanation; the task's
+/// original instruction rides along as the request's instruction channel,
+/// so the model knows both what to do and that the pieces are one
+/// document.
+pub const REDUCE_NOTE: &str = "This material is the per-chunk results of one longer \
+     document; each chunk was already processed under the same instruction, and the \
+     '--- result i of N ---' markers separate the sections. Produce the single final \
+     result for the whole document, as the instruction asks.";
+
 const CONTEXT_NOTE: &str = "Context from the end of the previous chunk, for continuity \
      only — do not process or output it:";
 
-/// Plan the request sequence: unsliced material travels with the first
+/// Plan the chunk-join sequence: unsliced material travels with the first
 /// chunk's request, each oversized text part's chunks follow in order, and
 /// `quiet` suppresses the split note on stderr.
 pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
+    plan_map_steps(inputs, quiet, CHUNK_NOTE)
+}
+
+/// Plan the chunk-reduce sequence: the same map steps as the join
+/// strategy, plus one final reduce step whose material is the map
+/// replies. That material does not exist at planning time — the step
+/// carries empty inputs and the runner fills them in — so the plan is
+/// honest only together with the runner's reduce handling. A single chunk
+/// is already the whole document and takes no reduce step.
+pub fn plan_steps_reduce(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
+    let mut steps = plan_map_steps(inputs, quiet, CHUNK_REDUCE_NOTE)?;
+    if steps.len() > 1 {
+        let maps = steps.len();
+        steps.push(RequestStep {
+            index: steps.len(),
+            // Placeholders: the map replies become the material at run
+            // time, built by `reduce_inputs`.
+            inputs: Vec::new(),
+            label: format!("consolidate {maps} chunks"),
+            hard_cut_end: false,
+            part: None,
+            artifact_stem: None,
+            role: StepRole::Reduce,
+        });
+    }
+    Ok(steps)
+}
+
+/// The map phase shared by both strategies: unsliced material travels
+/// with the first chunk's request, each oversized text part's chunks
+/// follow in order, and every step after the first explains itself with
+/// `note`. `quiet` suppresses the split note on stderr.
+fn plan_map_steps(inputs: &[InputPart], quiet: bool, note: &str) -> Result<Vec<RequestStep>> {
     let mut untouched: Vec<InputPart> = Vec::new();
     let mut chunked: Vec<(&InputPart, Vec<String>)> = Vec::new();
     for part in inputs {
@@ -67,6 +118,7 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             hard_cut_end: false,
             part: None,
             artifact_stem: None,
+            role: StepRole::Map,
         }]);
     }
 
@@ -78,7 +130,7 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             if steps.is_empty() {
                 step_inputs.append(&mut untouched);
             } else {
-                step_inputs.push(synthetic_text(usize::MAX, "chunk note", CHUNK_NOTE));
+                step_inputs.push(synthetic_text(usize::MAX, "chunk note", note));
             }
             if i > 0 {
                 let context = context_tail(&chunks[i - 1]);
@@ -98,10 +150,32 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
                 hard_cut_end: false,
                 part: None,
                 artifact_stem: None,
+                role: StepRole::Map,
             });
         }
     }
     Ok(steps)
+}
+
+/// Build the reduce request's material from the collected map replies: a
+/// consolidation note plus one labeled section per reply, so the model
+/// sees distinct sections of one document instead of one anonymous wall
+/// of text.
+pub fn reduce_inputs(sections: &[String]) -> Vec<InputPart> {
+    let total = sections.len();
+    let mut parts = vec![synthetic_text(
+        usize::MAX,
+        "consolidation note",
+        REDUCE_NOTE,
+    )];
+    for (i, text) in sections.iter().enumerate() {
+        parts.push(synthetic_text(
+            usize::MAX,
+            &format!("chunk {}/{} result", i + 1, total),
+            &format!("--- result {} of {total} ---\n\n{}", i + 1, text.trim()),
+        ));
+    }
+    parts
 }
 
 fn chunk_if_long(part: &InputPart) -> Option<Vec<String>> {
@@ -605,6 +679,48 @@ mod tests {
         let steps = plan_steps(&[text_part("one.txt", &text)], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].label, "all material");
+    }
+
+    #[test]
+    fn reduce_plan_appends_one_reduce_step_after_the_maps() {
+        let input = [text_part("book.txt", &para(600))];
+        let steps = plan_steps_reduce(&input, true).unwrap();
+        let maps = plan_steps(&input, true).unwrap();
+        assert_eq!(steps.len(), maps.len() + 1);
+        let (reduce, map_steps) = steps.split_last().unwrap();
+        assert_eq!(reduce.role, StepRole::Reduce);
+        // Placeholders only: the map replies become the material at run
+        // time, so the plan cannot carry real inputs here.
+        assert!(reduce.inputs.is_empty());
+        assert_eq!(reduce.index, map_steps.len());
+        assert_eq!(
+            reduce.label,
+            format!("consolidate {} chunks", map_steps.len())
+        );
+        assert!(map_steps.iter().all(|s| s.role == StepRole::Map));
+    }
+
+    #[test]
+    fn reduce_plan_skips_the_reduce_step_for_a_single_chunk() {
+        // One chunk is the whole document; consolidating it with itself
+        // would be an extra request for nothing.
+        let steps = plan_steps_reduce(&[text_part("a.txt", "hello")], true).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].role, StepRole::Map);
+        assert_eq!(steps[0].label, "all material");
+    }
+
+    #[test]
+    fn reduce_material_labels_every_chunk_result() {
+        let parts = reduce_inputs(&[" 一\n\n".to_string(), "二".to_string()]);
+        // Consolidation note + one section per map reply.
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].text().unwrap().contains("one longer document"));
+        let one = parts[1].text().unwrap();
+        assert!(one.starts_with("--- result 1 of 2 ---"), "{one}");
+        assert!(one.ends_with("一"), "reply whitespace trimmed: {one}");
+        assert!(parts[2].text().unwrap().contains("--- result 2 of 2 ---"));
+        assert!(parts[2].text().unwrap().contains("二"));
     }
 
     // --- ChunkGate ---------------------------------------------------------

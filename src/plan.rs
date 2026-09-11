@@ -746,7 +746,7 @@ pub fn describe(plan: &ExecutionPlan) -> String {
                 format!("ocr-tiles — {}", parts.join("; "))
             }
         }
-        ProcessorKind::ChunkMapReduce => {
+        ProcessorKind::ChunkJoin => {
             let mut parts = Vec::new();
             for step in &plan.steps {
                 if step.label != "all material" {
@@ -754,9 +754,22 @@ pub fn describe(plan: &ExecutionPlan) -> String {
                 }
             }
             if parts.is_empty() {
-                "chunk-map-reduce (no text needs chunking)".to_string()
+                "chunk-join (no text needs chunking)".to_string()
             } else {
-                format!("chunk-map-reduce — {}", parts.join("; "))
+                format!("chunk-join — {}", parts.join("; "))
+            }
+        }
+        ProcessorKind::ChunkReduce => {
+            let mut parts = Vec::new();
+            for step in &plan.steps {
+                if step.label != "all material" {
+                    parts.push(step.label.clone());
+                }
+            }
+            if parts.is_empty() {
+                "chunk-reduce (no text needs chunking)".to_string()
+            } else {
+                format!("chunk-reduce — {}", parts.join("; "))
             }
         }
     };
@@ -883,7 +896,8 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
             match plan.processor {
                 ProcessorKind::Single => "single",
                 ProcessorKind::OcrTiles => "ocr-tiles",
-                ProcessorKind::ChunkMapReduce => "chunk-map-reduce",
+                ProcessorKind::ChunkJoin => "chunk-join",
+                ProcessorKind::ChunkReduce => "chunk-reduce",
             }
             .to_string(),
         ),

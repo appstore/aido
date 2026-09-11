@@ -3,11 +3,12 @@
 
 use crate::api::{Client, Connection, GenerateRequest, GenerateResult};
 use crate::domain::{
-    AppError, AppResult, Artifact, Destination, GenerationStatus, MediaKind, Provenance,
+    AppError, AppResult, Artifact, Destination, GenerationStatus, InputPart, MediaKind, Provenance,
 };
 use crate::plan::{DeliveryMode, ExecutionPlan};
-use crate::processors::chunk::ChunkGate;
+use crate::processors::chunk::{reduce_inputs, ChunkGate};
 use crate::processors::ocr::BoundaryGate;
+use crate::processors::StepRole;
 use crate::spinner::Spinner;
 use crate::tasks::ProcessorKind;
 use std::cell::RefCell;
@@ -90,8 +91,9 @@ impl DeltaSink {
 
 /// Merges a multi-request run's replies into one text stream. The right
 /// join depends on the strategy: ocr-tiles re-shows overlap bands and
-/// dedups them; chunk-map-reduce carries context instead, so chunks join
-/// with a plain paragraph break.
+/// dedups them; chunk-join carries context instead, so chunks join with
+/// a plain paragraph break. A chunk-reduce run never merges — its map
+/// replies are intermediate and the reduce reply is the whole artifact.
 enum SliceMerger {
     Boundary(BoundaryGate),
     Chunk(ChunkGate),
@@ -163,6 +165,10 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     }
     let batch = part_sizes.iter().filter(|(id, _)| id.is_some()).count() > 1;
     let parts_total = part_sizes.iter().filter(|(id, _)| id.is_some()).count();
+    // A chunk-reduce run (map steps plus one reduce step per group) holds
+    // map replies back as the reduce request's material instead of
+    // merging them for delivery.
+    let reduce_plan = plan.steps.iter().any(|s| s.role == StepRole::Reduce);
     let group_size = |id: Option<usize>| {
         part_sizes
             .iter()
@@ -191,6 +197,9 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         first_index: usize,
         sink: Rc<RefCell<DeltaSink>>,
         gate: Option<SliceMerger>,
+        /// A reduce run's per-map-step replies, in step order: the reduce
+        /// request's future material, never delivered on their own.
+        sections: Vec<String>,
     }
     // Warnings and failures name the part by its input name (`b.png`),
     // not its artifact stem (`b`).
@@ -255,10 +264,13 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 live: live_stdout && !batch,
                 chars_seen: 0,
             }));
-            let gate = (group_size(step.part) > 1).then(|| {
+            // A reduce run never merges through a gate: map replies
+            // accumulate as sections (the reduce request's material) and
+            // the reduce reply is a single request's output.
+            let gate = (group_size(step.part) > 1 && !reduce_plan).then(|| {
                 let gate_sink = sink.clone();
                 match plan.processor {
-                    ProcessorKind::ChunkMapReduce => {
+                    ProcessorKind::ChunkJoin | ProcessorKind::ChunkReduce => {
                         SliceMerger::Chunk(ChunkGate::new(move |t: &str| {
                             gate_sink.borrow_mut().emit(t)
                         }))
@@ -279,7 +291,19 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 first_index: step.index,
                 sink,
                 gate,
+                sections: Vec::new(),
             });
+        }
+        // Map replies of a reduce run are intermediate: each accumulates
+        // into its own section and never reaches stdout or an artifact —
+        // only the reduce reply streams live.
+        if reduce_plan && step.role == StepRole::Map {
+            group.as_mut().unwrap().sections.push(String::new());
+        }
+        // The group's artifact is the reduce reply, so its provenance
+        // names the reduce request, not the first map request.
+        if step.role == StepRole::Reduce {
+            group.as_mut().unwrap().first_index = step.index;
         }
         if !plan.quiet {
             let label = if plan.steps.len() > 1 {
@@ -295,10 +319,20 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             };
             spinner.set_message(&label);
         }
+        // A reduce step's material is its group's collected map replies —
+        // placeholders in the plan, filled in here. The task's original
+        // instruction attaches to the reduce request like any other.
+        let reduce_material;
+        let inputs: &[InputPart] = if step.role == StepRole::Reduce {
+            reduce_material = reduce_inputs(&group.as_ref().unwrap().sections);
+            &reduce_material
+        } else {
+            &step.inputs
+        };
         let request = GenerateRequest {
             instruction: (!plan.instruction.is_empty()).then_some(plan.instruction.as_str()),
             requirement: plan.requirement.as_deref(),
-            inputs: &step.inputs,
+            inputs,
             model: &plan.resolved.model,
             max_tokens: plan.resolved.max_tokens,
             temperature: plan.resolved.temperature,
@@ -309,8 +343,13 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // requests; a single request goes straight to the sink. The
         // closure's last use is inside the request call (plus the
         // buffered replay right after), so later group access is fine.
+        let collect_section = reduce_plan && step.role == StepRole::Map;
         let mut on_delta = |delta: &str| {
             let g = group.as_mut().unwrap();
+            if collect_section {
+                g.sections.last_mut().unwrap().push_str(delta);
+                return;
+            }
             match g.gate.as_mut() {
                 Some(gate) => gate.push_delta(delta),
                 None => g.sink.borrow_mut().emit(delta),
