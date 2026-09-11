@@ -12,6 +12,8 @@ arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+# 自己展开 glob（引号包裹 / Windows 下 shell 不会展开）；零传递依赖。
+glob = "0.3"
 # Edge TTS 适配器：非官方 Read Aloud 协议（DRM 常量会轮换，跟随 0.2.x 补丁更新）。
 # 已知代价：kothok 经由其 tokio-rustls 依赖的默认特性把 aws-lc-sys（源码构建
 # 需要 cmake）拉进依赖树，运行时 TLS 实际用 ring。上游修正特性声明后可移除，

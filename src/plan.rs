@@ -112,7 +112,9 @@ pub fn build(
         cli.dry_run,
         env,
     )
-    .map_err(|e| AppError::usage(e.to_string()))?;
+    // The chain matters for expansion errors: "cannot expand 'pattern'"
+    // should still show the underlying io cause.
+    .map_err(|e| AppError::usage(format!("{e:#}")))?;
     validate_inputs(task, &resolved, &inputs)?;
     // Adapter capability: the edge-tts protocol has no instruction channel.
     // Refusing at plan time (not just at send time) keeps --dry-run honest
