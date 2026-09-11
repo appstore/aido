@@ -436,6 +436,107 @@ fn json_conflicts_with_explicit_stdout() {
     assert!(out.stderr().contains("stdout"), "stderr: {}", out.stderr());
 }
 
+/// The `--json` error contract: on usage (2), service (3) and generation
+/// (4) failures stdout still carries exactly one valid JSON report — the
+/// success report's envelope and field names, with `error` filled in —
+/// and stderr keeps the human-readable line.
+fn assert_json_error_report(out: &RunOutcome, code: i32, kind: &str) {
+    out.assert_code(code);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["error"]["kind"], kind, "report: {report}");
+    assert!(
+        !report["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "report: {report}"
+    );
+    assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
+}
+
+#[test]
+fn json_error_report_covers_usage_exit_two() {
+    // `--produce audio` exceeds what the summarize adapter can output: a
+    // preflight usage error, before any run exists.
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--produce",
+            "audio",
+            "--json",
+            "--text",
+            "hi",
+        ],
+        b"",
+        &[],
+    );
+    assert_json_error_report(&out, 2, "usage");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert!(report["run_id"].is_null(), "no run yet: {report}");
+    assert!(report["task"].is_null(), "no run yet: {report}");
+}
+
+#[test]
+fn json_error_report_covers_errors_before_clap_parses() {
+    // An unknown task fails inside the argv normalizer, before clap could
+    // have parsed --json; the naive argv scan must still yield the report.
+    let out = run(&["--json", "nosuchtask", "notes.txt"], b"", &[]);
+    assert_json_error_report(&out, 2, "usage");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert!(report["run_id"].is_null(), "no run yet: {report}");
+    assert!(report["task"].is_null(), "no run yet: {report}");
+}
+
+#[test]
+fn json_error_report_covers_service_exit_three() {
+    let server = Server::start(
+        "500 Internal Server Error",
+        r#"{"error":{"message":"service exploded"}}"#,
+    );
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &["summarize", "--profile", "test", "--json"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert_json_error_report(&out, 3, "service");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["task"], "summarize", "report: {report}");
+    assert!(report["run_id"].is_string(), "the run existed: {report}");
+    assert!(
+        out.stderr().contains("service exploded"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn json_error_report_covers_truncated_generation_exit_four() {
+    // The same truncated reply as protocol.rs's exit-4 fixture: with
+    // --json, stdout carries the error report instead of staying empty.
+    let server =
+        Server::json(r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#);
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &["summarize", "--profile", "test", "--json"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert_json_error_report(&out, 4, "generation");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["task"], "summarize", "report: {report}");
+    assert!(report["run_id"].is_string(), "the run existed: {report}");
+    assert!(
+        out.stderr().contains("not delivered"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
 #[test]
 fn several_artifacts_cannot_share_bare_stdout() {
     // produce two kinds and pipe stdout: the late check catches it — as a

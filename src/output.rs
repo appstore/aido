@@ -10,7 +10,7 @@
 
 use crate::clipboard;
 use crate::domain::{
-    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, MediaKind,
+    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, ErrorKind, MediaKind,
 };
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -692,13 +692,7 @@ fn json_report(
         .collect();
     let report_error = error.map(|e| {
         serde_json::json!({
-            "kind": match e.kind {
-                crate::domain::ErrorKind::Usage => "usage",
-                crate::domain::ErrorKind::Service => "service",
-                crate::domain::ErrorKind::Generation => "generation",
-                crate::domain::ErrorKind::Delivery => "delivery",
-                crate::domain::ErrorKind::Partial => "partial",
-            },
+            "kind": e.kind.as_str(),
             "message": e.chain(),
         })
     });
@@ -729,6 +723,32 @@ fn json_report(
         "deliveries": deliveries,
         "failed_parts": failed_parts,
         "error": report_error,
+    })
+}
+
+/// The JSON report for a run that failed before delivery could produce
+/// anything (usage, service and generation failures): the success
+/// report's `version` envelope and field names, with the failure carried
+/// in `error` (same `kind` names as the delivery report) and no
+/// artifacts or deliveries. `run_id` and `task` are `null` when the run
+/// never got far enough to know them.
+pub fn error_report(
+    kind: ErrorKind,
+    message: &str,
+    run_id: Option<&str>,
+    task: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "task": task,
+        "artifacts": [],
+        "deliveries": [],
+        "failed_parts": [],
+        "error": {
+            "kind": kind.as_str(),
+            "message": message,
+        },
     })
 }
 

@@ -303,6 +303,18 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// The name this kind carries in the JSON run report's `error.kind`,
+    /// shared by the success report and the error report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::Service => "service",
+            Self::Generation => "generation",
+            Self::Delivery => "delivery",
+            Self::Partial => "partial",
+        }
+    }
+
     pub fn exit_code(self) -> i32 {
         match self {
             Self::Usage => 2,
