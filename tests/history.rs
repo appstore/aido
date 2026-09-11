@@ -687,6 +687,80 @@ fn byte_budget_never_deletes_the_newest_run() {
     assert_eq!(out.stdout(), "NEW\n");
 }
 
+/// Changing the process-wide cwd touches every test in this binary, so
+/// cwd-changing tests serialize on this lock. Every other path in the
+/// suite is absolute (`temp_dir` et al. build on `std::env::temp_dir()`,
+/// and `AIDO_CONFIG` is always set), so nothing else reads the cwd.
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores the original cwd on drop, even when an assertion panics.
+struct CwdGuard {
+    original: std::path::PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+fn enter_cwd(dir: &std::path::Path) -> CwdGuard {
+    let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let original = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir).unwrap();
+    CwdGuard {
+        original,
+        _lock: lock,
+    }
+}
+
+#[test]
+fn byte_budget_prunes_with_a_relative_history_dir() {
+    // AIDO_HISTORY_DIR may be relative: it resolves against the cwd, which
+    // the spawned aido inherits. The budget loop used to join the already
+    // joined run path back onto the dir, so a relative setting produced
+    // `hist/hist/…`, every removal failed, and the budget never bit.
+    let base = temp_dir("hist-relative");
+    let hist = base.join("hist");
+    std::fs::create_dir_all(&hist).unwrap();
+    let old_id = "20260101-000000.000";
+    fake_complete_run(&hist, old_id, &"x".repeat(4096));
+
+    let _cwd = enter_cwd(&base);
+    let server = Server::json(chat_body("NEW"));
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 50\nhistory_bytes = 1024\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", "hist"),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+    let stderr = out.stderr();
+    assert!(
+        !stderr.contains("failed to prune history entry"),
+        "a relative history dir must prune cleanly; stderr: {stderr}"
+    );
+
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1, "the over-budget old run is pruned");
+    assert_ne!(runs[0].file_name().unwrap(), old_id);
+
+    // the newest run is still recoverable, through the same relative path
+    let out = run(&["last"], b"", &[("AIDO_HISTORY_DIR", "hist")]);
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "NEW\n");
+}
+
 #[test]
 fn last_skips_a_damaged_newest_entry() {
     // One corrupted manifest must not brick recovery: `last` skips the

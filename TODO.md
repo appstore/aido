@@ -198,7 +198,7 @@
     - **更轻量**：`validate_inputs` 里若 `required_types` 未满足、但存在来源为 Clipboard 且处于 dry-run 的 part，降级为 stderr 上的一行提示而非错误。
   - 测试：把 `tests/input.rs:356` 的断言从「退出 2 且提到 image」改成「退出 0、计划里材料行标注类型待定、且没有触碰剪贴板」。
 
-- [ ] **F13 · 中 · `src/history.rs:325` · 历史字节预算的清理只在绝对路径下碰巧生效**
+- [x] **F13 · 中 · `src/history.rs:325` · 历史字节预算的清理只在绝对路径下碰巧生效**
   - 问题：`prune()` 的字节预算分支把已经拼好的完整路径又传回 `remove_run(&dir, id)`，后者再 `dir.join(id)` 一次。这在 id 是绝对路径时靠 `Path::join` 的「绝对路径覆盖 base」特性侥幸正确。一旦 `AIDO_HISTORY_DIR` 设成相对路径，拼出来的就是 `hist/hist/2026…`，删除失败，字节预算彻底不起作用，同时每次运行都在 stderr 上刷一行 `warning: failed to prune history entry`。测试全部用绝对临时目录，所以覆盖不到。
   - 方案：`history.rs:325` 把 `dirs: Vec<PathBuf>` 换成 `Vec<(String, u64)>`（id + 尺寸），循环里 `remove_run(&dir, &id)`。顺带避免了 `dir_size` 被算两遍。
   - 测试：`tests/history.rs` 已有的字节预算测试改用相对 `AIDO_HISTORY_DIR`（配合 `current_dir`）跑一遍，现在的绝对路径版本保留。

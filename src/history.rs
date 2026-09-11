@@ -320,16 +320,19 @@ pub fn prune(keep: usize, budget: u64) {
     // kept: it is the run just saved, and the recovery promise ("a failed
     // clipboard write is recoverable via `aido last`") depends on it —
     // even when a single artifact exceeds the whole budget.
-    let mut total = 0u64;
-    let mut dirs: Vec<PathBuf> = ids.iter().map(|id| dir.join(id)).collect();
-    dirs.sort(); // stamp order
-    for path in &dirs {
-        total += dir_size(path);
-    }
-    while total > budget && dirs.len() > 1 {
-        let oldest = dirs.remove(0);
-        total = total.saturating_sub(dir_size(&oldest));
-        remove_run(&dir, &oldest.to_string_lossy());
+    let mut entries: Vec<(String, u64)> = ids
+        .into_iter()
+        .map(|id| {
+            let size = dir_size(&dir.join(&id));
+            (id, size)
+        })
+        .collect();
+    entries.sort(); // stamp order
+    let mut total: u64 = entries.iter().map(|(_, size)| size).sum();
+    while total > budget && entries.len() > 1 {
+        let (oldest, size) = entries.remove(0);
+        total = total.saturating_sub(size);
+        remove_run(&dir, &oldest);
     }
 }
 
