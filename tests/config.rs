@@ -131,6 +131,38 @@ fn profile_input_types_intersect_with_the_task() {
 }
 
 #[test]
+fn disjoint_profile_and_task_input_types_error_at_resolve_time() {
+    // summarize takes text only; an audio-only profile shares no input type
+    // with it. Resolve must reject the combination itself — every material
+    // would be rejected later, and only with an empty `(allowed: )` list.
+    // (ocr would not do here: its declared types include text, so a
+    // text-only profile still intersects.)
+    let cfg = settings_config(
+        "[profiles.audio-only]\nprovider = \"srv\"\nmodel = \"m\"\ninput_types = [\"audio\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "audio-only",
+            "notes.md",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(
+        err.contains("shares no type with task 'summarize'"),
+        "{err}"
+    );
+    assert!(err.contains("restricts inputs to [audio]"), "{err}");
+    assert!(!err.contains("(allowed: )"), "{err}");
+}
+
+#[test]
 fn deprecated_global_env_vars_are_ignored_with_a_warning() {
     let server = Server::json(chat_body("ok"));
     let cfg = settings_config(&format!(

@@ -184,6 +184,20 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     let allowed_inputs = match (&task.input_types, &profile.input_types) {
         (Some(t), Some(p)) => {
             let i: Vec<MediaKind> = t.iter().filter(|k| p.contains(k)).copied().collect();
+            if i.is_empty() {
+                // An empty intersection rejects every material later, and
+                // only with an empty candidate list — name the config
+                // mismatch here instead. (A task without declared types or
+                // an unrestricted profile has no intersection to be empty.)
+                bail!(
+                    "profile '{profile_name}' restricts inputs to [{}], which \
+                     shares no type with task '{}' ([{}]); pick another \
+                     profile or extend the profile",
+                    p.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(","),
+                    task.name,
+                    t.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(",")
+                );
+            }
             Some(i)
         }
         (Some(t), None) => Some(t.clone()),

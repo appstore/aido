@@ -241,7 +241,7 @@
     - **备选**：三处全部删除，只留 `apply_param_options` 的硬编码。但这样 `maps_to()` 承载的设计意图（参数→option 的映射契约）就丢了，未来新增适配器容易漏。
   - 测试：编译 + grep 确认无引用；`apply_param_options` 的现有行为测试不变。
 
-- [ ] **F19 · 低 · `src/config/resolve.rs:184` · task ∩ profile 的输入类型交集为空时不报错**
+- [x] **F19 · 低 · `src/config/resolve.rs:184` · task ∩ profile 的输入类型交集为空时不报错**
   - 问题：produce 为空时有明确的 `bail!`，`allowed_inputs` 为空却直接放行。到 `validate_inputs` 才逐个拒绝每份材料，错误信息里的候选列表是空的：`…does not accept (allowed: )`。
   - 方案：应当在 resolve 阶段就报「这个 profile 和这个 task 的输入类型没有交集」。（finding 原文指明方向。）
   - 测试（※补全）：构造交集为空的 task/profile 组合 → 明确报交集错误而非空候选列表。
