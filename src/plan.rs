@@ -166,7 +166,7 @@ pub fn build(
     }
 
     // --- artifacts and encodings -------------------------------------------
-    validate_outputs(cli, &mut resolved, &steps, terminal)?;
+    validate_outputs(cli, &mut resolved, &steps)?;
 
     // --- destinations -------------------------------------------------------
     let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
@@ -449,12 +449,7 @@ fn select_processor(cli: &Cli, task: &Task) -> ProcessorKind {
     }
 }
 
-fn validate_outputs(
-    cli: &Cli,
-    resolved: &mut Resolved,
-    steps: &[RequestStep],
-    terminal: TerminalInfo,
-) -> AppResult<()> {
+fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -> AppResult<()> {
     let media_kinds: Vec<MediaKind> = resolved
         .produce
         .iter()
@@ -501,15 +496,9 @@ fn validate_outputs(
             serde_json::Value::String(format.to_string()),
         );
     }
-    // Media output needs somewhere to go.
-    if !media_kinds.is_empty() {
-        let has_file_target = cli.output.is_some() || cli.out_dir.is_some();
-        if !has_file_target && terminal.stdout {
-            return Err(AppError::usage(
-                "binary output needs -o FILE or --out-dir, or a stdout pipe",
-            ));
-        }
-    }
+    // Media output needs somewhere to go — a judgment made on the
+    // resolved destinations in `resolve_destinations`, where every
+    // possible target (file, directory, clipboard, stdout pipe) is known.
     if resolved.produce.len() > 1 && cli.output.is_some() {
         return Err(AppError::usage(
             "several output kinds cannot go to a single -o FILE; use --out-dir",
@@ -620,7 +609,21 @@ fn resolve_destinations(
         // Default destination: stdout.
         destinations.push(Destination::Stdout);
     }
-    let _ = terminal;
+    // Binary output needs a destination that can hold it: a file, a
+    // directory, the clipboard (--copy; audio was already refused there
+    // with its own message), or stdout as a pipe — never the terminal.
+    // Judging the resolved list keeps every future destination covered
+    // instead of re-deriving CLI flags here.
+    if produce.iter().any(|k| *k != MediaKind::Text)
+        && terminal.stdout
+        && destinations
+            .iter()
+            .all(|d| matches!(d, Destination::Stdout))
+    {
+        return Err(AppError::usage(
+            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe",
+        ));
+    }
     Ok(destinations)
 }
 

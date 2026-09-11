@@ -487,3 +487,73 @@ impl Drop for MasterFd {
         }
     }
 }
+
+/// Run aido with a pseudo-terminal as stdin *and* stdout — a full terminal
+/// session, for tests where "stdout is a terminal" rules bind (binary
+/// output refusing a bare terminal, live streaming, ...). stderr stays
+/// piped so assertions keep working. Unix-only, like the other pty
+/// helpers.
+#[cfg(unix)]
+pub fn run_full_tty(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: std::path::PathBuf,
+) -> RunOutcome {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let mut master = 0i32;
+    let mut slave = 0i32;
+    #[cfg(target_os = "macos")]
+    let (termp, winp): (*mut libc::termios, *mut libc::winsize) =
+        (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_os = "macos"))]
+    let (termp, winp): (*const libc::termios, *const libc::winsize) =
+        (std::ptr::null(), std::ptr::null());
+    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), termp, winp) };
+    assert_eq!(rc, 0, "openpty failed");
+    let stdout_slave = unsafe { libc::dup(slave) };
+    let mut cmd = Command::new(EXE);
+    cmd.args(args)
+        .stdin(unsafe { Stdio::from_raw_fd(slave) })
+        .stdout(unsafe { Stdio::from_raw_fd(stdout_slave) })
+        .stderr(Stdio::piped())
+        .env("AIDO_CONFIG", &config)
+        .env("AIDO_TASKS_DIR", "/nonexistent/aido-test-tasks")
+        .env("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history");
+    for var in [
+        "OPENAI_API_KEY",
+        "AIDO_API_KEY",
+        "AIDO_PROFILE",
+        "AIDO_MODEL",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+    ] {
+        cmd.env_remove(var);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn");
+    // The Stdio objects (and the slave fds they own) live inside `cmd`;
+    // dropping it right after the spawn closes the parent's slave copies,
+    // so the master below actually sees the child's exit as EOF.
+    drop(cmd);
+    // Draining the master while the child runs keeps the pty buffer from
+    // blocking it. A pty master reports "all slaves closed" as EIO, which
+    // read_to_end surfaces as an error — that error *is* the EOF here.
+    let mut stdout = Vec::new();
+    {
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+        let _ = master_file.read_to_end(&mut stdout);
+    }
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&config);
+    RunOutcome {
+        output: std::process::Output {
+            status: out.status,
+            stdout,
+            stderr: out.stderr,
+        },
+    }
+}

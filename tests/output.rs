@@ -132,6 +132,56 @@ fn media_extension_mismatch_fails_before_any_request() {
     assert!(err.contains(".png"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn image_to_clipboard_in_a_terminal_is_a_valid_plan() {
+    // `--copy` is a documented destination for a binary artifact: in a
+    // real terminal session (stdout is a tty too) the plan must list the
+    // clipboard instead of demanding -o/--out-dir.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run_full_tty(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--copy",
+            "--dry-run",
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    let plan = out.stdout();
+    assert!(plan.contains("destinations:"), "{plan}");
+    assert!(plan.contains("clipboard"), "{plan}");
+}
+
+#[cfg(unix)]
+#[test]
+fn image_without_any_destination_in_a_terminal_is_still_refused() {
+    // The guard itself stays: a bare terminal cannot receive binary.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run_full_tty(
+        &["image", "--profile", "test", "--text", "dog", "--dry-run"],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("binary output needs"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
 #[test]
 fn directory_delivery_writes_artifacts_then_manifest() {
     let png = solid_png(2, 2);

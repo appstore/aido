@@ -2,22 +2,21 @@
 
 > 本文件是 `docs/pr-25-review.md` 的**完整工作版**：原审阅的全部内容——审阅背景与结论、F01–F33 每条的问题描述（含示例、行号）、实现方案（含备选与权衡）、追加审阅的状态说明——逐条保留并加上勾选框跟踪进度。
 >
->
-> **工作方式**：按批次顺序逐条修复；每条 = 改代码 + 补测试 + `cargo fmt` + `cargo clippy` + `cargo test` 全绿 + 自 review diff + 勾选本条 + 独立 commit。
+> **工作方式**：**每个issue都开独立的subagent进行逐个issue修复按批次顺序逐条修复**，再由总agent来进行统一review；每条 = 改代码 + 补测试 + `cargo fmt` + `cargo clippy` + `cargo test` 全绿 + 自 review diff + 勾选本条 + 独立 commit。
 > **分支**：`fix/pr-25-review`（基于 `50c6559`）。
 
 ## 批次总览（执行顺序）
 
 原文：「分 5 批。批次是有序的：第 1 批决定『能不能合并』，第 2 批决定『结果对不对』，之后三批可以并行推进。每批列出覆盖的 finding、改动位置和需要补的测试。」
 
-| 批次 | 主题 | Findings | 批次说明（原文） |
-|---|---|---|---|
-| 1 | 解除阻断：让合法命令跑起来 | F01 F03 F05 F12 | 四个改动都很小、互不耦合，但每一个都在拒绝一条文档承诺过的用法。**合并前必须清空。** |
-| 2 | 执行链语义：让结果是对的 | F02 F06 F09 | 都在 `processors/` 和 `runner.rs`，改动面比批次 1 大。F02 和 F09 会改变 summarize/translate 的实际输出，建议在同一个 commit 里连带更新 README 的行为说明。 |
-| 3 | 安全与数据完整性 | F04 F07 F08 F13 F17 F26 | 都是独立的小改动，可以拆成单独的 commit 并行推进。 |
-| 4 | 契约一致性 | F10 F11 F14 F15 F16 F19 | 让 README 里写的退出码契约和 `--json` 契约真正成立，并清掉两处会误导后续维护者的结构。 |
-| 5 | 死代码、依赖与文档 | F18 F20 F21 F22 F23 F24 F25 | 清理三处死代码、补齐 dry-run 的参数来源、消除硬编码、修正文档与行为。均为低风险独立改动，可并行。 |
-| 6 | 追加审阅（af6f9c5 合并后） | F27 F28 F29 F30 F31 F32 F33 | 2 中 5 低；F29–F33 均为小改动，可并行。 |
+| 批次 | 主题                       | Findings                    | 批次说明（原文）                                                                                                                                           |
+| ---- | -------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | 解除阻断：让合法命令跑起来 | F01 F03 F05 F12             | 四个改动都很小、互不耦合，但每一个都在拒绝一条文档承诺过的用法。**合并前必须清空。**                                                                       |
+| 2    | 执行链语义：让结果是对的   | F02 F06 F09                 | 都在 `processors/` 和 `runner.rs`，改动面比批次 1 大。F02 和 F09 会改变 summarize/translate 的实际输出，建议在同一个 commit 里连带更新 README 的行为说明。 |
+| 3    | 安全与数据完整性           | F04 F07 F08 F13 F17 F26     | 都是独立的小改动，可以拆成单独的 commit 并行推进。                                                                                                         |
+| 4    | 契约一致性                 | F10 F11 F14 F15 F16 F19     | 让 README 里写的退出码契约和 `--json` 契约真正成立，并清掉两处会误导后续维护者的结构。                                                                     |
+| 5    | 死代码、依赖与文档         | F18 F20 F21 F22 F23 F24 F25 | 清理三处死代码、补齐 dry-run 的参数来源、消除硬编码、修正文档与行为。均为低风险独立改动，可并行。                                                          |
+| 6    | 追加审阅（af6f9c5 合并后） | F27 F28 F29 F30 F31 F32 F33 | 2 中 5 低；F29–F33 均为小改动，可并行。                                                                                                                    |
 
 ---
 
@@ -40,11 +39,14 @@
 
 - [x] **F01 · 高 · `src/input.rs:117` · 非交互式环境下，任何带文件的命令都会报错退出**
   - 问题：「stdin 被管道占用但没用 `-` 消费」这条规则只看 `stdin_is_terminal`，不看管道里是否真有数据。而 CI runner、cron、systemd、不带 `-t` 的 docker run，stdin 一律是 `/dev/null` 或已关闭的管道——都不是 tty。
+
     ```console
     $ aido translate README.md --to en < /dev/null
     error: stdin is piped but not consumed; add `-` where the piped data belongs
     ```
+
     也就是说，重构后 aido 在所有自动化场景里都无法直接调用，除非每条命令都补一个 `< /dev/tty`。这条规则的本意是拦住「用户以为自己在传管道」的误用，代价不该是让非交互式调用整体失效。
+
   - 方案：核心是把「stdin 不是 tty」换成「stdin 上确实有待读数据」。改 `input.rs`：
     - 给 `InputEnv` 增加 `fn stdin_has_data(&mut self) -> bool`。真实实现里对 fd 0 做非阻塞 poll/select（Unix 用 `libc::poll`，超时 0；Windows 走 `PeekNamedPipe`），返回「可读且非 EOF」。测试实现直接由构造参数给定。
     - `gather()` 里 `:117` 的分支条件从 `!env.stdin_is_terminal` 改成 `env.stdin_has_data()`。
@@ -63,14 +65,18 @@
   - 测试：`tests/chunk.rs` 增加「假服务器对 3 个 map 请求分别回 A/B/C，对第 4 个请求断言其材料里同时含 A、B、C，最终 stdout 只有 reduce 的回复」。
   - 批次 2 说明：会改变 summarize/translate 的实际输出，同 commit 连带更新 README 行为说明。
 
-- [ ] **F03 · 高 · `src/plan.rs:445` · `aido image --copy` 在终端里必然被拒**
+- [x] **F03 · 高 · `src/plan.rs:445` · `aido image --copy` 在终端里必然被拒**
   - 问题：`validate_outputs` 判断「二进制产物是否有去处」时，`has_file_target` 只看 `-o` 和 `--out-dir`，完全没把 `--copy` 算进去。而这个检查跑在 `resolve_destinations` 之前。
+
     ```console
     $ aido image --text "一只柴犬" --copy
     error: binary output needs -o FILE or --out-dir, or a stdout pipe
     ```
+
     README 第 88 行写的是「`--copy`：把一个文本/图片产物写入剪贴板」。代码和文档直接矛盾，且没有测试覆盖这条路径。
+
   - 方案（最小改法）：
+
     ```rust
     let has_file_target = cli.output.is_some() || cli.out_dir.is_some();
     //                    ↓
@@ -78,8 +84,10 @@
         || cli.out_dir.is_some()
         || (cli.copy && !resolved.produce.contains(&MediaKind::Audio));
     ```
+
     音频要排除掉，因为 `resolve_destinations:560` 本来就会拒绝音频进剪贴板——那条更具体的错误信息更有用，应当让它先说话。
     更彻底的做法（**推荐**）：把这个检查整体挪到 `resolve_destinations` 之后，让它对已解析出的 destinations 判断「有没有一个能接住二进制产物」，而不是重新推断 CLI 旗标。这样以后新增去处不会再漏。
+
   - 测试：`tests/output.rs` 增加 `image --text ... --copy` 在伪 tty 下 `--dry-run` 退出 0、且计划里列出 clipboard。
 
 - [ ] **F04 · 高 · `src/api/mod.rs:281` · `src/processors/ocr.rs:113` · 解压炸弹护栏对 JPEG / WebP 完全失效**
@@ -93,6 +101,7 @@
 - [ ] **F05 · 高 · `src/config/mod.rs:160 vs :273` · 跑一次 `aido config init`，零配置 TTS 就坏了**
   - 问题：`default_config()`（无配置文件时使用）给 openai provider 挂了 `routes = { speech = "edge-tts" }`，所以 `aido tts` 不需要任何 API key。但 `config init` 写出的 `SAMPLE_CONFIG` 里没有这段 routes。于是用户按 README 的「第一步：`aido config init`」操作完，`aido tts` 就从「开箱即用」变成「报错：缺少 `AIDO_API_KEY`」。测试 `tests/config.rs:387` 恰好只覆盖了「完全没有配置文件」这一种情况，所以 CI 看不到。
   - 方案：在 `SAMPLE_CONFIG` 的 `[providers.openai]` 下补上与 `default_config()` 一致的路由，并解释为什么：
+
     ```toml
     [providers.openai]
     base_url = "https://api.openai.com/v1"
@@ -103,7 +112,9 @@
     [providers.openai.routes]
     speech = "edge-tts"
     ```
+
     根治办法：让 `SAMPLE_CONFIG` 不再是一份手写字符串，而是由 `default_config()` 序列化后加注释生成——这样两者不可能再分叉。但那需要给 `Config` 加 `Serialize`，可以放到批次 5。
+
   - 测试：`tests/config.rs` 增加「跑 `config init` → 再跑 `tts --dry-run` → 计划里的 route 是 edge-tts 且 credentials 显示 none required」。这正好补上 `:387` 那个测试的盲区。
 
 - [ ] **F06 · 高 · `src/runner.rs:215` · 多请求运行中途失败会丢掉已生成的内容，且不留历史**
@@ -126,12 +137,13 @@
   - 问题：`write_directory()` 给产物文件传 `overwrite=args.overwrite`（默认拒绝覆盖），却给 manifest 硬编码了 `true`。后果：对同一个目录跑第二次、且两次产物文件名不同（比如上次是 `image-1.png`、这次是 `text.txt`），旧的 manifest 被无声替换成只列新产物的版本，上一次的文件就变成没人索引的孤儿。而 manifest 正是这个目录里唯一的「这次交付包含什么」的记录。
   - 方案：`:471` 的硬编码 `true` 改成 `overwrite`。但这会让「对同一目录跑第二次」整体失败——这其实是正确的默认行为（目录交付是一个整体，不该半新半旧）。所以配套把错误信息说清楚：
     > `{dir}` 里已有上一次交付的 `manifest.json`；加 `--overwrite` 覆盖整个目录，或换一个 `--out-dir`
-    更好的做法（推荐）：在写任何文件之前先做一次预检：扫描目标目录，若 manifest 或任一目标文件名已存在且未给 `--overwrite`，立刻失败，一个字节都不写。现在的逐个写入会在中途失败时留下半个目录。
+    > 更好的做法（推荐）：在写任何文件之前先做一次预检：扫描目标目录，若 manifest 或任一目标文件名已存在且未给 `--overwrite`，立刻失败，一个字节都不写。现在的逐个写入会在中途失败时留下半个目录。
   - 测试：`tests/output.rs` 增加「对同一 out-dir 连跑两次、第二次不带 `--overwrite` → 退出 5、旧 manifest 内容不变」。
 
 - [ ] **F08 · 中 · `src/plan.rs:752` · `--dry-run` 会把 `base_url` 里的密码原样打出来**
   - 问题：`redact_url()` 只把 query 参数的值换成 `…`，不碰 URL 的 userinfo 段。配置里写 `base_url = "https://user:s3cret@gw.internal/v1"`（内网网关的常见写法），`--dry-run` 就会原样打印整串。PR 描述里说 dry-run「不展示密钥」，这条路径是个例外。
   - 方案：
+
     ```rust
     Ok(mut u) => {
         if !u.username().is_empty() { let _ = u.set_username("***"); }
@@ -139,15 +151,20 @@
         // …现有的 query 脱敏…
     }
     ```
+
     `Err(_)` 分支目前直接返回原串——解析失败的 URL 同样可能含密码。改成返回 `"(unparseable base_url, hidden)"` 更稳妥，反正 dry-run 的读者需要的是「配没配对」而不是原文。
+
   - 测试：`tests/config.rs` 增加「`base_url` 含 `user:pw@` → dry-run 输出不含 `pw`」。
 
 - [ ] **F09 · 中 · `src/processors/ocr.rs:71` · `src/processors/chunk.rs:76` · 未被切分的材料只进第一个请求**
   - 问题：两个处理器都把「没被切分的那些输入」（untouched）整体塞进第 0 步，后续分块只带上下文摘要。
+
     ```console
-    $ aido translate 术语表.md 长文.md
+    aido translate 术语表.md 长文.md
     ```
+
     术语表只对第 1 块生效，第 2 块之后的译文看不到它。而且原始顺序也丢了：不管术语表写在命令的哪个位置，它都被提到最前面。对「用一段说明去处理另一份材料」这种组合输入场景，这是安静的错误结果。
+
   - 方案：
     - 不再把 untouched 单独收集，而是保留输入的原始序号；构造每个 step 时，按原序把「非切分材料」和「本步的切片」一起排列——切片替换掉它原来所在的位置。
     - 这样 `aido translate 术语表.md 长文.md` 的第 k 个请求携带的是 `[术语表.md, 长文.md 第 k 块]`，顺序和用户给的一致，每块都看得到术语表。
@@ -168,11 +185,14 @@
 
 - [ ] **F12 · 中 · `src/input.rs:178` · OCR 的旗舰工作流没法用 `--dry-run` 检查**
   - 问题：`dry_run_clipboard_part()` 造的占位输入固定是 `MediaKind::Text`，而 ocr 声明了 `required_types = ["image"]`。所以：
+
     ```console
     $ aido ocr --copy --dry-run
     error: task 'ocr' requires image input; none of the material is image
     ```
+
     `aido ocr --copy`（截图在剪贴板里）正是 README 开篇第一个例子，而它的执行计划恰恰无法预览。`tests/input.rs:356` 把这个退出 2 当成了预期行为断言下来——这说明是设计取舍，但取舍的方向值得重新考虑：占位输入应当跳过类型检查，而不是伪装成 text 再被类型检查打回。
+
   - 方案（问题的根源是用 `MediaKind::Text` 去表示「类型未知」，两种改法）：
     - **推荐**：给 `InputPart` 加 `pub unknown_kind: bool`（`#[serde(default)]`），`dry_run_clipboard_part` 置 `true`。`plan.rs` 的 `validate_inputs` 对这类 part 跳过 `allowed_inputs` / `adapter.inputs()` / `required_types` 三项检查，同时在 `describe()` 的材料行里标注「类型将在运行时确定」。
     - **更轻量**：`validate_inputs` 里若 `required_types` 未满足、但存在来源为 Clipboard 且处于 dry-run 的 part，降级为 stderr 上的一行提示而非错误。
@@ -285,13 +305,16 @@
 
 - [ ] **F28 · 中 · `src/plan.rs:153` · dry-run 会展示一个真实执行会被拒绝的交付计划**
   - 问题：batch 的三条交付目标规则（`-o` 拒绝、缺 `--out-dir` 拒绝、stdout/clipboard 拒绝）全部包在 `if batch && !cli.dry_run` 里。于是：
+
     ```console
     $ aido ocr a.png b.png --dry-run
     destinations: stdout            ← 计划说发 stdout
     $ aido ocr a.png b.png
     error: 2 inputs are processed one request each; use --out-dir ...   ← 真实执行退出 2
     ```
+
     代码注释表明这是有意的（"Delivery-target rules don't bind a --dry-run: it only shows the plan"），但对「先 dry-run 验证再跑」的脚本化用法，dry-run 通过不再等于能跑，而且计划里展示的是一个必被拒绝的目标。
+
   - 方案（两条取舍选一；**所选：检查照常跑（推荐）**）：
     - 检查照常跑：去掉 plan.rs:153 三处的 `!cli.dry_run`。这三条是纯预检、无副作用，`validate_outputs`/`resolve_destinations` 在 dry-run 下本来就照常执行，batch 没有理由例外。代价是 `aido ocr a.png b.png --dry-run`（无 out-dir）从「展示计划」变为退出 2。
     - 保留豁免 + 提示：维持现状，`describe()` 在 `batch` 且交付目标不合法时追加一行「实际执行将拒绝：需 --out-dir」。
