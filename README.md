@@ -38,7 +38,7 @@ aido ask -p "写一首秋天的诗"
 echo hello | aido translate
 ```
 
-`tts` 无需任何配置和 key：只要运行时落到内置的 `openai` provider——完全没有配置文件时正属此类——语音合成默认走免费的 Edge TTS（微软非官方接口，输出 mp3）；文本类任务仍指向 OpenAI 兼容服务，需要 `AIDO_API_KEY`（或 `OPENAI_API_KEY`）。
+`tts` 无需任何配置和 key：只要运行时落到内置的 `openai` provider——完全没有配置文件时正属此类——语音合成默认走免费的 Edge TTS（微软非官方接口，输出 mp3）；文本类任务仍指向 OpenAI 兼容服务，需要 `AIDO_API_KEY`（或 `OPENAI_API_KEY`）。注意：零配置下的这条默认路由会把**合成文本发送到微软的端点**；要改用 OpenAI 的语音接口，需在配置中定义 provider（覆盖内置默认）并配置密钥，让 speech 不落在 `edge-tts` 路由上（详见下文「Edge TTS」）。
 
 ```bash
 aido tts --text "你好，世界" -o hello.mp3
@@ -191,7 +191,7 @@ processor = "ocr-tiles"        # 或 "single"（默认）、"chunk-join" / "chun
 
 ## Edge TTS（免费语音合成）
 
-`tts` 任务除了 OpenAI 兼容的 speech 服务，还内置 `edge-tts` 适配器：走微软 Edge「大声朗读」的非官方接口，无需 API key。只要运行时落到内置的 `openai` provider（完全没有配置文件时正属此类），`aido tts` 默认就走这条免费路径；混用其他服务时也可以显式配置一个只有 speech 路由的 Provider（不需要 `base_url`，端点由适配器持有）：
+`tts` 任务除了 OpenAI 兼容的 speech 服务，还内置 `edge-tts` 适配器：走微软 Edge「大声朗读」的非官方接口，无需 API key。只要运行时落到内置的 `openai` provider（完全没有配置文件时正属此类），`aido tts` 默认就走这条免费路径。**隐私提示**：这是零配置时的默认路由，不是你显式选择的服务——合成文本会原样发送到微软的端点；要改用 OpenAI 的语音接口，需在配置中定义自己的 Provider 并配置密钥（定义即整体覆盖内置的 `openai` Provider），speech 不路由到 `edge-tts` 时自动落回 `openai-speech` 适配器。混用其他服务时也可以显式配置一个只有 speech 路由的 Provider（不需要 `base_url`，端点由适配器持有）：
 
 ```toml
 [providers.edge]

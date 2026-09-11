@@ -266,10 +266,11 @@
   - 方案（※补全）：`check()` 识别 `YOUR_MODEL` 占位并报「未配置模型」。
   - 测试（※补全）：init 后 check → 非 ok。
 
-- [ ] **F24 · 低 · `Cargo.toml:20` · `src/config/mod.rs:160` · edge-tts 没做 feature gate，却成了零配置默认路由**
+- [x] **F24 · 低 · `Cargo.toml:20` · `src/config/mod.rs:160` · edge-tts 没做 feature gate，却成了零配置默认路由**
   - 问题：这个 PR 引入了 29 个新的传递依赖，其中包括 `aws-lc-sys`——一个需要 cmake 才能构建的大型 C/汇编加密库（PR 自己在 Cargo.toml 注释里承认运行时实际用的是 ring，它是被 kothok 的默认特性拖进来的）。所有用户都要付这个构建成本，即使从不用 TTS。另一面是行为：`default_config()` 把 speech 路由到 edge-tts，意味着无配置状态下 `aido tts --text "..."` 会把文本发给微软的非官方端点，用户没有任何显式选择。这值得在 README 里明说，而不只是在配置样例的注释里提一句。
   - 方案（※补全）：kothok 改 `default-features = false` 关掉非必要传递依赖（实现时对照 Cargo.toml 注释确认）；README 明说零配置 TTS 走微软非官方端点（行为 + 隐私）。
   - 验证（※补全）：`cargo tree` 无 aws-lc-sys、测试全绿。
+  - 状态（2026-09-11 修复）：依赖侧经实测**不可行**——`kothok-edge-tts 0.2.10` 自身声明零 feature（`default-features = false` 为 no-op），aws-lc-sys 由它对 `tokio-rustls` 的默认特性传递引入（`tokio-rustls default = [logging, tls12, aws_lc_rs]`），Cargo 无下游关闭他人默认特性的机制；上游 0.2.10 已是最新版。README 已补零配置默认路由的隐私说明与改用 OpenAI 语音的方法（快速开始 + Edge TTS 两节）；测试全绿。
 
 - [ ] **F25 · 低 · PR description · PR 描述里的测试数字过期**
   - 问题：描述写「71 单元 + 71 集成测试」，实际是 116 + 97。后续 4 个 commit 补了测试但没更新描述。
