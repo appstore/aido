@@ -300,7 +300,7 @@
 
 ## 新增问题 F27–F33
 
-- [ ] **F27 · 中 · `src/runner.rs:340` · 批处理把一切非 Complete 回复都报成 "the reply was truncated"，原始原因丢失**
+- [x] **F27 · 中 · `src/runner.rs:340` · 批处理把一切非 Complete 回复都报成 "the reply was truncated"，原始原因丢失**
   - 问题：`truncated` 的判据是 `reply.status != GenerationStatus::Complete`，而 `GenerationStatus` 还有 `Incomplete { reason }`、`Failed`、`Cancelled` 等变体。批处理里这些一律落成固定文案 `"the reply was truncated"`——`Incomplete { reason }` 携带的原始 reason（finish_reason 映射出的真实原因）被丢弃，`Failed`/`Cancelled` 也被误报成「截断」。失败分类与退出码不受影响（都按该 part 失败处理），但诊断信息降级：用户看到「截断」，实际可能是别的原因。
   - 方案：`src/runner.rs:342` 的错误文案从 `reply.status` 取值：`Incomplete { reason }` → 用 reason；`Failed`/`Cancelled` → 变体名；「truncated」只留给真正 length 截断映射出的那类状态。`close_group!` 里「no usable text」的文案不动。
   - 测试：`tests/per_part.rs` 的 `a_truncated_part_fails_alone_and_the_rest_deliver` 改断言具体 reason；加一个 `Failed` 状态的用例断言不出现 "truncated"。

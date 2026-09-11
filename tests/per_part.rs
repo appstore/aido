@@ -448,7 +448,10 @@ fn a_truncated_part_fails_alone_and_the_rest_deliver() {
     );
     let err = out.stderr();
     assert!(err.contains("part 'a.png' failed"), "{err}");
-    assert!(err.contains("truncated"), "{err}");
+    // The failure names the status's own reason (finish_reason "length"),
+    // not a hardcoded "truncated"; the separate token-limit hint may
+    // still say truncated, so match the whole failure line.
+    assert!(err.contains("part 'a.png' failed: length"), "{err}");
 }
 
 #[test]

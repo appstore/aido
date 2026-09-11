@@ -400,6 +400,9 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 }
                 g.requests.push(step.index);
                 let truncated = reply.status != GenerationStatus::Complete;
+                // The status carries the batch failure message, and
+                // `absorb` consumes the reply — read it before the move.
+                let batch_failure = (truncated && batch).then(|| status_failure(&reply.status));
                 absorb(reply, &mut media_artifacts, &mut warnings, &mut overall);
                 if let Some(g) = group.as_mut() {
                     if let Some(gate) = g.gate.as_mut() {
@@ -408,9 +411,8 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 }
                 // In a batch a truncated part fails alone; outside one the
                 // run keeps the pre-batch behavior (recorded, undelivered).
-                if truncated && batch {
+                if let Some(error) = batch_failure {
                     let g = group.take().unwrap();
-                    let error = "the reply was truncated".to_string();
                     let name = part_name(plan, g.id, &g.stem);
                     warnings.push(format!("part '{name}' failed: {error}"));
                     failed_parts.push(FailedPart { name, error });
@@ -491,6 +493,22 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     })
 }
 
+/// The failure message a non-Complete reply earns in a per-part batch:
+/// the status's own reason when it carries one, the variant named in
+/// plain words otherwise. "Truncated" is never guessed here — only a
+/// status that says so itself may report it.
+fn status_failure(status: &GenerationStatus) -> String {
+    match status {
+        GenerationStatus::Incomplete { reason } if !reason.trim().is_empty() => reason.clone(),
+        GenerationStatus::Failed => "the reply failed".to_string(),
+        GenerationStatus::Cancelled => "the reply was cancelled".to_string(),
+        // An empty reason, or a status without one (the adapters never
+        // deliver a Running reply): only "the reply did not finish" is
+        // known.
+        _ => "the reply was incomplete".to_string(),
+    }
+}
+
 fn absorb(
     reply: GenerateResult,
     media_artifacts: &mut Vec<Artifact>,
@@ -518,5 +536,45 @@ fn absorb(
     }));
     if reply.status != GenerationStatus::Complete && *overall == GenerationStatus::Complete {
         *overall = reply.status;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_failure_carries_the_status_own_reason() {
+        assert_eq!(
+            status_failure(&GenerationStatus::Incomplete {
+                reason: "length".into()
+            }),
+            "length"
+        );
+    }
+
+    #[test]
+    fn batch_failure_names_the_variant_not_a_guess() {
+        // Failed and Cancelled are the status's own words — never a
+        // mislabeled "truncated".
+        assert_eq!(
+            status_failure(&GenerationStatus::Failed),
+            "the reply failed"
+        );
+        assert_eq!(
+            status_failure(&GenerationStatus::Cancelled),
+            "the reply was cancelled"
+        );
+        assert!(
+            !status_failure(&GenerationStatus::Failed).contains("truncated")
+                && !status_failure(&GenerationStatus::Cancelled).contains("truncated")
+        );
+        // A status with no usable reason degrades to the generic wording.
+        assert_eq!(
+            status_failure(&GenerationStatus::Incomplete {
+                reason: String::new()
+            }),
+            "the reply was incomplete"
+        );
     }
 }
