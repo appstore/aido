@@ -905,7 +905,13 @@ mod tests {
         // print on stderr is the price of keeping the run's exit a clean
         // usage error.
         let bad = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
-        std::fs::write(dir.join(bad), b"x\n").unwrap();
+        // APFS rejects non-UTF-8 names outright ("Illegal byte sequence"),
+        // so on macOS such a file cannot exist and glob can never hit it;
+        // the catch_unwind guard is exercised on byte-preserving
+        // filesystems (ext4 &c.) only.
+        if std::fs::write(dir.join(bad), b"x\n").is_err() {
+            return;
+        }
         let pattern = format!("{}/*.txt", dir.display());
         let mut e = env(b"", true);
         let err = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap_err();
