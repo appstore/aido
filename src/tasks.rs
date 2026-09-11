@@ -39,17 +39,6 @@ impl Operation {
             _ => None,
         }
     }
-
-    /// The adapter name used when a provider route is not configured
-    /// explicitly; also the key into `[providers.X.routes]`.
-    pub fn default_route(self) -> &'static str {
-        match self {
-            Self::Generate => "openai-chat",
-            Self::Speech => "openai-speech",
-            Self::Transcribe => "openai-transcription",
-            Self::Image => "openai-images",
-        }
-    }
 }
 
 impl std::fmt::Display for Operation {
@@ -118,14 +107,16 @@ impl TaskParam {
         })
     }
 
-    /// The adapter option this parameter maps to for an operation.
-    pub fn maps_to(self) -> &'static str {
+    /// The adapter option this parameter maps to, or None when the
+    /// parameter takes effect in the plan itself (`--to` rewrites the
+    /// instruction; it is not an adapter option).
+    pub fn maps_to(self) -> Option<&'static str> {
         match self {
-            Self::To => "__instruction_suffix", // handled in the plan, not an option
-            Self::Voice => "voice",
-            Self::Speed => "speed",
-            Self::Count => "n",
-            Self::Size => "size",
+            Self::To => None, // handled in the plan, not an option
+            Self::Voice => Some("voice"),
+            Self::Speed => Some("speed"),
+            Self::Count => Some("n"),
+            Self::Size => Some("size"),
         }
     }
 }

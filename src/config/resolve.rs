@@ -29,12 +29,6 @@ impl ParamSource {
     }
 }
 
-#[derive(Debug)]
-pub struct Sourced<T> {
-    pub value: T,
-    pub source: ParamSource,
-}
-
 /// Everything a run needs to talk to a service, plus the input/output
 /// capability envelope after intersecting task and profile constraints.
 #[derive(Debug)]

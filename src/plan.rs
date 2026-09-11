@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::domain::{AppError, AppResult, Destination, InputPart, MediaKind, RunSummary};
 use crate::input::{self, InputEnv};
 use crate::processors::{self, RequestStep};
-use crate::tasks::{ProcessorKind, Task};
+use crate::tasks::{ProcessorKind, Task, TaskParam};
 use std::time::Duration;
 
 /// Terminal-ness injected so plans are testable without a tty.
@@ -330,38 +330,40 @@ fn validate_task_params(cli: &Cli, task: &Task) -> AppResult<()> {
     Ok(())
 }
 
-/// Typed parameters become adapter options (or instruction suffixes).
+/// Typed parameters become adapter options; which option a parameter
+/// drives is `TaskParam::maps_to`. `--to` maps to no option: its effect
+/// is folded into the instruction by `compose_instruction`.
 fn apply_param_options(cli: &Cli, task: &Task, resolved: &mut Resolved) -> AppResult<()> {
-    let mut set = |key: &str, value: serde_json::Value| {
+    for &param in &task.params {
+        let Some(key) = param.maps_to() else {
+            continue; // instruction-level parameter, not an adapter option
+        };
+        let Some(value) = param_value(cli, task, param) else {
+            continue; // not given on the CLI and no task default
+        };
         resolved.options.insert(key.to_string(), value);
-    };
-    if task.accepts_param("voice") {
-        if let Some(voice) = &cli.voice {
-            set("voice", serde_json::Value::String(voice.clone()));
-        } else if let Some(default) = task.default_param("voice") {
-            set("voice", default.clone());
-        }
-    }
-    if task.accepts_param("speed") {
-        if let Some(speed) = cli.speed {
-            set("speed", serde_json::json!(speed));
-        }
-    }
-    if task.accepts_param("count") {
-        if let Some(count) = cli.count {
-            set("n", serde_json::json!(count));
-        }
-    }
-    if task.accepts_param("size") {
-        if let Some(size) = &cli.size {
-            set("size", serde_json::Value::String(size.clone()));
-        }
     }
     resolved
         .adapter
         .validate_options(&resolved.options)
         .map_err(AppError::from)?;
     Ok(())
+}
+
+/// The parameter's value for this run: the CLI flag, else the task's
+/// default (`voice` is the only parameter a task may default).
+fn param_value(cli: &Cli, task: &Task, param: TaskParam) -> Option<serde_json::Value> {
+    match param {
+        TaskParam::To => None, // instruction-level, see maps_to
+        TaskParam::Voice => cli
+            .voice
+            .clone()
+            .map(serde_json::Value::String)
+            .or_else(|| task.default_param("voice").cloned()),
+        TaskParam::Speed => cli.speed.map(|s| serde_json::json!(s)),
+        TaskParam::Count => cli.count.map(|c| serde_json::json!(c)),
+        TaskParam::Size => cli.size.clone().map(serde_json::Value::String),
+    }
 }
 
 /// The fixed instruction with typed parameter effects folded in.

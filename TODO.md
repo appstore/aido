@@ -234,7 +234,7 @@
 
 ## 低 · F18–F26 · 死代码、依赖与文档
 
-- [ ] **F18 · 低 · `resolve.rs:33` · `tasks.rs:115, :45` · 三处死代码**
+- [x] **F18 · 低 · `resolve.rs:33` · `tasks.rs:115, :45` · 三处死代码**
   - 问题：`Sourced<T>` 定义了但全仓无引用；`TaskParam::maps_to()` 声明了参数到适配器 option 的映射，但 `plan.rs` 的 `apply_param_options` 把这套映射又硬编码了一遍；`Operation::default_route()` 同样无调用点（实际用的是 `conventional_adapter`）。三份真相来源里有两份是死的，改一处不会报错但会不一致。
   - 方案（※补全，择一）：
     - **推荐**：让 `apply_param_options` 改用 `maps_to()`，删掉硬编码映射，消除双真相；删掉 `Sourced<T>` 与 `Operation::default_route()`。
