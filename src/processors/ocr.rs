@@ -7,7 +7,7 @@
 //! those limits; slice replies merge at their boundaries, removing only
 //! lines the overlap bands genuinely duplicated.
 
-use super::{synthetic_text, RequestStep, StepRole};
+use super::{carry_guard, step_material, synthetic_text, RequestStep, StepRole};
 use crate::api::image_as_png;
 use crate::domain::{InputPart, MediaKind};
 use anyhow::{Context, Result};
@@ -35,19 +35,21 @@ const MERGE_WINDOW: usize = 3;
 pub const SLICE_NOTE: &str = "This image is one slice of a taller image that was \
      split so its text stays legible; process only what is visible in this slice.";
 
-/// Plan the request sequence: unsliced material travels with the first
-/// request, each tall image's slices follow in order, and every slice
-/// request carries the task's instruction (the runner re-attaches it).
-/// `quiet` suppresses the split note on stderr.
+/// Plan the request sequence: unsliced material rides with every slice's
+/// request in command-line order while it fits the carry budget
+/// ([`carry_guard`]); past it, the material travels with the first request
+/// only. Each tall image's slices follow in order, and every slice request
+/// carries the task's instruction (the runner re-attaches it). `quiet`
+/// suppresses the split note on stderr.
 pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
     let mut untouched: Vec<InputPart> = Vec::new();
-    // (image name, slices, per-slice hard flags): flag i marks the
+    // (source part, slices, per-slice hard flags): flag i marks the
     // boundary after slice i, whose overlap band slice i+1 re-shows.
-    let mut sliced: Vec<(String, Vec<InputPart>, Vec<bool>)> = Vec::new();
+    let mut sliced: Vec<(&InputPart, Vec<InputPart>, Vec<bool>)> = Vec::new();
     for part in inputs {
         if part.kind == MediaKind::Image {
             if let Some((chunks, hard_flags)) = slice_if_tall(part, quiet)? {
-                sliced.push((part.name.clone(), chunks, hard_flags));
+                sliced.push((part, chunks, hard_flags));
                 continue;
             }
         }
@@ -64,24 +66,28 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             role: StepRole::Map,
         }]);
     }
+    let split: Vec<&InputPart> = sliced.iter().map(|(part, _, _)| *part).collect();
+    let carry_every = carry_guard(&untouched, quiet);
 
     let mut steps = Vec::new();
-    for (image_name, chunks, hard_flags) in sliced {
+    for (source, chunks, hard_flags) in &sliced {
+        let part = *source;
         let total = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let first = steps.is_empty();
+        for (i, chunk) in chunks.iter().enumerate() {
             let mut step_inputs = Vec::new();
-            if first {
-                step_inputs.extend(untouched.iter().cloned());
-                untouched.clear();
-            } else {
+            if !steps.is_empty() {
                 step_inputs.push(synthetic_text(usize::MAX, "slice note", SLICE_NOTE));
             }
-            step_inputs.push(chunk);
+            // Real material keeps the command-line order, this slice
+            // standing in at its source part's position. Unsliced material
+            // rides with every slice while it fits the budget; past it,
+            // only the run's first request carries it.
+            let carry = steps.is_empty() || carry_every;
+            step_inputs.extend(step_material(inputs, part, chunk.clone(), &split, carry));
             steps.push(RequestStep {
                 index: steps.len(),
                 inputs: step_inputs,
-                label: format!("slice {}/{} of {image_name}", i + 1, total),
+                label: format!("slice {}/{} of {}", i + 1, total, part.name),
                 // The merge gate may only compare at a boundary that
                 // re-shows an overlap band: cut i's hardness belongs to
                 // the step whose bottom edge it cuts, and a tail slice
@@ -450,6 +456,18 @@ mod tests {
         }
     }
 
+    fn text_part(text: &str) -> InputPart {
+        InputPart {
+            id: 9,
+            source: InputSource::Literal,
+            name: "notes".into(),
+            kind: MediaKind::Text,
+            unknown_kind: false,
+            mime: "text/plain".into(),
+            content: InputContent::Text(text.into()),
+        }
+    }
+
     fn dims(png: &[u8]) -> (u32, u32) {
         let img = image::load_from_memory(png).unwrap();
         use image::GenericImageView as _;
@@ -494,18 +512,46 @@ mod tests {
     }
 
     #[test]
-    fn unsliced_material_travels_with_the_first_slice() {
+    fn unsliced_material_travels_with_every_slice_in_order() {
         let inputs = vec![
             image_part(solid_png(100, 500)),
             image_part(striped_png(100, 3200)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].inputs.len(), 2);
-        assert_eq!(steps[1].inputs.len(), 2); // slice note + slice
+        for (i, step) in steps.iter().enumerate() {
+            let names: Vec<&str> = step.inputs.iter().map(|p| p.name.as_str()).collect();
+            let short = names.iter().position(|n| *n == "long.png").unwrap();
+            let slice = names.iter().position(|n| n.contains("[slice ")).unwrap();
+            assert!(short < slice, "step {i}: {names:?}");
+        }
+        // Later slices explain themselves with the note, ahead of the
+        // carried material.
         assert!(steps[1].inputs[0]
             .text()
             .is_some_and(|t| t.contains("slice")));
+    }
+
+    #[test]
+    fn text_material_rides_with_every_slice_until_over_budget() {
+        let small = vec![
+            image_part(striped_png(100, 3200)),
+            text_part("see headers only"),
+        ];
+        let steps = plan_steps(&small, true).unwrap();
+        assert_eq!(steps.len(), 2);
+        for step in &steps {
+            assert!(
+                step.inputs.iter().any(|p| p.name == "notes"),
+                "every slice request must see the text material"
+            );
+        }
+        // Over the carry budget: the text rides with the first request only.
+        let big = "词".repeat(super::super::MAX_CARRY_CHARS + 1);
+        let over = vec![text_part(&big), image_part(striped_png(100, 3200))];
+        let steps = plan_steps(&over, true).unwrap();
+        assert!(steps[0].inputs.iter().any(|p| p.name == "notes"));
+        assert!(!steps[1].inputs.iter().any(|p| p.name == "notes"));
     }
 
     #[test]

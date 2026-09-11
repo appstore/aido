@@ -156,7 +156,7 @@
 
   - 测试：`tests/config.rs` 增加「`base_url` 含 `user:pw@` → dry-run 输出不含 `pw`」。
 
-- [ ] **F09 · 中 · `src/processors/ocr.rs:71` · `src/processors/chunk.rs:76` · 未被切分的材料只进第一个请求**
+- [x] **F09 · 中 · `src/processors/ocr.rs:71` · `src/processors/chunk.rs:76` · 未被切分的材料只进第一个请求**
   - 问题：两个处理器都把「没被切分的那些输入」（untouched）整体塞进第 0 步，后续分块只带上下文摘要。
 
     ```console

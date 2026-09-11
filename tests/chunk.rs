@@ -232,3 +232,162 @@ fn dry_run_shows_the_chunk_plan_without_requesting() {
     // The reduce step appears in the planned sequence.
     assert!(stdout.contains("; consolidate 2 chunks"), "{stdout}");
 }
+
+#[test]
+fn glossary_travels_with_every_chunk_in_command_line_order() {
+    // The "one document as context to process another" case: the glossary
+    // is unsliced, so it must ride with every chunk's request — in the
+    // order the user listed it, ahead of the long document.
+    let glossary = temp_file("术语表.md", "术语：aido=助手；chunk=分块。".as_bytes());
+    let book = temp_file("长文.md", three_chunk_text().as_bytes());
+    let server = MultiServer::start(&[
+        chat_body("第一块的摘要"),
+        chat_body("第二块的摘要"),
+        chat_body("第三块的摘要"),
+        chat_body("整篇的最终摘要"),
+    ]);
+    let cfg = chunk_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--no-stream",
+            glossary.to_str().unwrap(),
+            book.to_str().unwrap(),
+        ],
+        &[],
+        cfg,
+    );
+    out.assert_code(0);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4, "three map requests plus one reduce");
+    for (i, raw) in requests.iter().take(3).enumerate() {
+        let material = request_json(raw)["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            material.contains("aido=助手"),
+            "chunk {} never sees the glossary: {material}",
+            i + 1
+        );
+        // Command-line order in every request: glossary first, chunk after.
+        let glossary_at = material.find("aido=助手").unwrap();
+        let chunk_at = material
+            .find(&format!("长文.md [chunk {}/3]", i + 1))
+            .unwrap();
+        assert!(
+            glossary_at < chunk_at,
+            "chunk {}: material order wrong: {material}",
+            i + 1
+        );
+    }
+    // The untouched material rides with the map requests only; the reduce
+    // step's material is the collected map replies.
+    let reduce = request_json(&requests[3])["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!reduce.contains("aido=助手"), "{reduce}");
+}
+
+#[test]
+fn material_order_follows_the_command_line_when_the_document_is_first() {
+    // Reversed command line: every request carries the chunk first and the
+    // glossary behind it, matching how the user listed the inputs.
+    let book = temp_file("长文.md", three_chunk_text().as_bytes());
+    let glossary = temp_file("术语表.md", "术语：aido=助手。".as_bytes());
+    let server = MultiServer::start(&[
+        chat_body("第一块的摘要"),
+        chat_body("第二块的摘要"),
+        chat_body("第三块的摘要"),
+        chat_body("整篇的最终摘要"),
+    ]);
+    let cfg = chunk_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--no-stream",
+            book.to_str().unwrap(),
+            glossary.to_str().unwrap(),
+        ],
+        &[],
+        cfg,
+    );
+    out.assert_code(0);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    for (i, raw) in requests.iter().take(3).enumerate() {
+        let material = request_json(raw)["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            material.contains("aido=助手"),
+            "chunk {}: {material}",
+            i + 1
+        );
+        let glossary_at = material.find("aido=助手").unwrap();
+        let chunk_at = material
+            .find(&format!("长文.md [chunk {}/3]", i + 1))
+            .unwrap();
+        assert!(
+            chunk_at < glossary_at,
+            "chunk {}: material order wrong: {material}",
+            i + 1
+        );
+    }
+}
+
+#[test]
+fn oversized_glossary_falls_back_to_the_first_request_only() {
+    // A context file over half the chunk budget (>2000 chars) but under
+    // the chunking target (<4000) stays unsliced, yet repeating it in
+    // every request would cost more tokens than it is worth: it rides
+    // with the first request only, and stderr says why.
+    let glossary = format!("术语表：aido=助手。{}", "词".repeat(2400));
+    let book = temp_file("长文.md", three_chunk_text().as_bytes());
+    let server = MultiServer::start(&[
+        chat_body("第一块的译文"),
+        chat_body("第二块的译文"),
+        chat_body("第三块的译文"),
+    ]);
+    let cfg = chunk_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--text",
+            &glossary,
+            book.to_str().unwrap(),
+        ],
+        &[],
+        cfg,
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(err.contains("travels with the first request only"), "{err}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let first = request_json(&requests[0])["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(first.contains("aido=助手"), "{first}");
+    for (i, raw) in requests.iter().enumerate().skip(1) {
+        let material = request_json(raw)["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !material.contains("aido=助手"),
+            "chunk {} must not repeat the oversized material: {material}",
+            i + 1
+        );
+    }
+}

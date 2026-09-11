@@ -21,14 +21,14 @@
 //! each time. With context carry the outputs never repeat, so the join
 //! step of `chunk-join` is a plain join with a paragraph break.
 
-use super::{synthetic_text, RequestStep, StepRole};
+use super::{carry_guard, step_material, synthetic_text, RequestStep, StepRole};
 use crate::domain::{InputContent, InputPart, MediaKind};
 use anyhow::Result;
 
 /// Packing target per chunk, in characters — not bytes, which would make
 /// CJK chunks three times smaller than Latin ones for the same token
 /// budget (CJK is roughly one token per char; Latin roughly four chars).
-const TARGET_CHUNK_CHARS: usize = 4000;
+pub(crate) const TARGET_CHUNK_CHARS: usize = 4000;
 /// A tail chunk smaller than this folds into the previous chunk instead.
 const MIN_TAIL_CHARS: usize = 500;
 /// Context excerpt from the previous chunk, shown to every later chunk.
@@ -54,9 +54,10 @@ pub const REDUCE_NOTE: &str = "This material is the per-chunk results of one lon
 const CONTEXT_NOTE: &str = "Context from the end of the previous chunk, for continuity \
      only — do not process or output it:";
 
-/// Plan the chunk-join sequence: unsliced material travels with the first
-/// chunk's request, each oversized text part's chunks follow in order, and
-/// `quiet` suppresses the split note on stderr.
+/// Plan the chunk-join sequence: unsliced material rides with every
+/// chunk's request in command-line order while it fits the carry budget,
+/// each oversized text part's chunks follow in order, and `quiet`
+/// suppresses the split note on stderr.
 pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
     plan_map_steps(inputs, quiet, CHUNK_NOTE)
 }
@@ -86,10 +87,13 @@ pub fn plan_steps_reduce(inputs: &[InputPart], quiet: bool) -> Result<Vec<Reques
     Ok(steps)
 }
 
-/// The map phase shared by both strategies: unsliced material travels
-/// with the first chunk's request, each oversized text part's chunks
-/// follow in order, and every step after the first explains itself with
-/// `note`. `quiet` suppresses the split note on stderr.
+/// The map phase shared by both strategies: unsliced material rides with
+/// every chunk's request — in command-line order, the chunk standing in
+/// at its source part's position — while it fits the carry budget
+/// ([`carry_guard`]); past it, the material travels with the first
+/// request only. Each oversized text part's chunks follow in order, and
+/// every step after the first explains itself with `note`. `quiet`
+/// suppresses the split notes on stderr.
 fn plan_map_steps(inputs: &[InputPart], quiet: bool, note: &str) -> Result<Vec<RequestStep>> {
     let mut untouched: Vec<InputPart> = Vec::new();
     let mut chunked: Vec<(&InputPart, Vec<String>)> = Vec::new();
@@ -121,15 +125,16 @@ fn plan_map_steps(inputs: &[InputPart], quiet: bool, note: &str) -> Result<Vec<R
             role: StepRole::Map,
         }]);
     }
+    let split: Vec<&InputPart> = chunked.iter().map(|(part, _)| *part).collect();
+    let carry_every = carry_guard(&untouched, quiet);
 
     let mut steps = Vec::new();
-    for (part, chunks) in chunked {
+    for (source, chunks) in &chunked {
+        let part = *source;
         let total = chunks.len();
         for (i, chunk_text) in chunks.iter().enumerate() {
             let mut step_inputs = Vec::new();
-            if steps.is_empty() {
-                step_inputs.append(&mut untouched);
-            } else {
+            if !steps.is_empty() {
                 step_inputs.push(synthetic_text(usize::MAX, "chunk note", note));
             }
             if i > 0 {
@@ -140,7 +145,13 @@ fn plan_map_steps(inputs: &[InputPart], quiet: bool, note: &str) -> Result<Vec<R
                     &format!("{CONTEXT_NOTE}\n\n{context}"),
                 ));
             }
-            step_inputs.push(chunk_part(part, i, total, chunk_text));
+            // Real material keeps the command-line order, this chunk
+            // standing in at its source part's position. Unsliced material
+            // rides with every chunk while it fits the budget; past it,
+            // only the run's first request carries it.
+            let carry = steps.is_empty() || carry_every;
+            let chunk = chunk_part(part, i, total, chunk_text);
+            step_inputs.extend(step_material(inputs, part, chunk, &split, carry));
             steps.push(RequestStep {
                 index: steps.len(),
                 inputs: step_inputs,
@@ -609,16 +620,101 @@ mod tests {
     }
 
     #[test]
-    fn unsliced_material_travels_with_the_first_chunk() {
+    fn unsliced_material_travels_with_every_chunk_in_order() {
         let inputs = vec![
             text_part("small.txt", "hello"),
             text_part("book.txt", &para(600)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert!(steps.len() >= 3);
-        assert_eq!(steps[0].inputs.len(), 2);
+        for (i, step) in steps.iter().enumerate() {
+            let names: Vec<&str> = step.inputs.iter().map(|p| p.name.as_str()).collect();
+            let small = names.iter().position(|n| *n == "small.txt").unwrap();
+            let chunk = names
+                .iter()
+                .position(|n| n.starts_with("book.txt [chunk "))
+                .unwrap();
+            assert!(small < chunk, "step {i}: {names:?}");
+        }
         assert_eq!(steps[0].inputs[0].name, "small.txt");
+        // Notes stay ahead of the real material on later steps.
         assert!(steps[1].inputs[0].text().unwrap().contains("chunk"));
+    }
+
+    #[test]
+    fn material_order_follows_the_command_line() {
+        // The long document listed first: its chunk keeps the front spot in
+        // every request, the glossary rides behind it.
+        let inputs = vec![
+            text_part("book.txt", &para(600)),
+            text_part("gloss.txt", "terms"),
+        ];
+        let steps = plan_steps(&inputs, true).unwrap();
+        for (i, step) in steps.iter().enumerate() {
+            let names: Vec<&str> = step.inputs.iter().map(|p| p.name.as_str()).collect();
+            let gloss = names.iter().position(|n| *n == "gloss.txt").unwrap();
+            let chunk = names
+                .iter()
+                .position(|n| n.starts_with("book.txt [chunk "))
+                .unwrap();
+            assert!(chunk < gloss, "step {i}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_unsliced_material_rides_with_the_first_chunk_only() {
+        // Over the carry budget, under the chunk target: too big to repeat
+        // in every request, too small to be chunked itself.
+        let glossary = "词".repeat(super::super::MAX_CARRY_CHARS + 1);
+        assert!(char_len(&glossary) < TARGET_CHUNK_CHARS);
+        let inputs = vec![
+            text_part("gloss.txt", &glossary),
+            text_part("book.txt", &para(600)),
+        ];
+        let steps = plan_steps(&inputs, true).unwrap();
+        assert!(steps.len() >= 3);
+        assert_eq!(steps[0].inputs[0].name, "gloss.txt");
+        for (i, step) in steps.iter().enumerate().skip(1) {
+            assert!(
+                !step.inputs.iter().any(|p| p.name == "gloss.txt"),
+                "step {i} must not repeat the oversized material"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_chunked_part_travels_in_its_own_steps_only() {
+        let inputs = vec![
+            text_part("a.txt", &para(600)),
+            text_part("shared.txt", "hello"),
+            text_part("b.txt", &para(600)),
+        ];
+        let steps = plan_steps(&inputs, true).unwrap();
+        let mut seen_b = false;
+        for step in &steps {
+            let names: Vec<&str> = step.inputs.iter().map(|p| p.name.as_str()).collect();
+            let has_a = names.iter().any(|n| n.starts_with("a.txt [chunk "));
+            let has_b = names.iter().any(|n| n.starts_with("b.txt [chunk "));
+            assert!(
+                has_a ^ has_b,
+                "exactly one chunked part's chunk per request: {names:?}"
+            );
+            assert!(names.contains(&"shared.txt"), "{names:?}");
+            if has_b {
+                seen_b = true;
+                // Command-line order: b's chunk stands at b's position,
+                // behind the shared material listed before it.
+                let shared = names.iter().position(|n| *n == "shared.txt").unwrap();
+                let chunk = names
+                    .iter()
+                    .position(|n| n.starts_with("b.txt [chunk "))
+                    .unwrap();
+                assert!(shared < chunk, "{names:?}");
+            } else {
+                assert!(!seen_b, "a's steps must all precede b's: {names:?}");
+            }
+        }
+        assert!(seen_b);
     }
 
     #[test]
