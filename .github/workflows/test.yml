@@ -50,6 +50,19 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # 已知的可接受技术债：kothok-edge-tts 经由其 tokio-rustls 依赖的默认
+      # 特性把 aws-lc-sys（源码构建需要 cmake）拉进依赖树，运行时 TLS 实际
+      # 用 ring。本步骤不拦截构建：aws-lc-rs 在树里时发 warning 注解；
+      # 哪天它消失（上游修正），提醒移除本检查和 README 的 cmake 说明。
+      - name: Dependency tree report (aws-lc-rs)
+        if: runner.os == 'Linux'
+        run: |
+          if cargo tree --locked -i aws-lc-rs; then
+            echo "::warning::aws-lc-rs is in the dependency tree (via kothok-edge-tts → tokio-rustls default features). Runtime TLS uses ring; source builds need cmake. Accepted tech debt — see README."
+          else
+            echo "::notice::aws-lc-rs has left the dependency tree (upstream fixed?). Update the README build note and remove this check."
+          fi
+
   msrv:
     # 验证 Cargo.toml 声明的 rust-version 真的能编译（--locked 锁定依赖版本，防止依赖漂移掩盖问题）
     name: msrv

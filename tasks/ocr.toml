@@ -1,0 +1,17 @@
+operation = "generate"
+instruction = """
+Extract all text from the image (OCR).
+Rules:
+- Transcribe faithfully; do not translate or summarize.
+- Preserve the original language, line structure and markdown formatting (headings, lists, tables, code blocks) where recognizable.
+- Output only the extracted text. Do not wrap the whole output in code fences, and add no commentary.
+"""
+input_types = ["text", "image"]
+required_types = ["image"]
+output_types = ["text"]
+# Tall screenshots are sliced into legibility-sized requests; replies merge
+# at slice boundaries. Disable per-run with --no-split.
+processor = "ocr-tiles"
+# Multiple images become one request sequence (and one result file) per
+# image — out/a.png lands as out/a.txt. Requires --out-dir.
+per_part = true

@@ -1,0 +1,7 @@
+# Text input is the content to speak. Instructions (task or -p) go to the
+# speech service's instructions channel, never into the spoken text.
+operation = "speech"
+input_types = ["text"]
+required_types = ["text"]
+output_types = ["audio"]
+params = ["voice", "speed"]
