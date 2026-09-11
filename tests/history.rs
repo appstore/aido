@@ -289,6 +289,14 @@ fn history_list_numbers_newest_first_and_show_takes_an_index() {
         .unwrap_or_else(|e| panic!("--json report: {e}; stdout: {}", out.stdout()));
     assert_eq!(report["run_id"], newest);
 
+    // and flags after the operand as well: the normalizer hoists them in
+    // front of the management words, so the same top-level flag set applies
+    let out = run(&["history", "show", "1", "--json"], b"", &envs);
+    out.assert_code(0);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("--json report: {e}; stdout: {}", out.stdout()));
+    assert_eq!(report["run_id"], newest);
+
     // bad indexes
     let out = run(&["history", "show", "0"], b"", &envs);
     out.assert_code(2);

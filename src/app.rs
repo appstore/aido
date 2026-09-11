@@ -489,16 +489,7 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
             }
             Ok(())
         }
-        HistoryCmd::Show {
-            target,
-            output,
-            out_dir,
-            copy,
-            stdout,
-            json,
-            overwrite,
-            quiet,
-        } => {
+        HistoryCmd::Show { target } => {
             let record = resolve_run(target)?;
             if !record.generation.is_complete() {
                 println!(
@@ -510,18 +501,10 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
                 );
                 return Ok(());
             }
-            // The subcommand's own flags win; the same flags placed before
-            // the management word (`aido --copy history show 1`) count too.
-            let options = RestoreOptions {
-                output: output.clone().or_else(|| cli.output.clone()),
-                out_dir: out_dir.clone().or_else(|| cli.out_dir.clone()),
-                stdout: *stdout || cli.stdout,
-                json: *json || cli.json,
-                copy: *copy || cli.copy,
-                overwrite: *overwrite || cli.overwrite,
-                quiet: *quiet || cli.quiet,
-            };
-            deliver_restored(&options, record).await
+            // The normalizer hoists flags ahead of the management words, so
+            // clap assigned them to the top-level `Cli`; that is the single
+            // source of truth here, exactly as for `last`.
+            deliver_restored(&RestoreOptions::from_cli(cli), record).await
         }
     }
 }

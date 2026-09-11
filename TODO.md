@@ -210,7 +210,7 @@
     - **删掉**：如果暂时没有消费方，就从 `Artifact` 和 manifest 里移除，等真正需要溯源时再加。
   - 测试：多请求运行的 artifact provenance 指向真实请求序号；单请求运行指向 `Request { index: 0 }`；切片合并运行指向 `Merged`。
 
-- [ ] **F15 · 中 · `src/cli.rs:684-726` · `src/app.rs:405` · `history show` 子命令自带的旗标字段永远是假**
+- [x] **F15 · 中 · `src/cli.rs:684-726` · `src/app.rs:405` · `history show` 子命令自带的旗标字段永远是假**
   - 问题：normalize 的设计是把所有 flag 收进 rest、再把管理命令的词追加到末尾。所以 clap 拿到的永远是 `[--copy, history, show, 1]`——`--copy` 被顶层 `Cli` 吃掉，`HistoryCmd::Show` 那 7 个 `#[arg]` 字段在结构上不可能被赋值。功能上没坏，因为 `app.rs:405` 用 `output.or_else(|| cli.output)` 做了兜底。但这是个陷阱：后面谁往 `Show` 加一个新旗标、忘了同步加兜底，它就会静默失效，而代码看起来完全正常。
   - 方案（※补全，择一）：
     - **推荐**：删掉 `HistoryCmd::Show` 上结构性不可达的 7 个 `#[arg]` 字段，统一走顶层 `Cli` 的旗标，`app.rs:405` 的 `or_else` 兜底改为直接读 `cli.output`，消除双真相。这样新增旗标只有一个来源。
