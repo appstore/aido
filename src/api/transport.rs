@@ -59,6 +59,41 @@ pub fn normalize_base_url(input: &str) -> Result<String> {
     Ok(url.into())
 }
 
+/// The cleartext hint, when a run would put its API key on the wire
+/// unencrypted: base_url is plain http, a key is configured, and the host
+/// is not this machine. Local inference servers are legitimately http, so
+/// loopback hosts are exempt. Shared with the `--dry-run` plan, which
+/// never builds a client and must hint at the same exposure.
+pub fn cleartext_key_warning(base_url: Option<&str>, api_key_present: bool) -> Option<String> {
+    if !api_key_present {
+        return None;
+    }
+    let url = reqwest::Url::parse(base_url?).ok()?;
+    if url.scheme() != "http" || is_loopback_host(&url) {
+        return None;
+    }
+    Some(format!(
+        "credentials will be sent in cleartext to {} (base_url uses http://)",
+        url.host_str().unwrap_or("(unknown host)")
+    ))
+}
+
+/// Loopback hosts: the `localhost` name and any loopback IPv4/IPv6
+/// address — the whole 127.0.0.0/8 block and ::1. The URL serializer
+/// hands IPv6 literals over with their brackets (`[::1]`).
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some(host) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        None => false,
+    }
+}
+
 /// Everything the client needs to reach a service. Credentials are
 /// resolved by the caller at send time and never logged. `base_url` is
 /// `None` for adapters that own their endpoint (edge-tts).
@@ -92,6 +127,14 @@ impl Client {
                     .context("provider has no base URL")?,
             )?),
         };
+        // One non-blocking hint per run: a key over plain http off this
+        // machine would leave in cleartext.
+        if let Some(warning) = cleartext_key_warning(
+            base_url.as_ref().map(reqwest::Url::as_str),
+            conn.api_key.is_some(),
+        ) {
+            eprintln!("warning: {warning}");
+        }
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("aido/", env!("CARGO_PKG_VERSION")))
@@ -358,5 +401,31 @@ mod tests {
         );
         assert!(normalize_base_url("file:///tmp/api").is_err());
         assert!(normalize_base_url("https://example.com/#x").is_err());
+    }
+
+    #[test]
+    fn cleartext_warning_names_the_host_off_loopback() {
+        let warning = cleartext_key_warning(Some("http://gw.internal:8080/v1"), true).unwrap();
+        assert!(warning.contains("cleartext"), "{warning}");
+        assert!(warning.contains("gw.internal"), "{warning}");
+    }
+
+    #[test]
+    fn cleartext_warning_spares_loopback_https_and_keyless() {
+        for url in [
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            // The whole 127.0.0.0/8 block is loopback, not just .0.0.1.
+            "http://127.250.1.9/v1",
+            "http://[::1]:8080/v1",
+            "https://gw.internal/v1",
+        ] {
+            assert!(
+                cleartext_key_warning(Some(url), true).is_none(),
+                "{url} must not warn"
+            );
+        }
+        assert!(cleartext_key_warning(Some("http://gw.internal/v1"), false).is_none());
+        assert!(cleartext_key_warning(None, true).is_none());
     }
 }

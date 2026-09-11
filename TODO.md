@@ -275,7 +275,7 @@
   - 问题：描述写「71 单元 + 71 集成测试」，实际是 116 + 97。后续 4 个 commit 补了测试但没更新描述。
   - 处置（※补全）：PR #25 已合并（`50c6559`），PR 描述本身无处再改；记录实际数字即可（追加审阅时点为 146 单元 + 121 集成 = 267 全绿）。
 
-- [ ] **F26 · 低 · `src/api/transport.rs:47` · `http://` 的远程 `base_url` 会明文发送 API key，无任何提示**
+- [x] **F26 · 低 · `src/api/transport.rs:47` · `http://` 的远程 `base_url` 会明文发送 API key，无任何提示**
   - 问题：`normalize_base_url` 接受 http 是对的（本地推理服务器就是 http）。但对非 loopback 的 http 地址，密钥走 Authorization 头明文出去，连一行 warning 都没有。
   - 方案：`transport.rs` 在 `Client::new` 里（而不是 `normalize_base_url` 里，那是纯函数）判断：scheme 为 http、host 不是 localhost/127.0.0.0/8/::1、且 `api_key.is_some()` → stderr 一行 `warning: 凭据将以明文发送到 {host}（base_url 用的是 http://）`。不阻断，只提示。`plan::describe` 里也加一行同样的提醒，让 dry-run 就能看到。
   - 测试（※补全）：http 非 loopback + key → dry-run 输出含 warning。

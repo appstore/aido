@@ -688,6 +688,13 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         "provider:    {} → {} (route: {})\n",
         r.provider_name, shown_url, r.adapter
     ));
+    // The dry-run never builds a client, so the cleartext-credential
+    // hint fires here too, under the same conditions the client uses.
+    if let Some(warning) =
+        crate::api::cleartext_key_warning(r.base_url.as_deref(), api_key_present(r))
+    {
+        out.push_str(&format!("warning:     {warning}\n"));
+    }
     out.push_str(&format!("model:       {}\n", r.model));
     if !plan.instruction.is_empty() {
         out.push_str(&format!("instruction: {}\n", first_line(&plan.instruction)));
@@ -836,6 +843,20 @@ fn first_line(s: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// Whether the run would actually carry a key: the provider's env var is
+/// set and non-empty, with the conventional OpenAI name as a fallback for
+/// the default provider — the same resolution the client's caller uses.
+fn api_key_present(resolved: &Resolved) -> bool {
+    fn env_nonempty(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    }
+    resolved.api_key_env.as_deref().is_some_and(|name| {
+        env_nonempty(name) || (name == "AIDO_API_KEY" && env_nonempty("OPENAI_API_KEY"))
+    })
 }
 
 fn human_bytes(n: u64) -> String {

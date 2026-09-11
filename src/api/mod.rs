@@ -10,7 +10,7 @@ use crate::domain::{Artifact, GenerationStatus, InputPart, MediaKind};
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
-pub use transport::{normalize_base_url, Client, Connection};
+pub use transport::{cleartext_key_warning, normalize_base_url, Client, Connection};
 
 pub type MediaMode = MediaKind;
 

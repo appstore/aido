@@ -365,6 +365,74 @@ fn dry_run_hides_credentials_embedded_in_the_base_url() {
 }
 
 #[test]
+fn dry_run_warns_when_a_key_would_traverse_plain_http() {
+    // A non-loopback http base_url would carry the key in cleartext; the
+    // plan names the host instead of letting the run happen unwarned.
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://gw.internal:8080/v1\"\napi_key_env = \"MY_KEY\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "-",
+            "--dry-run",
+        ],
+        b"piped notes\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("MY_KEY", "sk-test"),
+        ],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("credentials will be sent in cleartext to gw.internal"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("base_url uses http://"), "{stdout}");
+}
+
+#[test]
+fn dry_run_spares_loopback_http_and_https_from_the_cleartext_warning() {
+    // Local inference servers are legitimately http (loopback is exempt),
+    // and https encrypts the key everywhere.
+    let file = temp_file("notes.md", b"material\n");
+    for base in [
+        "http://127.0.0.1:8080/v1",
+        "http://localhost:8080/v1",
+        "https://gw.internal:8080/v1",
+    ] {
+        let cfg = settings_config(&format!(
+            "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+             [providers.srv]\nbase_url = \"{base}\"\napi_key_env = \"MY_KEY\""
+        ));
+        let out = run(
+            &[
+                "summarize",
+                "--profile",
+                "test",
+                file.to_str().unwrap(),
+                "-",
+                "--dry-run",
+            ],
+            b"piped notes\n",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("MY_KEY", "sk-test"),
+            ],
+        );
+        out.assert_code(0);
+        let stdout = out.stdout();
+        assert!(!stdout.contains("cleartext"), "{base}: {stdout}");
+    }
+}
+
+#[test]
 fn config_check_flags_route_keys_that_are_not_operations() {
     // A typo'd route key (`speach`) would silently fall back to the
     // conventional adapter; `config check` must name it.
