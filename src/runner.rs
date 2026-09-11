@@ -209,7 +209,11 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     struct Group {
         id: Option<usize>,
         stem: String,
-        first_index: usize,
+        /// Every request whose reply feeds this group's artifact, in step
+        /// order. A reduce group holds only its reduce request: the map
+        /// replies are intermediate material, so the artifact names the
+        /// one request that produced it.
+        requests: Vec<usize>,
         sink: Rc<RefCell<DeltaSink>>,
         gate: Option<SliceMerger>,
         /// A reduce run's per-map-step replies, in step order: the reduce
@@ -238,15 +242,21 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             let merged = g.sink.borrow();
             total_chars += merged.chars_seen;
             if !merged.merged.is_empty() {
+                // One reply is that request's artifact; several joined
+                // replies name every request they merged, in order.
+                let provenance = match g.requests.as_slice() {
+                    [only] => Provenance::Request { index: *only },
+                    many => Provenance::Merged {
+                        requests: many.to_vec(),
+                    },
+                };
                 $artifacts.push(Artifact {
                     id: g.stem.clone(),
                     kind: MediaKind::Text,
                     mime: "text/plain".into(),
                     format: "text".into(),
                     bytes: merged.merged.clone().into_bytes(),
-                    provenance: Provenance::Request {
-                        index: g.first_index,
-                    },
+                    provenance,
                 });
             } else if g.id.is_some() {
                 let name = part_name(plan, g.id, &g.stem);
@@ -303,7 +313,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             group = Some(Group {
                 id: step.part,
                 stem: step.artifact_stem.clone().unwrap_or_else(|| "text".into()),
-                first_index: step.index,
+                requests: Vec::new(),
                 sink,
                 gate,
                 sections: Vec::new(),
@@ -314,11 +324,6 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // only the reduce reply streams live.
         if reduce_plan && step.role == StepRole::Map {
             group.as_mut().unwrap().sections.push(String::new());
-        }
-        // The group's artifact is the reduce reply, so its provenance
-        // names the reduce request, not the first map request.
-        if step.role == StepRole::Reduce {
-            group.as_mut().unwrap().first_index = step.index;
         }
         if !plan.quiet {
             let label = if plan.steps.len() > 1 {
@@ -376,13 +381,24 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             client.generate(&request).await
         };
         match result {
-            Ok(reply) => {
+            Ok(mut reply) => {
                 steps_done += 1;
+                // The reply learns which request it answered only here:
+                // an adapter saw one exchange, never the run.
+                reply.request_index = step.index;
                 // A buffered reply arrives whole: run it through the same
                 // path the deltas would take.
                 if !plan.transport_stream && !reply.text.is_empty() {
                     on_delta(&reply.text.clone());
                 }
+                // The reply is in, so the group records its request. A
+                // reduce group keeps only the reduce request: its artifact
+                // is the consolidation, not the map replies it consumed.
+                let g = group.as_mut().unwrap();
+                if step.role == StepRole::Reduce {
+                    g.requests.clear();
+                }
+                g.requests.push(step.index);
                 let truncated = reply.status != GenerationStatus::Complete;
                 absorb(reply, &mut media_artifacts, &mut warnings, &mut overall);
                 if let Some(g) = group.as_mut() {
@@ -452,11 +468,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     }
 
     // Media artifacts keep their global promotion: a batch task produces
-    // text per part; media stays an aggregate of the run.
+    // text per part; media stays an aggregate of the run. Provenance came
+    // with the reply (which request produced it); the run-wide id is
+    // assigned here.
     for (i, artifact) in media_artifacts.into_iter().enumerate() {
         artifacts.push(Artifact {
             id: format!("{}-{}", artifact.kind, i + 1),
-            provenance: Provenance::Request { index: 0 },
             ..artifact
         });
     }
@@ -485,7 +502,20 @@ fn absorb(
             warnings.push(warning);
         }
     }
-    media_artifacts.extend(reply.artifacts);
+    // The adapter's raw media becomes a domain artifact here, where the
+    // run's context exists: provenance names the request the reply
+    // answered. The id stays empty — the promotion below names the
+    // artifact for the whole run.
+    media_artifacts.extend(reply.artifacts.into_iter().map(|raw| Artifact {
+        id: String::new(),
+        kind: raw.kind,
+        mime: raw.mime,
+        format: raw.format,
+        bytes: raw.bytes,
+        provenance: Provenance::Request {
+            index: reply.request_index,
+        },
+    }));
     if reply.status != GenerationStatus::Complete && *overall == GenerationStatus::Complete {
         *overall = reply.status;
     }

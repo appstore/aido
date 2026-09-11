@@ -97,13 +97,19 @@ pub enum InputContent {
 // ---------------------------------------------------------------------------
 
 /// Which request produced an artifact, so `--dry-run` plans and run records
-/// can explain provenance. One run may issue several requests (OCR slices).
+/// can explain provenance. One run may issue several requests (OCR slices,
+/// text chunks): a merged artifact names every request whose reply it joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Provenance {
     /// Produced by request `index` (0-based) of the run.
     Request { index: usize },
-    /// Restored from history; not produced in this process.
+    /// Joined from the replies of several requests of one run, named in
+    /// reply order (an ocr run's slices, a chunk-join run's chunks).
+    Merged { requests: Vec<usize> },
+    /// Restored from history (`aido last`, `history show`); not produced
+    /// in this process. Set only when artifacts are loaded back — history
+    /// manifests store no provenance, so this is never written to disk.
     Restored,
 }
 
@@ -492,6 +498,32 @@ mod tests {
         let err = AppError::from(io_err);
         assert!(err.chain().contains("gone"));
         assert_eq!(err.kind.exit_code(), 3);
+    }
+
+    #[test]
+    fn provenance_keeps_the_tagged_form_old_records_carry() {
+        // The shape the --out-dir delivery manifests carry. Old records
+        // hold "request" and "restored"; "merged" only joins them, so
+        // every historical form still parses.
+        assert_eq!(
+            serde_json::to_value(Provenance::Request { index: 0 }).unwrap(),
+            serde_json::json!({"type": "request", "index": 0})
+        );
+        for (raw, parsed) in [
+            (
+                r#"{"type":"request","index":3}"#,
+                Provenance::Request { index: 3 },
+            ),
+            (r#"{"type":"restored"}"#, Provenance::Restored),
+            (
+                r#"{"type":"merged","requests":[0,1,2]}"#,
+                Provenance::Merged {
+                    requests: vec![0, 1, 2],
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<Provenance>(raw).unwrap(), parsed);
+        }
     }
 
     #[test]

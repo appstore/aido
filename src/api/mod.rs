@@ -6,7 +6,7 @@ mod responses;
 mod sse;
 mod transport;
 
-use crate::domain::{Artifact, GenerationStatus, InputPart, MediaKind};
+use crate::domain::{GenerationStatus, InputPart, MediaKind};
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -164,6 +164,19 @@ impl GenerateRequest<'_> {
     }
 }
 
+/// One media artifact an adapter produced, before the runner turns it into
+/// a domain [`Artifact`]. An adapter sees one exchange, never the run, so
+/// neither the run-wide id nor the provenance (which request produced it,
+/// merged or not) is the adapter's to invent — the runner assigns both.
+#[derive(Debug)]
+pub struct RawArtifact {
+    pub kind: MediaKind,
+    pub mime: String,
+    /// Codec/container for media ("png", "mp3").
+    pub format: String,
+    pub bytes: Vec<u8>,
+}
+
 /// One adapter response, in domain terms. Text is not an artifact yet —
 /// the runner promotes it when the run's artifacts are assembled. The
 /// default status is Complete because every parse path that keeps the
@@ -171,7 +184,12 @@ impl GenerateRequest<'_> {
 #[derive(Debug, Default)]
 pub struct GenerateResult {
     pub text: String,
-    pub artifacts: Vec<Artifact>,
+    pub artifacts: Vec<RawArtifact>,
+    /// The run's request this reply answers (0-based, as planned).
+    /// Adapters cannot know their place in a run; the runner sets it from
+    /// the step it dispatched and stamps media artifacts' provenance with
+    /// it.
+    pub request_index: usize,
     pub status: GenerationStatus,
     pub warnings: Vec<String>,
 }

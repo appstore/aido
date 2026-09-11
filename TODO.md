@@ -203,7 +203,7 @@
   - 方案：`history.rs:325` 把 `dirs: Vec<PathBuf>` 换成 `Vec<(String, u64)>`（id + 尺寸），循环里 `remove_run(&dir, &id)`。顺带避免了 `dir_size` 被算两遍。
   - 测试：`tests/history.rs` 已有的字节预算测试改用相对 `AIDO_HISTORY_DIR`（配合 `current_dir`）跑一遍，现在的绝对路径版本保留。
 
-- [ ] **F14 · 中 · `src/runner.rs:241, :248` · `src/api/media.rs:117, :174` · Provenance 是个形同虚设的字段**
+- [x] **F14 · 中 · `src/runner.rs:241, :248` · `src/api/media.rs:117, :174` · Provenance 是个形同虚设的字段**
   - 问题：`domain.rs` 用整整一段注释解释 Provenance 的用途：「一次运行可能发出多个请求（OCR 切片），记录哪个请求产出了哪个产物」。实际上 `runner.rs` 给所有产物硬编码 `Request { index: 0 }`；适配器那边更离谱，新生成的产物一律标成 `Provenance::Restored`（「从历史恢复，非本进程产出」），只是随后被 runner 覆盖掉了。字段写进了 manifest、序列化进了历史，但承载的信息是假的。
   - 方案（两条路选一条，不要维持现状）：
     - **做实（所选）**：`GenerateResult` 增加 `request_index`，由 `runner.rs` 在循环里用 `step.index` 填；文本 artifact 的 provenance 改成 `Merged { requests: Vec<usize> }`（切片合并本来就来自多个请求）。适配器里那些 `Provenance::Restored` 占位全部删掉——改成让适配器返回不带 provenance 的中间结构，由 runner 统一赋值，这样「新生成的东西被标成 Restored」在类型上就不可能发生。

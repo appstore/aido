@@ -232,6 +232,7 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
         status: status(choice.finish_reason.as_deref()),
         warnings: Vec::new(),
         artifacts: Vec::new(),
+        request_index: 0, // the runner records which request this answers
     };
     result.note_incomplete();
     Ok(result)
