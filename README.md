@@ -96,6 +96,8 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 
 指定了显式去向后只执行指定去向。已存在的目标文件默认报错；写入走"同目录临时文件 + 原子提交"。`--json` 与 `--stdout` / `-o -` 互斥。
 
+`--out-dir` 写出的 `manifest.json` 记录本次交付：顶层 `version` 恒为 `1`（另有 `run_id` 与 `artifacts`），每个产物条目列出 `id` / `kind` / `mime` / `file` / `size`；自 0.3.0 起产物条目追加 `provenance` 字段（`{"type":"request","index":N}` 或 `{"type":"merged","requests":[…]}`，标明产物来自该次运行的哪个请求）——老读者应允许其缺省。
+
 ### 流式与退出码
 
 `--stream` / `--no-stream` 控制正文向 stdout 的实时交付（终端默认实时，管道默认缓冲；两种模式最终字节完全一致；请求仍可用 SSE 收集）。截断的回复**默认不交付**并记入历史。

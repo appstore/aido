@@ -327,7 +327,7 @@
   - 方案：给 `RunRecord` 加 `failed_parts: Vec<(String, String)>` 字段并在 `deliver_restored` 回填。
   - 测试（※补全）：`last --json` 恢复报告含失败清单。
 
-- [ ] **F30 · 低 · `src/output.rs:474` · 目录 manifest 新增 provenance 字段，version 仍是 1**
+- [x] **F30 · 低 · `src/output.rs:474` · 目录 manifest 新增 provenance 字段，version 仍是 1**
   - 问题：per-part 给 manifest 的产物条目加了 `"provenance"` 字段，但 manifest 顶层 `version: 1` 未动。追加字段对宽松读者向后兼容，但对持有严格 schema（如 `additionalProperties: false`）的下游是破坏。
   - 方案：要么升 version，要么在 README 的 manifest 说明里写明该字段自 0.3.0 起追加、允许缺省。
   - 验证（※补全）：文档更新（或 version 变更 + 兼容说明）。
