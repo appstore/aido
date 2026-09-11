@@ -133,7 +133,7 @@
 
 ## 中 · F07–F17 · 契约不一致与数据完整性
 
-- [ ] **F07 · 中 · `src/output.rs:471` · `--out-dir` 不带 `--overwrite` 也会覆盖 `manifest.json`**
+- [x] **F07 · 中 · `src/output.rs:471` · `--out-dir` 不带 `--overwrite` 也会覆盖 `manifest.json`**
   - 问题：`write_directory()` 给产物文件传 `overwrite=args.overwrite`（默认拒绝覆盖），却给 manifest 硬编码了 `true`。后果：对同一个目录跑第二次、且两次产物文件名不同（比如上次是 `image-1.png`、这次是 `text.txt`），旧的 manifest 被无声替换成只列新产物的版本，上一次的文件就变成没人索引的孤儿。而 manifest 正是这个目录里唯一的「这次交付包含什么」的记录。
   - 方案：`:471` 的硬编码 `true` 改成 `overwrite`。但这会让「对同一目录跑第二次」整体失败——这其实是正确的默认行为（目录交付是一个整体，不该半新半旧）。所以配套把错误信息说清楚：
     > `{dir}` 里已有上一次交付的 `manifest.json`；加 `--overwrite` 覆盖整个目录，或换一个 `--out-dir`

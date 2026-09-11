@@ -438,9 +438,11 @@ pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) ->
     }
 }
 
-/// Directory delivery: artifact files first (each atomically committed),
-/// the manifest last — a directory without a manifest is an unfinished
-/// write, never a success story.
+/// Directory delivery: a no-clobber preflight (nothing is written unless
+/// the whole directory is free or `--overwrite` was given), then artifact
+/// files first (each atomically committed), the manifest last — a
+/// directory without a manifest is an unfinished write, never a success
+/// story.
 fn write_directory(
     artifacts: &[&Artifact],
     dir: &Path,
@@ -448,6 +450,31 @@ fn write_directory(
     overwrite: bool,
     quiet: bool,
 ) -> AppResult<Vec<(String, PathBuf)>> {
+    // The manifest is the only record of what a delivery contains, so a
+    // second run into the same directory must not silently replace it
+    // (the previous files would become unindexed orphans). Every name of
+    // this run is checked before the first byte is written — also within
+    // a per-part batch, where a mid-batch clobber would leave a half-old
+    // half-new directory behind.
+    if !overwrite {
+        let manifest_path = dir.join("manifest.json");
+        if manifest_path.exists() {
+            return Err(AppError::delivery(format!(
+                "{} already holds a previous delivery's manifest.json; \
+                 pass --overwrite to replace the whole directory, or pick another --out-dir",
+                dir.display()
+            )));
+        }
+        for artifact in artifacts {
+            let path = dir.join(artifact_file_name(artifact));
+            if path.exists() {
+                return Err(AppError::delivery(format!(
+                    "{} already exists; use --overwrite to replace it",
+                    path.display()
+                )));
+            }
+        }
+    }
     std::fs::create_dir_all(dir)
         .map_err(|e| AppError::delivery(format!("cannot create {}: {e}", dir.display())))?;
     let mut saved = Vec::new();
@@ -481,7 +508,7 @@ fn write_directory(
             .unwrap_or_default()
             .as_bytes(),
         &manifest_path,
-        true, // the manifest is rewritten only by this run's commit
+        overwrite, // the preflight above guards the no-overwrite pass
     )?;
     Ok(saved)
 }

@@ -248,6 +248,108 @@ fn directory_delivery_writes_artifacts_then_manifest() {
 }
 
 #[test]
+fn out_dir_keeps_the_previous_delivery_without_overwrite() {
+    // Run 1: a plain summary lands as text.txt plus its manifest.
+    let server = Server::json(chat_body("first"));
+    let dir = temp_dir("out-dir-twice");
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("text.txt")).unwrap(),
+        "first"
+    );
+    let manifest_before = std::fs::read(dir.join("manifest.json")).unwrap();
+
+    // Run 2: a translate batch names its files a.txt/b.txt, so only the
+    // manifest collides. Without --overwrite the run fails before writing
+    // a byte: no new files, and the old manifest still describes the
+    // first delivery exactly as run 1 left it.
+    let inputs = temp_dir("out-dir-twice-inputs");
+    let a = inputs.join("a.md");
+    let b = inputs.join("b.md");
+    std::fs::write(&a, "hello").unwrap();
+    std::fs::write(&b, "world").unwrap();
+    let server = MultiServer::start(&[chat_body("你好"), chat_body("世界")]);
+    let cfg = chat_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--to",
+            "zh-CN",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(5);
+    let err = out.stderr();
+    assert!(err.contains("manifest.json"), "{err}");
+    assert!(err.contains("--overwrite"), "{err}");
+    assert!(!dir.join("a.txt").exists(), "no byte may be written");
+    assert!(!dir.join("b.txt").exists(), "no byte may be written");
+    assert_eq!(
+        std::fs::read(dir.join("manifest.json")).unwrap(),
+        manifest_before,
+        "the old manifest survives untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("text.txt")).unwrap(),
+        "first"
+    );
+
+    // Run 3: the same batch with --overwrite replaces the whole delivery;
+    // the manifest now lists only this run's artifacts.
+    let server = MultiServer::start(&[chat_body("你好"), chat_body("世界")]);
+    let cfg = chat_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--to",
+            "zh-CN",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+            "--overwrite",
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "你好");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "世界");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let files: Vec<_> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["a.txt", "b.txt"]);
+}
+
+#[test]
 fn single_image_to_piped_stdout_is_exact_bytes() {
     let png = solid_png(2, 2);
     let encoded = {
