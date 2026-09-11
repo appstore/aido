@@ -369,6 +369,113 @@ fn dry_run_explains_the_plan_without_any_request() {
 }
 
 #[test]
+fn dry_run_reports_profile_generation_param_sources() {
+    // A profile-set max_tokens/temperature must be reported with its real
+    // source; the old report showed max_tokens only for the CLI flag,
+    // hardcoded as cli, and dropped temperature entirely.
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\nmax_tokens = 2048\ntemperature = 0.2\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("max_tokens = 2048  (profile)"), "{stdout}");
+    assert!(stdout.contains("temperature = 0.2  (profile)"), "{stdout}");
+}
+
+#[test]
+fn dry_run_reports_cli_overrides_of_generation_params() {
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\nmax_tokens = 2048\ntemperature = 0.2\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "--max-tokens",
+            "99",
+            "--temperature",
+            "0.9",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("max_tokens = 99  (cli)"), "{stdout}");
+    assert!(stdout.contains("temperature = 0.9  (cli)"), "{stdout}");
+    // the profile's values lost the merge and must not be reported
+    assert!(!stdout.contains("2048"), "{stdout}");
+    assert!(!stdout.contains("0.2"), "{stdout}");
+}
+
+#[test]
+fn dry_run_reports_typed_param_sources_flag_vs_task_default() {
+    // `voice` is the one parameter a task may default: the report must
+    // name the task as its source, a --voice flag as cli, and leave an
+    // unset parameter marked as not sent.
+    let tasks = temp_dir("param-source-task");
+    std::fs::write(
+        tasks.join("briefing.toml"),
+        "operation = \"speech\"\n\
+         input_types = [\"text\"]\n\
+         required_types = [\"text\"]\n\
+         output_types = [\"audio\"]\n\
+         params = [\"voice\", \"speed\"]\n\
+         \n\
+         [defaults]\n\
+         voice = \"alloy\"\n",
+    )
+    .unwrap();
+    let envs = [("AIDO_TASKS_DIR", tasks.to_str().unwrap())];
+    let out = run(
+        &["run", "briefing", "--dry-run", "--text", "你好"],
+        b"",
+        &envs,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("voice = alloy  (task)"), "{stdout}");
+    assert!(stdout.contains("speed = (not sent)  (default)"), "{stdout}");
+
+    let out = run(
+        &[
+            "run",
+            "briefing",
+            "--dry-run",
+            "--text",
+            "你好",
+            "--voice",
+            "nova",
+        ],
+        b"",
+        &envs,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("voice = nova  (cli)"), "{stdout}");
+    assert!(!stdout.contains("alloy"), "{stdout}");
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
 fn dry_run_hides_credentials_embedded_in_the_base_url() {
     let file = temp_file("notes.md", b"material\n");
     let cfg = settings_config(

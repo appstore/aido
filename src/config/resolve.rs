@@ -43,7 +43,11 @@ pub struct Resolved {
     pub model_source: ParamSource,
     /// None = "do not send a token limit".
     pub max_tokens: Option<u64>,
+    /// Where the max_tokens value came from; `Default` when none is sent.
+    pub max_tokens_source: ParamSource,
     pub temperature: Option<f64>,
+    /// Where the temperature value came from; `Default` when none is sent.
+    pub temperature_source: ParamSource,
     pub options: BTreeMap<String, serde_json::Value>,
     /// Input types allowed after task ∩ profile; None = all.
     pub allowed_inputs: Option<Vec<MediaKind>>,
@@ -259,7 +263,8 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     }
 
     // Generation parameters: CLI → profile → program (tasks declare no
-    // generation defaults).
+    // generation defaults). The source travels with the value: the dry-run
+    // reports where each parameter came from.
     let max_tokens = cli
         .max_tokens
         .map(|v| (v, ParamSource::Cli))
@@ -269,10 +274,14 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         .map(|v| (v, ParamSource::Cli))
         .or_else(|| profile.temperature.map(|v| (v, ParamSource::Profile)));
     // v2 default: no token limit is sent unless someone sets one.
-    let max_tokens = match max_tokens {
-        Some((0, _)) => None, // v1's explicit "0 = omit" sentinel
-        Some((v, _)) => Some(v),
-        None => None,
+    let (max_tokens, max_tokens_source) = match max_tokens {
+        Some((0, _)) => (None, ParamSource::Default), // v1's explicit "0 = omit" sentinel
+        Some((v, source)) => (Some(v), source),
+        None => (None, ParamSource::Default),
+    };
+    let (temperature, temperature_source) = match temperature {
+        Some((v, source)) => (Some(v), source),
+        None => (None, ParamSource::Default),
     };
 
     // Options: profile defaults, then task defaults, then --option.
@@ -308,7 +317,9 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         model,
         model_source,
         max_tokens,
-        temperature: temperature.map(|(v, _)| v),
+        max_tokens_source,
+        temperature,
+        temperature_source,
         options,
         allowed_inputs,
         required_inputs: task.required_types.clone(),

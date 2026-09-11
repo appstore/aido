@@ -638,6 +638,12 @@ fn resolve_destinations(
     Ok(destinations)
 }
 
+/// The dry-run's provenance report: every parameter this run would carry
+/// and where its value came from. Generation parameters (model,
+/// max_tokens, temperature) always appear; typed parameters appear for
+/// the task that declares them. The CLI flag wins, then the task's
+/// default (`to` and `voice` are the only ones a task may default), else
+/// nothing is sent for it.
 fn describe_param_sources(
     cli: &Cli,
     task: &Task,
@@ -649,19 +655,56 @@ fn describe_param_sources(
         resolved.model.clone(),
         resolved.model_source,
     ));
-    if let Some(max) = cli.max_tokens {
-        out.push(("max_tokens".into(), max.to_string(), ParamSource::Cli));
-    }
-    if let Some(to) = &cli.to {
-        out.push(("to".into(), to.clone(), ParamSource::Cli));
-    } else if task.accepts_param("to") {
-        out.push((
-            "to".into(),
-            task.default_param("to")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "auto".into()),
-            ParamSource::Task,
-        ));
+    out.push((
+        "max_tokens".into(),
+        resolved
+            .max_tokens
+            .map_or_else(|| "(not sent)".into(), |v| v.to_string()),
+        resolved.max_tokens_source,
+    ));
+    out.push((
+        "temperature".into(),
+        resolved
+            .temperature
+            .map_or_else(|| "(not sent)".into(), |v| v.to_string()),
+        resolved.temperature_source,
+    ));
+    for param in &task.params {
+        let (value, source) = match param {
+            // `--to` never becomes an adapter option: its effect is folded
+            // into the instruction, with "auto" as the program's fallback
+            // target.
+            TaskParam::To => match &cli.to {
+                Some(to) => (to.clone(), ParamSource::Cli),
+                None => match task.default_param("to").and_then(|v| v.as_str()) {
+                    Some(to) => (to.to_string(), ParamSource::Task),
+                    None => ("auto".to_string(), ParamSource::Default),
+                },
+            },
+            TaskParam::Voice => match &cli.voice {
+                Some(voice) => (voice.clone(), ParamSource::Cli),
+                None => match task.default_param("voice").and_then(|v| v.as_str()) {
+                    Some(voice) => (voice.to_string(), ParamSource::Task),
+                    None => ("(not sent)".to_string(), ParamSource::Default),
+                },
+            },
+            // speed/count/size are CLI-only: no task default feeds them
+            // (task `defaults` reach these two above, task `options` reach
+            // the request directly, not through these typed parameters).
+            TaskParam::Speed => match cli.speed {
+                Some(speed) => (speed.to_string(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+            TaskParam::Count => match cli.count {
+                Some(count) => (count.to_string(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+            TaskParam::Size => match &cli.size {
+                Some(size) => (size.clone(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+        };
+        out.push((param.name().into(), value, source));
     }
     out
 }

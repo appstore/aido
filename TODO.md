@@ -246,7 +246,7 @@
   - 方案：应当在 resolve 阶段就报「这个 profile 和这个 task 的输入类型没有交集」。（finding 原文指明方向。）
   - 测试（※补全）：构造交集为空的 task/profile 组合 → 明确报交集错误而非空候选列表。
 
-- [ ] **F20 · 低 · `src/plan.rs:580` · dry-run 的「参数来源」只覆盖三个参数**
+- [x] **F20 · 低 · `src/plan.rs:580` · dry-run 的「参数来源」只覆盖三个参数**
   - 问题：`describe_param_sources` 只报 model、max_tokens、to，缺 temperature、voice、speed、count、size。而且 max_tokens 的来源被硬编码成 Cli——profile 里设的值根本不显示。`resolve.rs:255` 明明算出了正确的 `ParamSource`，转手就 `Some((v, _))` 丢掉了。issue #24 把「参数来源」列为 dry-run 的核心价值之一。
   - 方案（※补全）：保留并传递 `resolve.rs:255` 算出的 `ParamSource`，`describe_param_sources` 覆盖全部参数（model、max_tokens、temperature、to、voice、speed、count、size）。
   - 测试（※补全）：profile 设 max_tokens/temperature → 来源显示 profile。
