@@ -70,6 +70,38 @@ fn unconsumed_pipe_with_explicit_material_is_an_error() {
 }
 
 #[test]
+fn closed_empty_pipe_with_explicit_material_runs() {
+    // The shape every CI runner gives a command: stdin is a pipe that was
+    // closed without a single byte. Not a terminal, but no data either —
+    // explicit material must run exactly as it would in a terminal.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run(
+        &["summarize", file.to_str().unwrap()],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[test]
+fn null_stdin_with_explicit_material_runs() {
+    // stdin redirected from the null device: same verdict, same exit 0.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run_null_stdin(
+        &["summarize", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[test]
 fn empty_piped_stdin_is_an_error_and_never_touches_the_clipboard() {
     let out = run(&["summarize"], b"", &[]);
     out.assert_code(2);

@@ -38,7 +38,7 @@
 
 ## 高 · F01–F06 · 会让正确的命令失败或产出错误结果
 
-- [ ] **F01 · 高 · `src/input.rs:117` · 非交互式环境下，任何带文件的命令都会报错退出**
+- [x] **F01 · 高 · `src/input.rs:117` · 非交互式环境下，任何带文件的命令都会报错退出**
   - 问题：「stdin 被管道占用但没用 `-` 消费」这条规则只看 `stdin_is_terminal`，不看管道里是否真有数据。而 CI runner、cron、systemd、不带 `-t` 的 docker run，stdin 一律是 `/dev/null` 或已关闭的管道——都不是 tty。
     ```console
     $ aido translate README.md --to en < /dev/null

@@ -287,22 +287,11 @@ impl RunOutcome {
     }
 }
 
-/// Run the aido binary with isolated config/tasks/history; every test gets
-/// a silent environment by default.
-pub fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> RunOutcome {
-    run_with(args, stdin_data, envs, empty_config())
-}
-
-/// Like [`run`] but with an explicit config path.
-pub fn run_with(
-    args: &[&str],
-    stdin_data: &[u8],
-    envs: &[(&str, &str)],
-    config: impl AsRef<std::ffi::OsStr>,
-) -> RunOutcome {
+/// The common aido invocation: isolated config/tasks/history, piped
+/// stdio, and a stripped environment so no developer setting leaks in.
+fn base_command(args: &[&str], config: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(EXE);
     cmd.args(args)
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("AIDO_CONFIG", config.as_ref())
@@ -325,12 +314,47 @@ pub fn run_with(
     ] {
         cmd.env_remove(var);
     }
+    cmd
+}
+
+/// Run the aido binary with isolated config/tasks/history; every test gets
+/// a silent environment by default.
+pub fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> RunOutcome {
+    run_with(args, stdin_data, envs, empty_config())
+}
+
+/// Like [`run`] but with an explicit config path.
+pub fn run_with(
+    args: &[&str],
+    stdin_data: &[u8],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::piped());
     for (k, v) in envs {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(stdin_data).unwrap();
     let out = child.wait_with_output().unwrap();
+    RunOutcome { output: out }
+}
+
+/// Run aido with stdin attached to the platform's null device — the shape
+/// CI runners, cron and `docker run` without `-t` give a child process.
+pub fn run_null_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    let null = std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap();
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::from(null));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     RunOutcome { output: out }
 }
 

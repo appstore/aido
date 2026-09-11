@@ -2,13 +2,18 @@
 //!
 //! Decision table (contract §2.2):
 //!
-//! | explicit material | stdin non-terminal | behavior                          |
-//! |-------------------|-------------------|-----------------------------------|
-//! | none              | yes               | read stdin; empty is an error     |
-//! | contains `-`      | yes               | read stdin at the `-` position    |
-//! | none              | no                | clipboard (or instruction-only)   |
-//! | some, no `-`      | yes               | error: consume the pipe with `-`  |
-//! | some              | no                | explicit material; `-` reads EOF  |
+//! | explicit material | piped stdin data | behavior                          |
+//! |-------------------|------------------|-----------------------------------|
+//! | none              | yes              | read stdin; empty is an error     |
+//! | contains `-`      | yes              | read stdin at the `-` position    |
+//! | none              | no               | clipboard (or instruction-only)   |
+//! | some, no `-`      | yes              | error: consume the pipe with `-`  |
+//! | some              | no               | explicit material; `-` reads EOF  |
+//!
+//! "Piped stdin data" means stdin actually carries unread bytes — a closed
+//! pipe or `/dev/null` (what CI runners, cron and `docker run` without `-t`
+//! attach) counts as *no* data, so automation keeps working with explicit
+//! material. Only stdin that really holds bytes demands a `-`.
 //!
 //! A glob spec (a pattern the shell could not expand — quoted on Unix,
 //! always on Windows) or a directory spec expands in place to its sorted
@@ -39,6 +44,9 @@ const MAX_EXPANSION: usize = 4096;
 pub struct InputEnv<'a> {
     pub stdin_is_terminal: bool,
     stdin: &'a mut dyn Read,
+    /// Whether stdin actually carries unread bytes right now; a fresh
+    /// process gets [`fd0_has_unread_bytes`], tests hand in a plain bool.
+    stdin_data_probe: &'a mut (dyn FnMut() -> bool + 'a),
     clipboard: &'a mut (dyn FnMut() -> Result<crate::clipboard::ClipboardContent> + 'a),
 }
 
@@ -48,6 +56,7 @@ impl InputEnv<'static> {
         Self {
             stdin_is_terminal: std::io::stdin().is_terminal(),
             stdin: Box::leak(Box::new(std::io::stdin())),
+            stdin_data_probe: Box::leak(Box::new(fd0_has_unread_bytes)),
             clipboard: Box::leak(Box::new(crate::clipboard::read)),
         }
     }
@@ -57,13 +66,22 @@ impl<'a> InputEnv<'a> {
     pub fn custom(
         stdin: &'a mut dyn Read,
         stdin_is_terminal: bool,
+        stdin_data_probe: &'a mut (dyn FnMut() -> bool + 'a),
         clipboard: &'a mut dyn FnMut() -> Result<crate::clipboard::ClipboardContent>,
     ) -> Self {
         Self {
             stdin_is_terminal,
             stdin,
+            stdin_data_probe,
             clipboard,
         }
+    }
+
+    /// Whether stdin holds unread bytes — not just "is not a terminal".
+    /// This is what separates a real pipe (`cat x | aido ...`) from the
+    /// closed pipe or `/dev/null` CI attaches.
+    fn stdin_has_data(&mut self) -> bool {
+        (self.stdin_data_probe)()
     }
 
     fn read_stdin(&mut self) -> &mut dyn Read {
@@ -72,6 +90,116 @@ impl<'a> InputEnv<'a> {
 
     fn read_clipboard(&mut self) -> Result<crate::clipboard::ClipboardContent> {
         (self.clipboard)()
+    }
+}
+
+/// Whether fd 0 actually carries unread bytes, by handle kind:
+///
+/// * character devices (`/dev/null`) — never;
+/// * a redirected file — whatever remains past the current offset;
+/// * pipes and sockets — the exact pending byte count, with a
+///   zero-timeout poll as the last resort.
+///
+/// When nothing can be determined the answer is `true`: the caller only
+/// uses this to *reject* a run, so uncertainty keeps the old strict
+/// behavior instead of silently ignoring possible input.
+#[cfg(unix)]
+fn fd0_has_unread_bytes() -> bool {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::STDIN_FILENO, &mut stat) != 0 {
+            return true;
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFCHR => false,
+            libc::S_IFREG => {
+                let offset = libc::lseek(libc::STDIN_FILENO, 0, libc::SEEK_CUR);
+                stat.st_size > offset
+            }
+            _ => {
+                let mut pending: libc::c_int = 0;
+                if libc::ioctl(
+                    libc::STDIN_FILENO,
+                    libc::FIONREAD as libc::c_ulong,
+                    &mut pending,
+                ) == 0
+                {
+                    pending > 0
+                } else {
+                    let mut fds = [libc::pollfd {
+                        fd: libc::STDIN_FILENO,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    libc::poll(fds.as_mut_ptr(), 1, 0) > 0 && fds[0].revents & libc::POLLIN != 0
+                }
+            }
+        }
+    }
+}
+
+/// Windows twin of the unix probe: pipes are peeked, redirected files
+/// compare size against the current position, and character devices (the
+/// `NUL` automation attaches) never carry bytes.
+#[cfg(windows)]
+fn fd0_has_unread_bytes() -> bool {
+    use std::os::raw::{c_int, c_ulong, c_void};
+    type Handle = *mut c_void;
+    const STD_INPUT_HANDLE: c_ulong = 0xFFFF_FFF6;
+    const FILE_TYPE_DISK: c_ulong = 1;
+    const FILE_TYPE_PIPE: c_ulong = 3;
+    const FILE_CURRENT: c_ulong = 1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(kind: c_ulong) -> Handle;
+        fn GetFileType(handle: Handle) -> c_ulong;
+        fn PeekNamedPipe(
+            handle: Handle,
+            buffer: *mut c_void,
+            buffer_size: c_ulong,
+            bytes_read: *mut c_ulong,
+            total_bytes_avail: *mut c_ulong,
+            bytes_left_in_message: *mut c_ulong,
+        ) -> c_int;
+        fn GetFileSizeEx(handle: Handle, size: *mut i64) -> c_int;
+        fn SetFilePointerEx(
+            handle: Handle,
+            distance: i64,
+            new_position: *mut i64,
+            method: c_ulong,
+        ) -> c_int;
+    }
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        if stdin.is_null() {
+            return true;
+        }
+        match GetFileType(stdin) {
+            FILE_TYPE_DISK => {
+                let mut size = 0i64;
+                let mut position = 0i64;
+                if GetFileSizeEx(stdin, &mut size) != 0
+                    && SetFilePointerEx(stdin, 0, &mut position, FILE_CURRENT) != 0
+                {
+                    size > position
+                } else {
+                    true
+                }
+            }
+            FILE_TYPE_PIPE => {
+                let mut available = 0u32;
+                PeekNamedPipe(
+                    stdin,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                ) != 0
+                    && available > 0
+            }
+            _ => false,
+        }
     }
 }
 
@@ -127,7 +255,7 @@ pub fn gather(
         return Ok(Vec::new());
     }
 
-    if !env.stdin_is_terminal && !specs.iter().any(|s| matches!(s, SourceSpec::Stdin)) {
+    if env.stdin_has_data() && !specs.iter().any(|s| matches!(s, SourceSpec::Stdin)) {
         bail!(
             "stdin is piped but not consumed; add `-` where the piped data belongs \
              (e.g. `aido code-review -`), or redirect stdin from the terminal"
@@ -500,10 +628,13 @@ mod tests {
 
     fn env(stdin_data: &'static [u8], terminal: bool) -> InputEnv<'static> {
         // The cursor and closure are leaked here on purpose: test-scoped,
-        // tiny, and it keeps every call site a one-liner.
+        // tiny, and it keeps every call site a one-liner. The data probe
+        // mirrors what a real pipe would report: bytes pending or not.
+        let has_data = !stdin_data.is_empty();
         InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(stdin_data))),
             stdin_is_terminal: terminal,
+            stdin_data_probe: Box::leak(Box::new(move || has_data)),
             clipboard: Box::leak(Box::new(|| Ok(ClipboardContent::Text("clip".into())))),
         }
     }
@@ -533,6 +664,40 @@ mod tests {
         let mut e = env(b"pipe data\n", false);
         let err = gather(&[file("a.txt")], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("add `-`"));
+    }
+
+    #[test]
+    fn closed_empty_stdin_with_explicit_material_is_not_an_error() {
+        // CI runners, cron and `docker run` without `-t` attach a closed
+        // pipe or /dev/null: not a terminal, and no bytes either. The
+        // explicit material must run exactly as it would on a terminal.
+        let dir = std::env::temp_dir().join(format!("aido-input-null-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"real\n").unwrap();
+        let mut e = env(b"", false);
+        let parts = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap();
+        assert_eq!(parts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A data probe that says yes regardless of the cursor: stdin state
+    /// and probe answer are independent injections.
+    #[test]
+    fn probe_drives_the_pipe_guard_not_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("aido-input-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"real\n").unwrap();
+        let mut e = InputEnv {
+            stdin: Box::leak(Box::new(Cursor::new(b""))),
+            stdin_is_terminal: false,
+            stdin_data_probe: Box::leak(Box::new(|| true)),
+            clipboard: Box::leak(Box::new(|| Ok(ClipboardContent::Text("clip".into())))),
+        };
+        let err = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap_err();
+        assert!(err.to_string().contains("add `-`"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -654,6 +819,7 @@ mod tests {
         let mut e = InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(b""))),
             stdin_is_terminal: true,
+            stdin_data_probe: Box::leak(Box::new(|| false)),
             clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
         };
         let parts = gather(&[SourceSpec::Paste], true, None, true, &mut e).unwrap();
@@ -664,6 +830,7 @@ mod tests {
         let mut e = InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(b""))),
             stdin_is_terminal: true,
+            stdin_data_probe: Box::leak(Box::new(|| false)),
             clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
         };
         let parts = gather(&[], true, None, true, &mut e).unwrap();
