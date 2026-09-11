@@ -208,10 +208,18 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 }
             }
         }
-        if profile.model.is_none() {
-            issues.push(format!(
+        // `config init` writes `model = "YOUR_MODEL"`; a profile still
+        // carrying that placeholder (or an empty model) fails at run time,
+        // so check must flag it instead of reporting ok.
+        match profile.model.as_deref().map(str::trim) {
+            None => issues.push(format!(
                 "profile '{name}': no model set; the adapter default would be used"
-            ));
+            )),
+            Some(m) if m.is_empty() || m == "YOUR_MODEL" => issues.push(format!(
+                "profile '{name}': no model configured; set model in the config \
+                 ('YOUR_MODEL' is the config init placeholder)"
+            )),
+            Some(_) => {}
         }
     }
     // The profile resolution will actually use: an explicit

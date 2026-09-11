@@ -261,7 +261,7 @@
   - 方案（※补全，倾向改实现使符合文档）：逐层展开 `source()`、每行一个（或改文档，二选一）。
   - 测试（※补全）：嵌套 error 的 chain 输出为多行。
 
-- [ ] **F23 · 低 · `src/config/mod.rs:211, :279` · `config check` 对占位模型名报 ok**
+- [x] **F23 · 低 · `src/config/mod.rs:211, :279` · `config check` 对占位模型名报 ok**
   - 问题：`config init` 写入 `model = "YOUR_MODEL"`，`check()` 只判断 `model.is_none()`，于是一个必然在运行时失败的配置通过了校验。而 `config init` 的输出里第 3 步恰好就是「用 `aido config check` 验证」。
   - 方案（※补全）：`check()` 识别 `YOUR_MODEL` 占位并报「未配置模型」。
   - 测试（※补全）：init 后 check → 非 ok。

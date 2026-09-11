@@ -211,7 +211,23 @@ fn config_init_writes_a_sample_and_check_validates_it() {
     );
     out.assert_code(2);
 
-    // the sample is structurally valid: check passes
+    // the sample still carries the YOUR_MODEL placeholder: check must flag
+    // the profile (exit 2, the issue on stdout) instead of blessing a
+    // config that cannot run
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg_path.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let stdout = out.stdout();
+    assert!(stdout.contains("'default'"), "stdout: {stdout}");
+    assert!(stdout.contains("no model configured"), "stdout: {stdout}");
+    assert!(stdout.contains("YOUR_MODEL"), "stdout: {stdout}");
+
+    // filling in a real model makes check pass
+    let sample = std::fs::read_to_string(&cfg_path).unwrap();
+    std::fs::write(&cfg_path, sample.replace("YOUR_MODEL", "gpt-5")).unwrap();
     let out = run(
         &["config", "check"],
         b"",
