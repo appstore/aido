@@ -332,7 +332,7 @@
   - 方案：要么升 version，要么在 README 的 manifest 说明里写明该字段自 0.3.0 起追加、允许缺省。
   - 验证（※补全）：文档更新（或 version 变更 + 兼容说明）。
 
-- [ ] **F31 · 低 · `src/input.rs:352` · 未闭合 `[` 的报错语义与 shell 不一致**
+- [x] **F31 · 低 · `src/input.rs:352` · 未闭合 `[` 的报错语义与 shell 不一致**
   - 问题：文件名含元字符时，「字面文件存在则优先」的兜底（`expand_glob` 开头的 `is_file()` 检查）让常见场景正确，比 shell 还好。但文件不存在时，bash 把未闭合的 `[` 当字面量、报 No such file；aido 的 glob 解析直接报 "invalid glob pattern"。`aido ocr "shot[1.png"`（漏写 `]`）看起来像「模式写错了」，其实是「文件没找到」。两种行为都说得通，只是错误分类可能误导排查方向。
   - 方案：调整 invalid pattern 的报错文案/分类，指向「文件未找到」方向。
   - 测试（※补全）：`ocr "shot[1.png"`（文件不存在）→ 报 file-not-found 方向的错误。

@@ -355,6 +355,38 @@ fn missing_file_fails_with_the_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unparseable_pattern_without_a_file_reports_no_file_first() {
+    // `shot[1.png` cannot parse as a glob (unclosed `[`) and no literal
+    // file exists: the error must read like the shell's — no such file —
+    // with the syntax problem only as secondary context.
+    let out = run_tty(&["ocr", "shot[1.png"], &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("no files match"), "{err}");
+    assert!(err.contains("shot[1.png"), "{err}");
+    assert!(err.contains("not a valid glob pattern"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_file_with_unclosed_bracket_expands_past_the_pattern() {
+    // The same unparseable name, but the file exists: the literal-file
+    // escape wins and the run proceeds past expansion.
+    let png = solid_png(2, 2);
+    let file = temp_file("shot[1.png", &png);
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run_tty_with(
+        &["ocr", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
 #[test]
 fn ocr_requires_image_material() {
     let out = run(&["ocr"], b"only text\n", &[]);

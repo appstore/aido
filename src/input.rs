@@ -503,8 +503,12 @@ fn expand_glob(pattern: &str, cap: usize) -> Result<Vec<PathBuf>> {
         require_literal_separator: true,
         require_literal_leading_dot: true,
     };
-    let paths = glob::glob_with(&glob_pattern, options)
-        .map_err(|e| anyhow::anyhow!("invalid glob pattern '{pattern}': {e}"))?;
+    // The literal file already got its chance above, so an unparseable
+    // pattern is usually a typo'd filename: lead with the shell-equivalent
+    // "no such file" fact, keeping the syntax detail as secondary context.
+    let paths = glob::glob_with(&glob_pattern, options).map_err(|e| {
+        anyhow::anyhow!("no files match '{pattern}' (it is also not a valid glob pattern: {e})")
+    })?;
     // glob 0.3 unwraps `to_str()` on scanned directory entries while
     // filtering leading dots, so a non-UTF-8 filename (legacy zip
     // extraction, GBK names) would panic the whole run. Expansion reads
@@ -922,6 +926,13 @@ mod tests {
         let mut e = env(b"", true);
         let parts = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].text(), Some("literal\n"));
+        // Even a name that is not a valid glob at all (unclosed `[`) takes
+        // the literal exit before parsing ever runs.
+        let dir = write_dir("glob-literal-raw", &[("shot[1.png", b"literal\n")]);
+        let pattern = dir.join("shot[1.png").display().to_string();
+        let mut e = env(b"", true);
+        let parts = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap();
+        assert_eq!(parts[0].text(), Some("literal\n"));
     }
 
     #[test]
@@ -1045,10 +1056,17 @@ mod tests {
 
     #[test]
     fn invalid_patterns_error_cleanly() {
+        // The literal file had its chance above, so a pattern that cannot
+        // even parse reads as "no such file" first, syntax second — what
+        // bash would say.
         let err = expand_glob("a**b", MAX_EXPANSION).unwrap_err();
-        assert!(err.to_string().contains("invalid glob pattern"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("no files match 'a**b'"), "{msg}");
+        assert!(msg.contains("not a valid glob pattern"), "{msg}");
         let err = expand_glob("[b", MAX_EXPANSION).unwrap_err();
-        assert!(err.to_string().contains("invalid glob pattern"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("no files match '[b'"), "{msg}");
+        assert!(msg.contains("not a valid glob pattern"), "{msg}");
     }
 
     #[test]
