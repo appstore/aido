@@ -88,10 +88,22 @@ fn spawn_holder(text: &str, hold_secs: u64) {
     }
 }
 
-pub fn set_image(cb: &mut arboard::Clipboard, bytes: &[u8]) -> Result<()> {
-    let rgba = image::load_from_memory(bytes)
+/// Decode clipboard-bound image bytes to RGBA. The declared dimensions
+/// are read from the container header first — the same
+/// decompression-bomb guard the input side uses — so bytes reaching the
+/// clipboard (freshly generated or restored from history) cannot OOM
+/// this decode.
+fn decode_for_clipboard(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let (w, h) = crate::api::image_dimensions(bytes)
+        .context("failed to read the clipboard image dimensions")?;
+    crate::api::ensure_decode_size("clipboard image", w, h)?;
+    Ok(image::load_from_memory(bytes)
         .context("failed to decode clipboard image")?
-        .into_rgba8();
+        .into_rgba8())
+}
+
+pub fn set_image(cb: &mut arboard::Clipboard, bytes: &[u8]) -> Result<()> {
+    let rgba = decode_for_clipboard(bytes)?;
     cb.set_image(arboard::ImageData {
         width: rgba.width() as usize,
         height: rgba.height() as usize,
@@ -125,4 +137,51 @@ pub fn write_image(bytes: &[u8], hold_secs: u64) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = hold_secs;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_jpeg() -> Vec<u8> {
+        let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        jpg
+    }
+
+    /// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`:
+    /// the decompression-bomb shape — a few hundred bytes claiming a huge
+    /// canvas.
+    fn jpeg_declaring(w: u32, h: u32) -> Vec<u8> {
+        let mut jpg = tiny_jpeg();
+        // Layout after the FF C0 marker: length(2), precision(1), height
+        // (2 BE), width (2 BE).
+        let sof = jpg
+            .windows(2)
+            .position(|p| p == [0xFF, 0xC0])
+            .expect("encoder wrote a SOF0 marker");
+        jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+        jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+        jpg
+    }
+
+    #[test]
+    fn clipboard_decode_refuses_bomb_shaped_bytes() {
+        let err = decode_for_clipboard(&jpeg_declaring(20_000, 20_000)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to decode"), "{msg}");
+        assert!(msg.contains("400 MP"), "{msg}");
+    }
+
+    #[test]
+    fn clipboard_decode_returns_rgba_for_small_images() {
+        let rgba = decode_for_clipboard(&tiny_jpeg()).unwrap();
+        assert_eq!(rgba.dimensions(), (2, 2));
+    }
 }

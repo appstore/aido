@@ -1,6 +1,9 @@
 //! Buffered media protocols. Generation options are serialized structurally,
 //! never interpolated into JSON templates.
-use super::{merged_text, plain_text, single_audio, GenerateRequest, GenerateResult, RawArtifact};
+use super::{
+    ensure_decode_size, image_dimensions, merged_text, plain_text, single_audio, GenerateRequest,
+    GenerateResult, RawArtifact,
+};
 use crate::domain::MediaKind;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -108,6 +111,13 @@ pub(super) fn image_bytes(bytes: Vec<u8>) -> Result<RawArtifact> {
         image::ImageFormat::WebP => ("webp", "image/webp"),
         _ => bail!("unsupported generated image format"),
     };
+    // The declared dimensions are read from the header alone before the
+    // validation decode: a compromised endpoint could otherwise OOM the
+    // process with a bomb-shaped reply (user material is guarded at the
+    // adapter boundary).
+    let (w, h) =
+        image_dimensions(&bytes).context("cannot read the dimensions of the generated image")?;
+    ensure_decode_size("generated image", w, h)?;
     // Validate decoded pixels before saving a success/history entry.
     image::load_from_memory(&bytes).context("invalid generated image")?;
     // No id and no provenance: the runner names the artifact for the run

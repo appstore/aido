@@ -445,6 +445,23 @@ mod tests {
     }
 
     #[test]
+    fn generated_image_bombs_are_refused_before_the_validation_decode() {
+        let err = media::image_bytes(jpeg_declaring(20_000, 20_000)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to decode"), "{msg}");
+        assert!(msg.contains("400 MP"), "{msg}");
+    }
+
+    #[test]
+    fn generated_small_images_still_pass_the_guard() {
+        let art = media::image_bytes(tiny_jpeg()).unwrap();
+        assert_eq!(art.kind, MediaKind::Image);
+        assert_eq!(art.mime, "image/jpeg");
+        assert_eq!(art.format, "jpeg");
+        assert!(!art.bytes.is_empty());
+    }
+
+    #[test]
     fn single_text_stays_raw() {
         let parts = vec![text("a.txt", InputSource::File("a.txt".into()), "alpha\n")];
         assert_eq!(labeled_texts(&parts), vec!["alpha\n"]);
