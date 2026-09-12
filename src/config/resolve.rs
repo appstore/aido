@@ -7,7 +7,7 @@ use crate::cli::Cli;
 use crate::domain::MediaKind;
 use crate::tasks::{Operation, Task};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Where a merged parameter came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,12 +29,6 @@ impl ParamSource {
     }
 }
 
-#[derive(Debug)]
-pub struct Sourced<T> {
-    pub value: T,
-    pub source: ParamSource,
-}
-
 /// Everything a run needs to talk to a service, plus the input/output
 /// capability envelope after intersecting task and profile constraints.
 #[derive(Debug)]
@@ -49,7 +43,11 @@ pub struct Resolved {
     pub model_source: ParamSource,
     /// None = "do not send a token limit".
     pub max_tokens: Option<u64>,
+    /// Where the max_tokens value came from; `Default` when none is sent.
+    pub max_tokens_source: ParamSource,
     pub temperature: Option<f64>,
+    /// Where the temperature value came from; `Default` when none is sent.
+    pub temperature_source: ParamSource,
     pub options: BTreeMap<String, serde_json::Value>,
     /// Input types allowed after task ∩ profile; None = all.
     pub allowed_inputs: Option<Vec<MediaKind>>,
@@ -184,6 +182,20 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     let allowed_inputs = match (&task.input_types, &profile.input_types) {
         (Some(t), Some(p)) => {
             let i: Vec<MediaKind> = t.iter().filter(|k| p.contains(k)).copied().collect();
+            if i.is_empty() {
+                // An empty intersection rejects every material later, and
+                // only with an empty candidate list — name the config
+                // mismatch here instead. (A task without declared types or
+                // an unrestricted profile has no intersection to be empty.)
+                bail!(
+                    "profile '{profile_name}' restricts inputs to [{}], which \
+                     shares no type with task '{}' ([{}]); pick another \
+                     profile or extend the profile",
+                    p.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(","),
+                    task.name,
+                    t.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(",")
+                );
+            }
             Some(i)
         }
         (Some(t), None) => Some(t.clone()),
@@ -236,7 +248,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     } else {
         cli.produce.clone()
     };
-    produce.dedup();
+    produce = dedup_preserving_order(produce);
     if produce.is_empty() {
         bail!("the requested output types are empty after applying the profile");
     }
@@ -251,7 +263,8 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     }
 
     // Generation parameters: CLI → profile → program (tasks declare no
-    // generation defaults).
+    // generation defaults). The source travels with the value: the dry-run
+    // reports where each parameter came from.
     let max_tokens = cli
         .max_tokens
         .map(|v| (v, ParamSource::Cli))
@@ -261,10 +274,14 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         .map(|v| (v, ParamSource::Cli))
         .or_else(|| profile.temperature.map(|v| (v, ParamSource::Profile)));
     // v2 default: no token limit is sent unless someone sets one.
-    let max_tokens = match max_tokens {
-        Some((0, _)) => None, // v1's explicit "0 = omit" sentinel
-        Some((v, _)) => Some(v),
-        None => None,
+    let (max_tokens, max_tokens_source) = match max_tokens {
+        Some((0, _)) => (None, ParamSource::Default), // v1's explicit "0 = omit" sentinel
+        Some((v, source)) => (Some(v), source),
+        None => (None, ParamSource::Default),
+    };
+    let (temperature, temperature_source) = match temperature {
+        Some((v, source)) => (Some(v), source),
+        None => (None, ParamSource::Default),
     };
 
     // Options: profile defaults, then task defaults, then --option.
@@ -300,7 +317,9 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         model,
         model_source,
         max_tokens,
-        temperature: temperature.map(|(v, _)| v),
+        max_tokens_source,
+        temperature,
+        temperature_source,
         options,
         allowed_inputs,
         required_inputs: task.required_types.clone(),
@@ -308,6 +327,54 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     })
 }
 
+/// Order-preserving dedup: keep the first occurrence of each kind. The
+/// produce order drives artifact ordering, so this must not sort, and
+/// `Vec::dedup` would only collapse *adjacent* repeats — `image,text,image`
+/// must resolve to two entries, not three.
+fn dedup_preserving_order(produce: Vec<MediaKind>) -> Vec<MediaKind> {
+    let mut seen = HashSet::new();
+    produce
+        .into_iter()
+        .filter(|kind| seen.insert(*kind))
+        .collect()
+}
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dedup_keeps_first_occurrence_order() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Image, MediaKind::Text, MediaKind::Image]),
+            vec![MediaKind::Image, MediaKind::Text]
+        );
+    }
+    #[test]
+    fn dedup_collapses_adjacent_and_non_adjacent_repeats_alike() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Text, MediaKind::Text]),
+            vec![MediaKind::Text]
+        );
+        assert_eq!(
+            dedup_preserving_order(vec![
+                MediaKind::Audio,
+                MediaKind::Text,
+                MediaKind::Audio,
+                MediaKind::Text
+            ]),
+            vec![MediaKind::Audio, MediaKind::Text]
+        );
+    }
+    #[test]
+    fn dedup_keeps_distinct_kinds_and_the_empty_list() {
+        assert_eq!(
+            dedup_preserving_order(vec![MediaKind::Text, MediaKind::Image, MediaKind::Audio]),
+            vec![MediaKind::Text, MediaKind::Image, MediaKind::Audio]
+        );
+        assert!(dedup_preserving_order(Vec::new()).is_empty());
+    }
 }

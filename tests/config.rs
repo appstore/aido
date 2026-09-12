@@ -131,6 +131,38 @@ fn profile_input_types_intersect_with_the_task() {
 }
 
 #[test]
+fn disjoint_profile_and_task_input_types_error_at_resolve_time() {
+    // summarize takes text only; an audio-only profile shares no input type
+    // with it. Resolve must reject the combination itself — every material
+    // would be rejected later, and only with an empty `(allowed: )` list.
+    // (ocr would not do here: its declared types include text, so a
+    // text-only profile still intersects.)
+    let cfg = settings_config(
+        "[profiles.audio-only]\nprovider = \"srv\"\nmodel = \"m\"\ninput_types = [\"audio\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "audio-only",
+            "notes.md",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(
+        err.contains("shares no type with task 'summarize'"),
+        "{err}"
+    );
+    assert!(err.contains("restricts inputs to [audio]"), "{err}");
+    assert!(!err.contains("(allowed: )"), "{err}");
+}
+
+#[test]
 fn deprecated_global_env_vars_are_ignored_with_a_warning() {
     let server = Server::json(chat_body("ok"));
     let cfg = settings_config(&format!(
@@ -179,7 +211,23 @@ fn config_init_writes_a_sample_and_check_validates_it() {
     );
     out.assert_code(2);
 
-    // the sample is structurally valid: check passes
+    // the sample still carries the YOUR_MODEL placeholder: check must flag
+    // the profile (exit 2, the issue on stdout) instead of blessing a
+    // config that cannot run
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg_path.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let stdout = out.stdout();
+    assert!(stdout.contains("'default'"), "stdout: {stdout}");
+    assert!(stdout.contains("no model configured"), "stdout: {stdout}");
+    assert!(stdout.contains("YOUR_MODEL"), "stdout: {stdout}");
+
+    // filling in a real model makes check pass
+    let sample = std::fs::read_to_string(&cfg_path).unwrap();
+    std::fs::write(&cfg_path, sample.replace("YOUR_MODEL", "gpt-5")).unwrap();
     let out = run(
         &["config", "check"],
         b"",
@@ -240,7 +288,7 @@ fn tasks_list_and_show_cover_the_builtins() {
     let out = run(&["tasks", "show", "summarize"], b"", &[]);
     out.assert_code(0);
     let stdout = out.stdout();
-    assert!(stdout.contains("chunk-map-reduce"), "{stdout}");
+    assert!(stdout.contains("chunk-reduce"), "{stdout}");
     assert!(stdout.contains("text"), "{stdout}");
 
     let out = run(&["tasks", "show", "nope"], b"", &[]);
@@ -337,6 +385,209 @@ fn dry_run_explains_the_plan_without_any_request() {
 }
 
 #[test]
+fn dry_run_reports_profile_generation_param_sources() {
+    // A profile-set max_tokens/temperature must be reported with its real
+    // source; the old report showed max_tokens only for the CLI flag,
+    // hardcoded as cli, and dropped temperature entirely.
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\nmax_tokens = 2048\ntemperature = 0.2\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("max_tokens = 2048  (profile)"), "{stdout}");
+    assert!(stdout.contains("temperature = 0.2  (profile)"), "{stdout}");
+}
+
+#[test]
+fn dry_run_reports_cli_overrides_of_generation_params() {
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\nmax_tokens = 2048\ntemperature = 0.2\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "--max-tokens",
+            "99",
+            "--temperature",
+            "0.9",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("max_tokens = 99  (cli)"), "{stdout}");
+    assert!(stdout.contains("temperature = 0.9  (cli)"), "{stdout}");
+    // the profile's values lost the merge and must not be reported
+    assert!(!stdout.contains("2048"), "{stdout}");
+    assert!(!stdout.contains("0.2"), "{stdout}");
+}
+
+#[test]
+fn dry_run_reports_typed_param_sources_flag_vs_task_default() {
+    // `voice` is the one parameter a task may default: the report must
+    // name the task as its source, a --voice flag as cli, and leave an
+    // unset parameter marked as not sent.
+    let tasks = temp_dir("param-source-task");
+    std::fs::write(
+        tasks.join("briefing.toml"),
+        "operation = \"speech\"\n\
+         input_types = [\"text\"]\n\
+         required_types = [\"text\"]\n\
+         output_types = [\"audio\"]\n\
+         params = [\"voice\", \"speed\"]\n\
+         \n\
+         [defaults]\n\
+         voice = \"alloy\"\n",
+    )
+    .unwrap();
+    let envs = [("AIDO_TASKS_DIR", tasks.to_str().unwrap())];
+    let out = run(
+        &["run", "briefing", "--dry-run", "--text", "你好"],
+        b"",
+        &envs,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("voice = alloy  (task)"), "{stdout}");
+    assert!(stdout.contains("speed = (not sent)  (default)"), "{stdout}");
+
+    let out = run(
+        &[
+            "run",
+            "briefing",
+            "--dry-run",
+            "--text",
+            "你好",
+            "--voice",
+            "nova",
+        ],
+        b"",
+        &envs,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("voice = nova  (cli)"), "{stdout}");
+    assert!(!stdout.contains("alloy"), "{stdout}");
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
+fn dry_run_hides_credentials_embedded_in_the_base_url() {
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"https://user:sup3rsecret@gw.internal/v1\"\napi_key_env = \"MY_KEY\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "-",
+            "--dry-run",
+        ],
+        b"piped notes\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("https://***:***@gw.internal/v1"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sup3rsecret"), "{stdout}");
+}
+
+#[test]
+fn dry_run_warns_when_a_key_would_traverse_plain_http() {
+    // A non-loopback http base_url would carry the key in cleartext; the
+    // plan names the host instead of letting the run happen unwarned.
+    let file = temp_file("notes.md", b"material\n");
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://gw.internal:8080/v1\"\napi_key_env = \"MY_KEY\"",
+    );
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            file.to_str().unwrap(),
+            "-",
+            "--dry-run",
+        ],
+        b"piped notes\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("MY_KEY", "sk-test"),
+        ],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("credentials will be sent in cleartext to gw.internal"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("base_url uses http://"), "{stdout}");
+}
+
+#[test]
+fn dry_run_spares_loopback_http_and_https_from_the_cleartext_warning() {
+    // Local inference servers are legitimately http (loopback is exempt),
+    // and https encrypts the key everywhere.
+    let file = temp_file("notes.md", b"material\n");
+    for base in [
+        "http://127.0.0.1:8080/v1",
+        "http://localhost:8080/v1",
+        "https://gw.internal:8080/v1",
+    ] {
+        let cfg = settings_config(&format!(
+            "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+             [providers.srv]\nbase_url = \"{base}\"\napi_key_env = \"MY_KEY\""
+        ));
+        let out = run(
+            &[
+                "summarize",
+                "--profile",
+                "test",
+                file.to_str().unwrap(),
+                "-",
+                "--dry-run",
+            ],
+            b"piped notes\n",
+            &[
+                ("AIDO_CONFIG", cfg.to_str().unwrap()),
+                ("MY_KEY", "sk-test"),
+            ],
+        );
+        out.assert_code(0);
+        let stdout = out.stdout();
+        assert!(!stdout.contains("cleartext"), "{base}: {stdout}");
+    }
+}
+
+#[test]
 fn config_check_flags_route_keys_that_are_not_operations() {
     // A typo'd route key (`speach`) would silently fall back to the
     // conventional adapter; `config check` must name it.
@@ -398,6 +649,37 @@ fn zero_config_tts_defaults_to_keyless_edge_tts() {
         stdout.contains("credentials: none required"),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn config_init_keeps_tts_keyless() {
+    // The sample's [providers.openai] shadows the built-in provider, so it
+    // must carry the same speech route: following README step 1 (`aido
+    // config init`) should not turn a keyless `aido tts` into a missing
+    // AIDO_API_KEY error.
+    let dir = temp_dir("config-init-tts");
+    let cfg_path = dir.join("config.toml");
+    let out = run(
+        &["config", "init"],
+        b"",
+        &[("AIDO_CONFIG", cfg_path.to_str().unwrap())],
+    );
+    out.assert_code(0);
+
+    let out = run_with(
+        &["tts", "--text", "你好，世界", "--dry-run"],
+        b"",
+        &[],
+        &cfg_path,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("(route: edge-tts)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("credentials: none required"),
+        "stdout: {stdout}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -520,5 +802,80 @@ fn edge_tts_refuses_a_task_fixed_instruction_and_names_the_source() {
             .contains("the task's fixed instruction would have nowhere to go"),
         "{}",
         out.stderr()
+    );
+}
+
+/// A generate profile routed to the responses adapter, whose outputs cover
+/// both text and image, so `--produce image,text,image` passes capability
+/// checks (base_url is never dialed: both tests below stop at plan time).
+fn responses_profile_config() -> std::path::PathBuf {
+    settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"\n\
+         [providers.srv.routes]\ngenerate = \"openai-responses\"",
+    )
+}
+
+#[test]
+fn produce_repeats_dedup_to_first_occurrence_order() {
+    // `image,text,image` used to survive `Vec::dedup` (it only collapses
+    // *adjacent* repeats), so the resolved produce list kept three entries
+    // and downstream checks double-counted the image kind. Each kind must
+    // appear once, in first-occurrence order — that order drives artifact
+    // ordering, so no sorting.
+    let cfg = responses_profile_config();
+    let out = run(
+        &[
+            "ask",
+            "--profile",
+            "test",
+            "--text",
+            "hi",
+            "-p",
+            "hi",
+            "--produce",
+            "image,text,image",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("produce:     image,text"), "{stdout}");
+    assert!(!stdout.contains("image,text,image"), "{stdout}");
+}
+
+#[test]
+fn repeated_produce_kinds_no_longer_make_format_ambiguous() {
+    // With the duplicate entry still present, `--format` saw two image
+    // kinds in `image,text,image` and refused the run as ambiguous. After
+    // the dedup only one image kind remains, so the ambiguity gate passes;
+    // what is left is the ordinary multi-kind --format mismatch, naming
+    // the deduped, order-preserved produce list.
+    let cfg = responses_profile_config();
+    let out = run(
+        &[
+            "ask",
+            "--profile",
+            "test",
+            "--text",
+            "hi",
+            "-p",
+            "hi",
+            "--produce",
+            "image,text,image",
+            "--format",
+            "png",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(!err.contains("ambiguous"), "{err}");
+    assert!(
+        err.contains("does not match the produced type(s) [image,text]"),
+        "{err}"
     );
 }

@@ -64,9 +64,52 @@ fn dash_reads_stdin_at_its_position_between_files() {
 #[test]
 fn unconsumed_pipe_with_explicit_material_is_an_error() {
     let file = temp_file("a.txt", b"from file\n");
+    // The bytes are in the pipe before the binary starts, so the probe
+    // cannot lose a race against the parent's write. Windows keeps the
+    // write-after-spawn pipe: no prefill helper there.
+    #[cfg(unix)]
+    let out = run_prefilled_pipe(
+        &["summarize", file.to_str().unwrap()],
+        b"pipe\n",
+        &[],
+        empty_config(),
+    );
+    #[cfg(windows)]
     let out = run(&["summarize", file.to_str().unwrap()], b"pipe\n", &[]);
     out.assert_code(2);
     assert!(out.stderr().contains("add `-`"), "stderr: {}", out.stderr());
+}
+
+#[test]
+fn closed_empty_pipe_with_explicit_material_runs() {
+    // The shape every CI runner gives a command: stdin is a pipe that was
+    // closed without a single byte. Not a terminal, but no data either —
+    // explicit material must run exactly as it would in a terminal.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run(
+        &["summarize", file.to_str().unwrap()],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[test]
+fn null_stdin_with_explicit_material_runs() {
+    // stdin redirected from the null device: same verdict, same exit 0.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run_null_stdin(
+        &["summarize", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
 }
 
 #[test]
@@ -323,6 +366,38 @@ fn missing_file_fails_with_the_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unparseable_pattern_without_a_file_reports_no_file_first() {
+    // `shot[1.png` cannot parse as a glob (unclosed `[`) and no literal
+    // file exists: the error must read like the shell's — no such file —
+    // with the syntax problem only as secondary context.
+    let out = run_tty(&["ocr", "shot[1.png"], &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("no files match"), "{err}");
+    assert!(err.contains("shot[1.png"), "{err}");
+    assert!(err.contains("not a valid glob pattern"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_file_with_unclosed_bracket_expands_past_the_pattern() {
+    // The same unparseable name, but the file exists: the literal-file
+    // escape wins and the run proceeds past expansion.
+    let png = solid_png(2, 2);
+    let file = temp_file("shot[1.png", &png);
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run_tty_with(
+        &["ocr", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
 #[test]
 fn ocr_requires_image_material() {
     let out = run(&["ocr"], b"only text\n", &[]);
@@ -360,9 +435,15 @@ fn dry_run_does_not_touch_the_clipboard() {
     let out = run_tty(&["ocr", "--paste", "--dry-run"], &[]);
     let err = out.stderr();
     assert!(!err.contains("clipboard:"), "{err}");
-    // the placeholder keeps the type checks honest: ocr needs an image
-    assert_eq!(out.code(), 2, "{err}");
-    assert!(err.contains("image"), "{err}");
+    // ocr requires image material, but the unread clipboard's kind is
+    // decided at runtime — the plan must preview, not fail the type check.
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("clipboard (not read under --dry-run)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unknown (decided at runtime)"), "{stdout}");
 }
 
 fn expansion_dir(name: &str) -> std::path::PathBuf {

@@ -4,7 +4,7 @@
 use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
 use crate::config;
 use crate::domain::{
-    AppError, AppResult, Destination, GenerationStatus, MediaKind, RunRecord, RunSummary,
+    AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind, RunRecord, RunSummary,
 };
 use crate::history;
 use crate::input::InputEnv;
@@ -32,11 +32,25 @@ struct PendingRun {
     record_history: bool,
 }
 
+/// Shared run state. The interrupted-run placeholder is claimed once the
+/// outcome exists — a later Ctrl+C must not overwrite a real record with
+/// an empty cancelled one — while the run identity stays until the end:
+/// a failure after the generation ran still names the run it belongs to.
+#[derive(Default)]
+struct RunState {
+    pending: Option<PendingRun>,
+    identity: Option<(String, Option<String>)>,
+}
+
 pub async fn run() -> i32 {
+    // A normalize error fires before clap ever parses, so the --json
+    // decision starts as a naive argv scan; once parsing succeeded, the
+    // parsed flag overrides it.
+    let wants_json = std::env::args_os().any(|a| a == "--json");
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let normalized = match cli::normalize(argv) {
         Ok(n) => n,
-        Err(e) => return fail(&AppError::usage(format!("{e:#}"))),
+        Err(e) => return fail(&AppError::usage(format!("{e:#}")), wants_json, None, None),
     };
     let cli = match Cli::try_parse_from(
         std::iter::once(std::ffi::OsString::from("aido")).chain(normalized.argv.clone()),
@@ -47,26 +61,36 @@ pub async fn run() -> i32 {
             return if e.use_stderr() { 2 } else { 0 };
         }
     };
+    let wants_json = cli.json;
     // Ctrl+C anywhere in a run cancels it (exit 130) instead of hanging on
     // a slow request or leaving a half-written delivery. The interrupted
     // run is recorded as cancelled when a plan had already been built.
-    let pending: Arc<std::sync::Mutex<Option<PendingRun>>> = Arc::default();
+    let state: Arc<std::sync::Mutex<RunState>> = Arc::default();
     let result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
-            record_cancelled(&pending);
+            record_cancelled(&state);
             return EXIT_CANCEL;
         }
-        result = dispatch(cli, normalized, pending.clone()) => result,
+        result = dispatch(cli, normalized, state.clone()) => result,
     };
     match result {
         Ok(()) => 0,
-        Err(e) => fail(&e),
+        Err(e) => {
+            // The run identity is known once a plan was built; earlier
+            // failures have neither a run id nor a task.
+            let identity = state.lock().ok().and_then(|s| s.identity.clone());
+            let (run_id, task) = match &identity {
+                Some((id, task)) => (Some(id.as_str()), task.as_deref()),
+                None => (None, None),
+            };
+            fail(&e, wants_json, run_id, task)
+        }
     }
 }
 
-fn record_cancelled(pending: &std::sync::Mutex<Option<PendingRun>>) {
-    let claimed = pending.lock().ok().and_then(|mut slot| slot.take());
+fn record_cancelled(state: &std::sync::Mutex<RunState>) {
+    let claimed = state.lock().ok().and_then(|mut s| s.pending.take());
     match claimed {
         Some(p) => {
             eprintln!("interrupted — the run was cancelled, nothing was delivered");
@@ -79,6 +103,8 @@ fn record_cancelled(pending: &std::sync::Mutex<Option<PendingRun>>) {
                     generation: GenerationStatus::Cancelled,
                     artifacts: Vec::new(),
                     warnings: vec!["interrupted by Ctrl+C".into()],
+                    failed_parts: Vec::new(),
+                    parts_total: 0,
                     deliveries: Vec::new(),
                 };
                 best_effort(
@@ -91,8 +117,25 @@ fn record_cancelled(pending: &std::sync::Mutex<Option<PendingRun>>) {
     }
 }
 
-fn fail(e: &AppError) -> i32 {
+fn fail(e: &AppError, json: bool, run_id: Option<&str>, task: Option<&str>) -> i32 {
     let _ = std::io::stdout().flush();
+    // Delivery and partial failures already carry the full JSON run report
+    // printed by the delivery path (exit 5/6); another report here would
+    // append a second JSON document to stdout. Every other failure class
+    // has no report yet — with --json, emit the shared error envelope so
+    // script callers get one report on every exit code.
+    if json
+        && matches!(
+            e.kind,
+            ErrorKind::Usage | ErrorKind::Service | ErrorKind::Generation
+        )
+    {
+        let report = output::error_report(e.kind, &e.chain(), run_id, task);
+        let mut out = std::io::stdout().lock();
+        let _ = serde_json::to_writer_pretty(&mut out, &report);
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    }
     eprintln!("error: {}", e.chain());
     e.kind.exit_code()
 }
@@ -100,7 +143,7 @@ fn fail(e: &AppError) -> i32 {
 async fn dispatch(
     cli: Cli,
     normalized: Normalized,
-    pending: Arc<std::sync::Mutex<Option<PendingRun>>>,
+    state: Arc<std::sync::Mutex<RunState>>,
 ) -> AppResult<()> {
     // Management subcommands.
     match &cli.command {
@@ -163,8 +206,9 @@ async fn dispatch(
     } else {
         history::stamp_now()
     };
-    if let Ok(mut slot) = pending.lock() {
-        *slot = Some(PendingRun {
+    if let Ok(mut state) = state.lock() {
+        state.identity = Some((run_id.clone(), Some(task.name.clone())));
+        state.pending = Some(PendingRun {
             run_id: run_id.clone(),
             task: Some(task.name.clone()),
             created_at: now_iso(),
@@ -177,9 +221,10 @@ async fn dispatch(
     let output = runner::execute(&plan).await?;
     // The outcome now exists and is recorded below; a Ctrl+C from here on
     // (during the save or the delivery) must not overwrite that record
-    // with an empty cancelled placeholder.
-    if let Ok(mut slot) = pending.lock() {
-        *slot = None;
+    // with an empty cancelled placeholder. The identity stays: the error
+    // report still names the run it belongs to.
+    if let Ok(mut state) = state.lock() {
+        state.pending = None;
     }
 
     // A generation that finished cleanly but did not satisfy the request
@@ -220,30 +265,62 @@ async fn dispatch(
         generation,
         artifacts: output.artifacts.clone(),
         warnings: output.warnings.clone(),
+        failed_parts: output
+            .failed_parts
+            .iter()
+            .map(|f| (f.name.clone(), f.error.clone()))
+            .collect(),
+        parts_total: output.parts_total,
         deliveries: Vec::new(),
     };
     if !record.generation.is_complete() {
         if plan.record_history {
             // `output.status` is Complete for an unsatisfied generation:
             // its validated artifacts stay in the record's directory
-            // instead of being dropped. A truncated stream keeps metadata
-            // only — partial text is never presented as recoverable.
+            // instead of being dropped. A run whose requests died mid-way
+            // keeps the same promise for whatever text did arrive — but a
+            // first-request failure has no text to keep, so it records
+            // metadata only, exactly like a truncated stream.
+            let keep_artifacts = output.status.is_complete()
+                || (output.failure.is_some() && !output.artifacts.is_empty());
             best_effort(
-                history::save_generation(&record, output.status.is_complete()),
+                history::save_generation(&record, keep_artifacts),
                 "failed to record the run",
             );
+            // Text that already streamed live cannot be taken back; point
+            // the user at the record that now holds it. Only a run that
+            // actually streamed whole replies into a kept artifact can
+            // make that claim — a reduce run streams no map reply and
+            // keeps no artifact, and a truncated stream records metadata
+            // only (no `failure`, no warning).
+            if output.live_stdout
+                && output.failure.is_some()
+                && output.steps_done > 0
+                && !output.artifacts.is_empty()
+            {
+                eprintln!(
+                    "warning: 已输出前 {}/{} 个分片的结果；完整记录见 aido history show {}",
+                    output.steps_done, output.steps_total, run_id
+                );
+            }
         }
         let reason = match &record.generation {
             GenerationStatus::Incomplete { reason } => format!(" ({reason})"),
             _ => String::new(),
         };
-        let message = if unsatisfied.is_some() {
+        let message = if unsatisfied.is_some() && output.failure.is_none() {
             format!(
                 "the generation did not satisfy the request{reason}; the result is not delivered"
             )
         } else {
             format!("the generation did not complete{reason}; the result is not delivered")
         };
+        if let Some(failure) = output.failure.as_ref() {
+            // The failed request's own class decides the exit code (a 500
+            // is a service error, 3) instead of a blanket generation
+            // failure; only a failure-less incompleteness stays exit 4.
+            return Err(AppError::new(failure.kind, message));
+        }
         return Err(AppError::generation(message));
     }
 
@@ -409,27 +486,27 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
             for (n, id) in ids.iter().rev().enumerate() {
                 let n = n + 1;
                 match history::load(id) {
-                    Ok(Some(record)) => println!(
-                        "{n:>width$}  {id}  {:<12} {}",
-                        record.task.as_deref().unwrap_or("-"),
-                        generation_label(&record.generation)
-                    ),
+                    Ok(Some(record)) => {
+                        let mut label = generation_label(&record.generation);
+                        if !record.failed_parts.is_empty() {
+                            label.push_str(&format!(
+                                "; {}/{} input part(s) failed",
+                                record.failed_parts.len(),
+                                record.parts_total.max(record.failed_parts.len())
+                            ));
+                        }
+                        println!(
+                            "{n:>width$}  {id}  {:<12} {label}",
+                            record.task.as_deref().unwrap_or("-")
+                        );
+                    }
                     Ok(None) => println!("{n:>width$}  {id}  (unreadable)"),
                     Err(e) => println!("{n:>width$}  {id}  (error: {e:#})"),
                 }
             }
             Ok(())
         }
-        HistoryCmd::Show {
-            target,
-            output,
-            out_dir,
-            copy,
-            stdout,
-            json,
-            overwrite,
-            quiet,
-        } => {
+        HistoryCmd::Show { target } => {
             let record = resolve_run(target)?;
             if !record.generation.is_complete() {
                 println!(
@@ -441,18 +518,10 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
                 );
                 return Ok(());
             }
-            // The subcommand's own flags win; the same flags placed before
-            // the management word (`aido --copy history show 1`) count too.
-            let options = RestoreOptions {
-                output: output.clone().or_else(|| cli.output.clone()),
-                out_dir: out_dir.clone().or_else(|| cli.out_dir.clone()),
-                stdout: *stdout || cli.stdout,
-                json: *json || cli.json,
-                copy: *copy || cli.copy,
-                overwrite: *overwrite || cli.overwrite,
-                quiet: *quiet || cli.quiet,
-            };
-            deliver_restored(&options, record).await
+            // The normalizer hoists flags ahead of the management words, so
+            // clap assigned them to the top-level `Cli`; that is the single
+            // source of truth here, exactly as for `last`.
+            deliver_restored(&RestoreOptions::from_cli(cli), record).await
         }
     }
 }
@@ -528,7 +597,9 @@ async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppRes
         json: options.json,
         run_id: &record.run_id,
         task: record.task.as_deref(),
-        failed_parts: &[],
+        // The restored report describes the run as it was: a partially
+        // failed batch must not read as a full success here either.
+        failed_parts: &record.failed_parts,
     };
     output::deliver(&args).result().map(|_| ())
 }
@@ -681,7 +752,8 @@ fn processor_name(kind: crate::tasks::ProcessorKind) -> &'static str {
     match kind {
         crate::tasks::ProcessorKind::Single => "single",
         crate::tasks::ProcessorKind::OcrTiles => "ocr-tiles",
-        crate::tasks::ProcessorKind::ChunkMapReduce => "chunk-map-reduce",
+        crate::tasks::ProcessorKind::ChunkJoin => "chunk-join",
+        crate::tasks::ProcessorKind::ChunkReduce => "chunk-reduce",
     }
 }
 

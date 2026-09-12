@@ -13,13 +13,17 @@
 //! glossary must not become a request of its own. Fewer than two file
 //! parts is not a batch, and the strategy plans exactly as before.
 //!
+//! Sharing never drops material, so a shared text past the carry budget
+//! ([`MAX_CARRY_CHARS`]) only earns one stderr note per plan: every
+//! part's request still carries it, and the note warns about the cost.
+//!
 //! Input-extension contract (#35): when glob / directory / URL inputs
 //! land, they count as batch units through the same rule — material that
 //! carries a file name. A URL that downloads to a temp file or a
 //! dedicated `InputSource::Url` variant only needs a sensible name; no
 //! change here.
 
-use super::{dispatch, RequestStep};
+use super::{dispatch, text_chars, RequestStep, MAX_CARRY_CHARS};
 use crate::domain::{InputPart, InputSource};
 use crate::tasks::ProcessorKind;
 use anyhow::Result;
@@ -46,6 +50,7 @@ pub fn plan_steps(
         .cloned()
         .collect();
     let stems = unique_stems(&units);
+    warn_shared_budget(&shared, quiet);
 
     let mut steps = Vec::new();
     for (part, stem) in units.iter().zip(&stems) {
@@ -68,6 +73,21 @@ pub fn plan_steps(
         }
     }
     Ok(steps)
+}
+
+/// Unlike the chunk strategies' carry guard, shared material is never
+/// dropped: a glossary must not become a request of its own, so every
+/// part's request keeps carrying it. Past the carry budget
+/// ([`MAX_CARRY_CHARS`]) that repetition may crowd the model's context
+/// window, which is worth one note per plan (`quiet` suppresses it).
+fn warn_shared_budget(shared: &[InputPart], quiet: bool) {
+    let chars = text_chars(shared);
+    if chars > MAX_CARRY_CHARS && !quiet {
+        eprintln!(
+            "note: shared context material ({chars} chars) rides with every \
+             part's request and may exceed the model's context window"
+        );
+    }
 }
 
 /// Output stems (`a.png` → `a`), unique across the batch in input order:
@@ -117,6 +137,7 @@ mod tests {
             source: InputSource::File(std::path::PathBuf::from(path)),
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(format!("material of {name}")),
         }
@@ -128,6 +149,7 @@ mod tests {
             source: InputSource::Literal,
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(format!("shared {name}")),
         }
@@ -201,5 +223,32 @@ mod tests {
         let steps = plan_steps(&inputs, ProcessorKind::Single, true).unwrap();
         assert_eq!(steps[0].artifact_stem, Some("a-b".into()));
         assert_eq!(steps[1].artifact_stem, Some("a-b-2".into()));
+    }
+
+    #[test]
+    fn a_reduce_step_belongs_to_its_part() {
+        // A long text chunks into three, so each part plans three map
+        // steps plus its own reduce step — the consolidation happens per
+        // part, not once over every part's replies.
+        let long = |id: usize, path: &str| InputPart {
+            id,
+            source: InputSource::File(std::path::PathBuf::from(path)),
+            name: path.into(),
+            kind: MediaKind::Text,
+            unknown_kind: false,
+            mime: "text/plain".into(),
+            content: InputContent::Text("字".repeat(9000)),
+        };
+        let inputs = [long(1, "a.md"), long(2, "b.md")];
+        let steps = plan_steps(&inputs, ProcessorKind::ChunkReduce, true).unwrap();
+        assert_eq!(steps.len(), 8, "3 map + 1 reduce per part");
+        for (reduce, id) in [(&steps[3], 1), (&steps[7], 2)] {
+            assert_eq!(reduce.role, crate::processors::StepRole::Reduce);
+            assert_eq!(reduce.part, Some(id));
+        }
+        assert!(steps[..3]
+            .iter()
+            .chain(&steps[4..7])
+            .all(|s| s.role == crate::processors::StepRole::Map));
     }
 }

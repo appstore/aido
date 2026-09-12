@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// The three content kinds aido understands on either side of a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Text,
@@ -67,6 +67,11 @@ pub struct InputPart {
     /// clipboard get a synthesized one), used for labels and history.
     pub name: String,
     pub kind: MediaKind,
+    /// Set only by the `--dry-run` clipboard placeholder: `kind` above is
+    /// a stand-in (text), not the real kind, which the actual run learns
+    /// when it reads the clipboard. Validation treats such a part as
+    /// acceptable to any task instead of judging the stand-in kind.
+    pub unknown_kind: bool,
     pub mime: String,
     pub content: InputContent,
 }
@@ -92,13 +97,19 @@ pub enum InputContent {
 // ---------------------------------------------------------------------------
 
 /// Which request produced an artifact, so `--dry-run` plans and run records
-/// can explain provenance. One run may issue several requests (OCR slices).
+/// can explain provenance. One run may issue several requests (OCR slices,
+/// text chunks): a merged artifact names every request whose reply it joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Provenance {
     /// Produced by request `index` (0-based) of the run.
     Request { index: usize },
-    /// Restored from history; not produced in this process.
+    /// Joined from the replies of several requests of one run, named in
+    /// reply order (an ocr run's slices, a chunk-join run's chunks).
+    Merged { requests: Vec<usize> },
+    /// Restored from history (`aido last`, `history show`); not produced
+    /// in this process. Set only when artifacts are loaded back — history
+    /// manifests store no provenance, so this is never written to disk.
     Restored,
 }
 
@@ -222,6 +233,15 @@ pub struct RunRecord {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Per-part batches only: the (part name, error) pairs that failed
+    /// while the surviving parts delivered, so a restored run's report can
+    /// name them instead of reading as a full success. The defaults keep
+    /// records written before this field parsing.
+    #[serde(default)]
+    pub failed_parts: Vec<(String, String)>,
+    /// Total parts of the per-part batch (0 outside one).
+    #[serde(default)]
+    pub parts_total: usize,
     #[serde(default)]
     pub deliveries: Vec<DeliveryState>,
 }
@@ -298,6 +318,18 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// The name this kind carries in the JSON run report's `error.kind`,
+    /// shared by the success report and the error report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::Service => "service",
+            Self::Generation => "generation",
+            Self::Delivery => "delivery",
+            Self::Partial => "partial",
+        }
+    }
+
     pub fn exit_code(self) -> i32 {
         match self {
             Self::Usage => 2,
@@ -347,12 +379,18 @@ impl AppError {
         Self::new(ErrorKind::Partial, message)
     }
 
-    /// The full message plus every underlying cause, one per line.
+    /// The message plus every underlying cause, one per line, following
+    /// `source()` to the end of the chain.
     pub fn chain(&self) -> String {
         let mut out = self.message.clone();
-        if let Some(err) = self.source.as_deref() {
-            out.push_str(": ");
+        let mut cause: Option<&dyn std::error::Error> = match &self.source {
+            Some(err) => Some(err.as_ref()),
+            None => None,
+        };
+        while let Some(err) = cause {
+            out.push('\n');
             out.push_str(&err.to_string());
+            cause = err.source();
         }
         out
     }
@@ -404,6 +442,7 @@ mod tests {
             source: InputSource::Literal,
             name: format!("part-{id}"),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
@@ -415,6 +454,7 @@ mod tests {
             source: InputSource::File("a.png".into()),
             name: "a.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
         }
@@ -455,6 +495,8 @@ mod tests {
                 provenance: Provenance::Request { index: 0 },
             }],
             warnings: Vec::new(),
+            failed_parts: Vec::new(),
+            parts_total: 0,
             deliveries: vec![DeliveryState {
                 destination: Destination::Clipboard,
                 status: DeliveryStatus::Failed {
@@ -473,6 +515,69 @@ mod tests {
         let err = AppError::from(io_err);
         assert!(err.chain().contains("gone"));
         assert_eq!(err.kind.exit_code(), 3);
+    }
+
+    #[test]
+    fn app_error_chain_walks_every_cause_layer_one_per_line() {
+        // `From<io::Error>` only ever attaches one layer, so build a source
+        // chain two layers deep by hand: the walk must not stop after the
+        // first cause.
+        #[derive(Debug)]
+        struct Leaf;
+        impl std::fmt::Display for Leaf {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("leaf cause")
+            }
+        }
+        impl std::error::Error for Leaf {}
+
+        #[derive(Debug)]
+        struct Mid;
+        impl std::fmt::Display for Mid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("mid cause")
+            }
+        }
+        impl std::error::Error for Mid {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Leaf)
+            }
+        }
+
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "top message".into(),
+            source: Some(Box::new(Mid)),
+        };
+        let chain = err.chain();
+        let lines: Vec<&str> = chain.lines().collect();
+        assert_eq!(lines, ["top message", "mid cause", "leaf cause"]);
+    }
+
+    #[test]
+    fn provenance_keeps_the_tagged_form_old_records_carry() {
+        // The shape the --out-dir delivery manifests carry. Old records
+        // hold "request" and "restored"; "merged" only joins them, so
+        // every historical form still parses.
+        assert_eq!(
+            serde_json::to_value(Provenance::Request { index: 0 }).unwrap(),
+            serde_json::json!({"type": "request", "index": 0})
+        );
+        for (raw, parsed) in [
+            (
+                r#"{"type":"request","index":3}"#,
+                Provenance::Request { index: 3 },
+            ),
+            (r#"{"type":"restored"}"#, Provenance::Restored),
+            (
+                r#"{"type":"merged","requests":[0,1,2]}"#,
+                Provenance::Merged {
+                    requests: vec![0, 1, 2],
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<Provenance>(raw).unwrap(), parsed);
+        }
     }
 
     #[test]

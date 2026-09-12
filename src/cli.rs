@@ -721,34 +721,14 @@ pub enum HistoryCmd {
         /// or a unique prefix of one
         #[arg(value_name = "RUN")]
         target: String,
-
-        /// Save exactly one artifact to FILE ("-" for stdout)
-        #[arg(short = 'o', long, value_name = "FILE", conflicts_with = "out_dir")]
-        output: Option<PathBuf>,
-
-        /// Save the full artifact set plus a manifest into DIR
-        #[arg(long, value_name = "DIR")]
-        out_dir: Option<PathBuf>,
-
-        /// Write a single text or image artifact to the clipboard
-        #[arg(short = 'c', long)]
-        copy: bool,
-
-        /// Write the result body (or a single media artifact) to stdout
-        #[arg(long, conflicts_with = "json")]
-        stdout: bool,
-
-        /// Print a versioned run report on stdout instead of the body
-        #[arg(long)]
-        json: bool,
-
-        /// Replace an existing output file instead of failing
-        #[arg(long)]
-        overwrite: bool,
-
-        /// Hide progress and success notes (errors still print)
-        #[arg(long)]
-        quiet: bool,
+        // Delivery flags (-o/--output, --out-dir, --copy, --stdout, --json,
+        // --overwrite, --quiet) must live ONLY on the top-level `Cli`: the
+        // normalizer collects every flag before the management words, so
+        // `aido history show 1 --copy` reaches clap as
+        // `[--copy, history, show, 1]` and `Cli` assigns `--copy`. A
+        // duplicate declared here could never be assigned — it would parse
+        // as `None`/`false` while looking real. app.rs reads the flags
+        // straight off `Cli`.
     },
 }
 

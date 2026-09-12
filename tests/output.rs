@@ -132,6 +132,56 @@ fn media_extension_mismatch_fails_before_any_request() {
     assert!(err.contains(".png"), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn image_to_clipboard_in_a_terminal_is_a_valid_plan() {
+    // `--copy` is a documented destination for a binary artifact: in a
+    // real terminal session (stdout is a tty too) the plan must list the
+    // clipboard instead of demanding -o/--out-dir.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run_full_tty(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--copy",
+            "--dry-run",
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    let plan = out.stdout();
+    assert!(plan.contains("destinations:"), "{plan}");
+    assert!(plan.contains("clipboard"), "{plan}");
+}
+
+#[cfg(unix)]
+#[test]
+fn image_without_any_destination_in_a_terminal_is_still_refused() {
+    // The guard itself stays: a bare terminal cannot receive binary.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run_full_tty(
+        &["image", "--profile", "test", "--text", "dog", "--dry-run"],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("binary output needs"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
 #[test]
 fn directory_delivery_writes_artifacts_then_manifest() {
     let png = solid_png(2, 2);
@@ -195,6 +245,108 @@ fn directory_delivery_writes_artifacts_then_manifest() {
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn out_dir_keeps_the_previous_delivery_without_overwrite() {
+    // Run 1: a plain summary lands as text.txt plus its manifest.
+    let server = Server::json(chat_body("first"));
+    let dir = temp_dir("out-dir-twice");
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("text.txt")).unwrap(),
+        "first"
+    );
+    let manifest_before = std::fs::read(dir.join("manifest.json")).unwrap();
+
+    // Run 2: a translate batch names its files a.txt/b.txt, so only the
+    // manifest collides. Without --overwrite the run fails before writing
+    // a byte: no new files, and the old manifest still describes the
+    // first delivery exactly as run 1 left it.
+    let inputs = temp_dir("out-dir-twice-inputs");
+    let a = inputs.join("a.md");
+    let b = inputs.join("b.md");
+    std::fs::write(&a, "hello").unwrap();
+    std::fs::write(&b, "world").unwrap();
+    let server = MultiServer::start(&[chat_body("你好"), chat_body("世界")]);
+    let cfg = chat_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--to",
+            "zh-CN",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(5);
+    let err = out.stderr();
+    assert!(err.contains("manifest.json"), "{err}");
+    assert!(err.contains("--overwrite"), "{err}");
+    assert!(!dir.join("a.txt").exists(), "no byte may be written");
+    assert!(!dir.join("b.txt").exists(), "no byte may be written");
+    assert_eq!(
+        std::fs::read(dir.join("manifest.json")).unwrap(),
+        manifest_before,
+        "the old manifest survives untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("text.txt")).unwrap(),
+        "first"
+    );
+
+    // Run 3: the same batch with --overwrite replaces the whole delivery;
+    // the manifest now lists only this run's artifacts.
+    let server = MultiServer::start(&[chat_body("你好"), chat_body("世界")]);
+    let cfg = chat_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--to",
+            "zh-CN",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+            "--overwrite",
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "你好");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "世界");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let files: Vec<_> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["a.txt", "b.txt"]);
 }
 
 #[test]
@@ -284,9 +436,111 @@ fn json_conflicts_with_explicit_stdout() {
     assert!(out.stderr().contains("stdout"), "stderr: {}", out.stderr());
 }
 
+/// The `--json` error contract: on usage (2), service (3) and generation
+/// (4) failures stdout still carries exactly one valid JSON report — the
+/// success report's envelope and field names, with `error` filled in —
+/// and stderr keeps the human-readable line.
+fn assert_json_error_report(out: &RunOutcome, code: i32, kind: &str) {
+    out.assert_code(code);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["error"]["kind"], kind, "report: {report}");
+    assert!(
+        !report["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "report: {report}"
+    );
+    assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
+}
+
+#[test]
+fn json_error_report_covers_usage_exit_two() {
+    // `--produce audio` exceeds what the summarize adapter can output: a
+    // preflight usage error, before any run exists.
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--produce",
+            "audio",
+            "--json",
+            "--text",
+            "hi",
+        ],
+        b"",
+        &[],
+    );
+    assert_json_error_report(&out, 2, "usage");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert!(report["run_id"].is_null(), "no run yet: {report}");
+    assert!(report["task"].is_null(), "no run yet: {report}");
+}
+
+#[test]
+fn json_error_report_covers_errors_before_clap_parses() {
+    // An unknown task fails inside the argv normalizer, before clap could
+    // have parsed --json; the naive argv scan must still yield the report.
+    let out = run(&["--json", "nosuchtask", "notes.txt"], b"", &[]);
+    assert_json_error_report(&out, 2, "usage");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert!(report["run_id"].is_null(), "no run yet: {report}");
+    assert!(report["task"].is_null(), "no run yet: {report}");
+}
+
+#[test]
+fn json_error_report_covers_service_exit_three() {
+    let server = Server::start(
+        "500 Internal Server Error",
+        r#"{"error":{"message":"service exploded"}}"#,
+    );
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &["summarize", "--profile", "test", "--json"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert_json_error_report(&out, 3, "service");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["task"], "summarize", "report: {report}");
+    assert!(report["run_id"].is_string(), "the run existed: {report}");
+    assert!(
+        out.stderr().contains("service exploded"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn json_error_report_covers_truncated_generation_exit_four() {
+    // The same truncated reply as protocol.rs's exit-4 fixture: with
+    // --json, stdout carries the error report instead of staying empty.
+    let server =
+        Server::json(r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#);
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &["summarize", "--profile", "test", "--json"],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    assert_json_error_report(&out, 4, "generation");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["task"], "summarize", "report: {report}");
+    assert!(report["run_id"].is_string(), "the run existed: {report}");
+    assert!(
+        out.stderr().contains("not delivered"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
 #[test]
 fn several_artifacts_cannot_share_bare_stdout() {
-    // produce two kinds and pipe stdout: the late check catches it.
+    // produce two kinds and pipe stdout: the late check catches it — as a
+    // delivery failure (exit 5), since the generation already ran.
     let body = serde_json::json!({"status":"completed","output":[
         {"type":"message","content":[{"type":"output_text","text":"text part"}]},
         {"type":"image_generation_call","result":encode_png()}
@@ -313,11 +567,89 @@ fn several_artifacts_cannot_share_bare_stdout() {
         &[("AIDO_CONFIG", cfg.to_str().unwrap())],
         cfg.clone(),
     );
-    assert_eq!(out.code(), 2, "stderr: {}", out.stderr());
+    assert_eq!(out.code(), 5, "stderr: {}", out.stderr());
     assert!(out
         .stderr()
         .contains("several artifacts cannot share bare stdout"));
     assert!(out.stdout().is_empty());
+}
+
+#[test]
+fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
+    // The service returns two images but only `-o one.png` was given: the
+    // generation succeeded, so the refusal is a delivery failure (exit 5),
+    // the run's history records the failed file attempt, and
+    // `aido last --out-dir` recovers both artifacts without the model.
+    let png = solid_png(2, 2);
+    let encoded = encode_png();
+    let body = serde_json::json!({"data":[{"b64_json":encoded},{"b64_json":encoded}]}).to_string();
+    let server = Server::json(&body);
+    let history = temp_dir("delivery-history");
+    let file = temp_dir("delivery-target").join("one.png");
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(5);
+    let err = out.stderr();
+    assert!(err.contains("2 artifacts cannot go to one file"), "{err}");
+    assert!(
+        !file.exists(),
+        "the refused target must not have been written"
+    );
+
+    // The run's manifest shows a complete generation and the failed file
+    // delivery, next to the kept artifacts.
+    let mut entries: Vec<_> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one run dir, got {entries:?}");
+    let run_dir = entries.pop().unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "complete");
+    assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 2);
+    let deliveries = manifest["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1, "deliveries: {deliveries:?}");
+    assert_eq!(deliveries[0]["destination"]["type"], "file");
+    assert!(deliveries[0]["status"]["failed"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("one file"));
+
+    // Recovery: redeliver the recorded run into a fresh directory.
+    let recovered = temp_dir("delivery-recovered");
+    let out = run(
+        &["last", "--out-dir", recovered.to_str().unwrap()],
+        b"",
+        &[
+            ("AIDO_CONFIG", empty_config().to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read(recovered.join("image-1.png")).unwrap(), png);
+    assert_eq!(std::fs::read(recovered.join("image-2.png")).unwrap(), png);
 }
 
 pub fn encode_png() -> String {
@@ -369,4 +701,73 @@ fn attached_short_o_delivers_to_the_named_file() {
     );
     out.assert_code(0);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "FILED");
+}
+
+#[cfg(unix)]
+#[test]
+fn output_file_mode_follows_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // The child inherits this process's umask; read it the way the
+    // delivery code does — umask(0) also sets, so restore immediately.
+    let raw = unsafe { libc::umask(0) };
+    unsafe { libc::umask(raw) };
+    // mode_t is u16 on macOS and u32 on Linux; widen for the mode math.
+    #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
+    let mask = raw as u32;
+    let server = Server::json(chat_body("UMASKED"));
+    let dir = temp_dir("out-umask");
+    let file = dir.join("summary.md");
+    let cfg = chat_cfg(&server.url());
+    let out = run(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        b"hi\n",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o666 & !mask, "delivered files follow the umask");
+}
+
+#[cfg(unix)]
+#[test]
+fn history_artifacts_stay_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let server = Server::json(chat_body("KEPT"));
+    let history = temp_dir("history-mode");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 2\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{url}\"",
+        url = server.url()
+    ));
+    let out = run(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+    // save_generation stores the artifact bytes as text.txt inside the
+    // one run directory, next to the run manifest.
+    let mut entries: Vec<_> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one run dir, got {entries:?}");
+    let run_dir = entries.pop().unwrap();
+    let mode = std::fs::metadata(run_dir.join("text.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "history artifacts stay owner-only");
 }

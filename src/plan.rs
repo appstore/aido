@@ -10,9 +10,10 @@ use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
 use crate::domain::{AppError, AppResult, Destination, InputPart, MediaKind, RunSummary};
+use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
 use crate::processors::{self, RequestStep};
-use crate::tasks::{ProcessorKind, Task};
+use crate::tasks::{ProcessorKind, Task, TaskParam};
 use std::time::Duration;
 
 /// Terminal-ness injected so plans are testable without a tty.
@@ -143,14 +144,17 @@ pub fn build(
         processors::plan_steps(&inputs, processor, cli.quiet)
     }
     .map_err(|e| AppError::usage(e.to_string()))?;
+    assert_parts_contiguous(&steps)?;
     // A batch is real only with more than one part: a single file plans
     // and delivers exactly as before.
     let mut part_ids = steps.iter().filter_map(|s| s.part).collect::<Vec<usize>>();
     part_ids.sort_unstable();
     part_ids.dedup();
     let batch = part_ids.len() > 1;
-    // Delivery-target rules don't bind a --dry-run: it only shows the plan.
-    if batch && !cli.dry_run {
+    // Delivery-target rules bind a --dry-run too: they are pure prechecks
+    // with no side effects, and a plan the real run would reject must not
+    // be shown as if it were deliverable.
+    if batch {
         if cli.output.is_some() {
             return Err(AppError::usage(
                 "a single -o FILE cannot take one artifact per input part; use --out-dir",
@@ -166,12 +170,11 @@ pub fn build(
     }
 
     // --- artifacts and encodings -------------------------------------------
-    validate_outputs(cli, &mut resolved, &steps, terminal)?;
+    validate_outputs(cli, &mut resolved, &steps)?;
 
     // --- destinations -------------------------------------------------------
     let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
     if batch
-        && !cli.dry_run
         && (destinations.contains(&Destination::Stdout) && !cli.json
             || destinations.contains(&Destination::Clipboard))
     {
@@ -262,13 +265,40 @@ pub fn build(
         delivery,
         timeout,
         total_timeout,
-        record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(50) > 0,
+        record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(DEFAULT_KEEP) > 0,
         quiet: cli.quiet,
         json: cli.json,
         param_sources,
         credentials_available,
         terminal,
     })
+}
+
+/// The runner closes a per-part group whenever the next step's `part`
+/// differs from the group's, so same-part steps must be contiguous: a
+/// step that returns to an earlier part would silently split that part
+/// into several groups whose artifacts collide on one stem.
+/// `perpart::plan_steps` appends per part in order so the invariant holds
+/// today, but `RequestStep.part` is public — this check turns a future
+/// reorder's violation into an explicit error instead. Untagged steps
+/// (`part: None`, the non-batch path) are ignored: only the tagged
+/// sequence is constrained.
+fn assert_parts_contiguous(steps: &[RequestStep]) -> AppResult<()> {
+    let mut last: Option<usize> = None;
+    for step in steps {
+        let Some(id) = step.part else {
+            continue;
+        };
+        if last.is_some_and(|prev| id < prev) {
+            return Err(AppError::usage(format!(
+                "request steps must be ordered by part (step {} returns to part \
+                 {id}); this is a processor bug",
+                step.index
+            )));
+        }
+        last = Some(id);
+    }
+    Ok(())
 }
 
 fn validate_task_params(cli: &Cli, task: &Task) -> AppResult<()> {
@@ -330,38 +360,40 @@ fn validate_task_params(cli: &Cli, task: &Task) -> AppResult<()> {
     Ok(())
 }
 
-/// Typed parameters become adapter options (or instruction suffixes).
+/// Typed parameters become adapter options; which option a parameter
+/// drives is `TaskParam::maps_to`. `--to` maps to no option: its effect
+/// is folded into the instruction by `compose_instruction`.
 fn apply_param_options(cli: &Cli, task: &Task, resolved: &mut Resolved) -> AppResult<()> {
-    let mut set = |key: &str, value: serde_json::Value| {
+    for &param in &task.params {
+        let Some(key) = param.maps_to() else {
+            continue; // instruction-level parameter, not an adapter option
+        };
+        let Some(value) = param_value(cli, task, param) else {
+            continue; // not given on the CLI and no task default
+        };
         resolved.options.insert(key.to_string(), value);
-    };
-    if task.accepts_param("voice") {
-        if let Some(voice) = &cli.voice {
-            set("voice", serde_json::Value::String(voice.clone()));
-        } else if let Some(default) = task.default_param("voice") {
-            set("voice", default.clone());
-        }
-    }
-    if task.accepts_param("speed") {
-        if let Some(speed) = cli.speed {
-            set("speed", serde_json::json!(speed));
-        }
-    }
-    if task.accepts_param("count") {
-        if let Some(count) = cli.count {
-            set("n", serde_json::json!(count));
-        }
-    }
-    if task.accepts_param("size") {
-        if let Some(size) = &cli.size {
-            set("size", serde_json::Value::String(size.clone()));
-        }
     }
     resolved
         .adapter
         .validate_options(&resolved.options)
         .map_err(AppError::from)?;
     Ok(())
+}
+
+/// The parameter's value for this run: the CLI flag, else the task's
+/// default (`voice` is the only parameter a task may default).
+fn param_value(cli: &Cli, task: &Task, param: TaskParam) -> Option<serde_json::Value> {
+    match param {
+        TaskParam::To => None, // instruction-level, see maps_to
+        TaskParam::Voice => cli
+            .voice
+            .clone()
+            .map(serde_json::Value::String)
+            .or_else(|| task.default_param("voice").cloned()),
+        TaskParam::Speed => cli.speed.map(|s| serde_json::json!(s)),
+        TaskParam::Count => cli.count.map(|c| serde_json::json!(c)),
+        TaskParam::Size => cli.size.clone().map(serde_json::Value::String),
+    }
 }
 
 /// The fixed instruction with typed parameter effects folded in.
@@ -409,6 +441,13 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     for part in inputs {
+        // An unknown-kind part is the --dry-run clipboard placeholder:
+        // its real kind is decided when the clipboard is read, so neither
+        // the allowed input types nor the adapter's accepted types can
+        // judge it yet — the actual run validates the real kind.
+        if part.unknown_kind {
+            continue;
+        }
         if let Some(allowed) = &resolved.allowed_inputs {
             if !allowed.contains(&part.kind) {
                 return Err(AppError::usage(format!(
@@ -431,7 +470,9 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     for required in &task.required_types {
-        if !inputs.iter().any(|p| p.kind == *required) {
+        // The placeholder may well turn out to be the required kind once
+        // the clipboard is read, so it satisfies the requirement here.
+        if !inputs.iter().any(|p| p.unknown_kind || p.kind == *required) {
             return Err(AppError::usage(format!(
                 "task '{}' requires {required} input; none of the material is {required}",
                 task.name
@@ -449,12 +490,7 @@ fn select_processor(cli: &Cli, task: &Task) -> ProcessorKind {
     }
 }
 
-fn validate_outputs(
-    cli: &Cli,
-    resolved: &mut Resolved,
-    steps: &[RequestStep],
-    terminal: TerminalInfo,
-) -> AppResult<()> {
+fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -> AppResult<()> {
     let media_kinds: Vec<MediaKind> = resolved
         .produce
         .iter()
@@ -501,15 +537,9 @@ fn validate_outputs(
             serde_json::Value::String(format.to_string()),
         );
     }
-    // Media output needs somewhere to go.
-    if !media_kinds.is_empty() {
-        let has_file_target = cli.output.is_some() || cli.out_dir.is_some();
-        if !has_file_target && terminal.stdout {
-            return Err(AppError::usage(
-                "binary output needs -o FILE or --out-dir, or a stdout pipe",
-            ));
-        }
-    }
+    // Media output needs somewhere to go — a judgment made on the
+    // resolved destinations in `resolve_destinations`, where every
+    // possible target (file, directory, clipboard, stdout pipe) is known.
     if resolved.produce.len() > 1 && cli.output.is_some() {
         return Err(AppError::usage(
             "several output kinds cannot go to a single -o FILE; use --out-dir",
@@ -620,10 +650,30 @@ fn resolve_destinations(
         // Default destination: stdout.
         destinations.push(Destination::Stdout);
     }
-    let _ = terminal;
+    // Binary output needs a destination that can hold it: a file, a
+    // directory, the clipboard (--copy; audio was already refused there
+    // with its own message), or stdout as a pipe — never the terminal.
+    // Judging the resolved list keeps every future destination covered
+    // instead of re-deriving CLI flags here.
+    if produce.iter().any(|k| *k != MediaKind::Text)
+        && terminal.stdout
+        && destinations
+            .iter()
+            .all(|d| matches!(d, Destination::Stdout))
+    {
+        return Err(AppError::usage(
+            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe",
+        ));
+    }
     Ok(destinations)
 }
 
+/// The dry-run's provenance report: every parameter this run would carry
+/// and where its value came from. Generation parameters (model,
+/// max_tokens, temperature) always appear; typed parameters appear for
+/// the task that declares them. The CLI flag wins, then the task's
+/// default (`to` and `voice` are the only ones a task may default), else
+/// nothing is sent for it.
 fn describe_param_sources(
     cli: &Cli,
     task: &Task,
@@ -635,19 +685,56 @@ fn describe_param_sources(
         resolved.model.clone(),
         resolved.model_source,
     ));
-    if let Some(max) = cli.max_tokens {
-        out.push(("max_tokens".into(), max.to_string(), ParamSource::Cli));
-    }
-    if let Some(to) = &cli.to {
-        out.push(("to".into(), to.clone(), ParamSource::Cli));
-    } else if task.accepts_param("to") {
-        out.push((
-            "to".into(),
-            task.default_param("to")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "auto".into()),
-            ParamSource::Task,
-        ));
+    out.push((
+        "max_tokens".into(),
+        resolved
+            .max_tokens
+            .map_or_else(|| "(not sent)".into(), |v| v.to_string()),
+        resolved.max_tokens_source,
+    ));
+    out.push((
+        "temperature".into(),
+        resolved
+            .temperature
+            .map_or_else(|| "(not sent)".into(), |v| v.to_string()),
+        resolved.temperature_source,
+    ));
+    for param in &task.params {
+        let (value, source) = match param {
+            // `--to` never becomes an adapter option: its effect is folded
+            // into the instruction, with "auto" as the program's fallback
+            // target.
+            TaskParam::To => match &cli.to {
+                Some(to) => (to.clone(), ParamSource::Cli),
+                None => match task.default_param("to").and_then(|v| v.as_str()) {
+                    Some(to) => (to.to_string(), ParamSource::Task),
+                    None => ("auto".to_string(), ParamSource::Default),
+                },
+            },
+            TaskParam::Voice => match &cli.voice {
+                Some(voice) => (voice.clone(), ParamSource::Cli),
+                None => match task.default_param("voice").and_then(|v| v.as_str()) {
+                    Some(voice) => (voice.to_string(), ParamSource::Task),
+                    None => ("(not sent)".to_string(), ParamSource::Default),
+                },
+            },
+            // speed/count/size are CLI-only: no task default feeds them
+            // (task `defaults` reach these two above, task `options` reach
+            // the request directly, not through these typed parameters).
+            TaskParam::Speed => match cli.speed {
+                Some(speed) => (speed.to_string(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+            TaskParam::Count => match cli.count {
+                Some(count) => (count.to_string(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+            TaskParam::Size => match &cli.size {
+                Some(size) => (size.clone(), ParamSource::Cli),
+                None => ("(not sent)".to_string(), ParamSource::Default),
+            },
+        };
+        out.push((param.name().into(), value, source));
     }
     out
 }
@@ -676,6 +763,13 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         "provider:    {} → {} (route: {})\n",
         r.provider_name, shown_url, r.adapter
     ));
+    // The dry-run never builds a client, so the cleartext-credential
+    // hint fires here too, under the same conditions the client uses.
+    if let Some(warning) =
+        crate::api::cleartext_key_warning(r.base_url.as_deref(), api_key_present(r))
+    {
+        out.push_str(&format!("warning:     {warning}\n"));
+    }
     out.push_str(&format!("model:       {}\n", r.model));
     if !plan.instruction.is_empty() {
         out.push_str(&format!("instruction: {}\n", first_line(&plan.instruction)));
@@ -688,11 +782,18 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         out.push_str("  (none — the instruction alone drives this run)\n");
     }
     for part in &plan.inputs {
+        // The --dry-run clipboard placeholder has no kind yet; say so
+        // instead of printing the stand-in "text".
+        let kind = if part.unknown_kind {
+            "unknown (decided at runtime)"
+        } else {
+            part.kind.as_str()
+        };
         out.push_str(&format!(
             "  {}. {}  {}  {}  [{}]\n",
             part.id + 1,
             part.name,
-            part.kind,
+            kind,
             part.source,
             human_bytes(match &part.content {
                 crate::domain::InputContent::Text(s) => s.len() as u64,
@@ -727,7 +828,7 @@ pub fn describe(plan: &ExecutionPlan) -> String {
                 format!("ocr-tiles — {}", parts.join("; "))
             }
         }
-        ProcessorKind::ChunkMapReduce => {
+        ProcessorKind::ChunkJoin => {
             let mut parts = Vec::new();
             for step in &plan.steps {
                 if step.label != "all material" {
@@ -735,9 +836,22 @@ pub fn describe(plan: &ExecutionPlan) -> String {
                 }
             }
             if parts.is_empty() {
-                "chunk-map-reduce (no text needs chunking)".to_string()
+                "chunk-join (no text needs chunking)".to_string()
             } else {
-                format!("chunk-map-reduce — {}", parts.join("; "))
+                format!("chunk-join — {}", parts.join("; "))
+            }
+        }
+        ProcessorKind::ChunkReduce => {
+            let mut parts = Vec::new();
+            for step in &plan.steps {
+                if step.label != "all material" {
+                    parts.push(step.label.clone());
+                }
+            }
+            if parts.is_empty() {
+                "chunk-reduce (no text needs chunking)".to_string()
+            } else {
+                format!("chunk-reduce — {}", parts.join("; "))
             }
         }
     };
@@ -806,6 +920,20 @@ fn first_line(s: &str) -> String {
     }
 }
 
+/// Whether the run would actually carry a key: the provider's env var is
+/// set and non-empty, with the conventional OpenAI name as a fallback for
+/// the default provider — the same resolution the client's caller uses.
+fn api_key_present(resolved: &Resolved) -> bool {
+    fn env_nonempty(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    }
+    resolved.api_key_env.as_deref().is_some_and(|name| {
+        env_nonempty(name) || (name == "AIDO_API_KEY" && env_nonempty("OPENAI_API_KEY"))
+    })
+}
+
 fn human_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -816,10 +944,17 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Strip potentially sensitive query values from URLs shown in reports.
+/// Strip credentials and potentially sensitive query values from URLs
+/// shown in reports.
 fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut u) => {
+            if !u.username().is_empty() {
+                let _ = u.set_username("***");
+            }
+            if u.password().is_some() {
+                let _ = u.set_password(Some("***"));
+            }
             let redacted: Vec<(String, String)> = u
                 .query_pairs()
                 .map(|(k, _)| (k.to_string(), "…".to_string()))
@@ -835,7 +970,7 @@ fn redact_url(url: &str) -> String {
             }
             u.into()
         }
-        Err(_) => url.to_string(),
+        Err(_) => "(unparseable base_url, hidden)".to_string(),
     }
 }
 
@@ -864,9 +999,105 @@ pub fn summarize(plan: &ExecutionPlan) -> RunSummary {
             match plan.processor {
                 ProcessorKind::Single => "single",
                 ProcessorKind::OcrTiles => "ocr-tiles",
-                ProcessorKind::ChunkMapReduce => "chunk-map-reduce",
+                ProcessorKind::ChunkJoin => "chunk-join",
+                ProcessorKind::ChunkReduce => "chunk-reduce",
             }
             .to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::ErrorKind;
+
+    fn step(index: usize, part: Option<usize>) -> RequestStep {
+        RequestStep {
+            index,
+            inputs: Vec::new(),
+            label: "all material".into(),
+            hard_cut_end: false,
+            part,
+            artifact_stem: None,
+            role: crate::processors::StepRole::Map,
+        }
+    }
+
+    #[test]
+    fn interleaved_parts_fail_naming_the_step_that_returns() {
+        let steps = vec![step(0, Some(0)), step(1, Some(1)), step(2, Some(0))];
+        let err = assert_parts_contiguous(&steps).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message.contains("step 2 returns to part 0"),
+            "message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("processor bug"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn contiguous_parts_pass_even_with_untagged_steps_mixed_in() {
+        // A multi-step part repeats its id (chunk strategies plan several
+        // requests per part); None-part steps are the non-batch path and
+        // constrain nothing.
+        let steps = vec![
+            step(0, None),
+            step(1, Some(0)),
+            step(2, Some(0)),
+            step(3, None),
+            step(4, Some(1)),
+            step(5, Some(2)),
+            step(6, None),
+        ];
+        assert_parts_contiguous(&steps).unwrap();
+    }
+
+    #[test]
+    fn empty_and_untagged_step_lists_pass() {
+        assert_parts_contiguous(&[]).unwrap();
+        assert_parts_contiguous(&[step(0, None), step(1, None)]).unwrap();
+    }
+    #[test]
+    fn redact_url_hides_userinfo_credentials() {
+        assert_eq!(
+            redact_url("https://user:s3cret@gw.internal/v1"),
+            "https://***:***@gw.internal/v1"
+        );
+        assert_eq!(
+            redact_url("https://user@gw.internal/v1"),
+            "https://***@gw.internal/v1"
+        );
+    }
+    #[test]
+    fn redact_url_still_masks_query_values() {
+        // the `…` marker is percent-encoded when the URL is serialized
+        assert_eq!(
+            redact_url("https://user:pw@gw.internal/v1?key=topsecret&x=1"),
+            "https://***:***@gw.internal/v1?key=%E2%80%A6&x=%E2%80%A6"
+        );
+    }
+    #[test]
+    fn redact_url_leaves_plain_urls_alone_apart_from_query() {
+        assert_eq!(
+            redact_url("https://gw.internal/v1"),
+            "https://gw.internal/v1"
+        );
+        assert_eq!(
+            redact_url("https://gw.internal/v1?key=secret"),
+            "https://gw.internal/v1?key=%E2%80%A6"
+        );
+    }
+    #[test]
+    fn redact_url_hides_unparseable_input() {
+        assert_eq!(
+            redact_url("not a url at all"),
+            "(unparseable base_url, hidden)"
+        );
     }
 }

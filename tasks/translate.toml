@@ -13,7 +13,7 @@ params = ["to"]
 # Oversized inputs are chunked at paragraph boundaries — every chunk
 # carries the tail of the previous one as context, so the joined
 # translation stays coherent; disable per-run with --no-split.
-processor = "chunk-map-reduce"
+processor = "chunk-join"
 # Multiple files are translated one request sequence per file — the
 # result of a.md lands beside it as a.txt. Requires --out-dir.
 per_part = true

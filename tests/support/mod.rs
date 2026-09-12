@@ -287,22 +287,11 @@ impl RunOutcome {
     }
 }
 
-/// Run the aido binary with isolated config/tasks/history; every test gets
-/// a silent environment by default.
-pub fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> RunOutcome {
-    run_with(args, stdin_data, envs, empty_config())
-}
-
-/// Like [`run`] but with an explicit config path.
-pub fn run_with(
-    args: &[&str],
-    stdin_data: &[u8],
-    envs: &[(&str, &str)],
-    config: impl AsRef<std::ffi::OsStr>,
-) -> RunOutcome {
+/// The common aido invocation: isolated config/tasks/history, piped
+/// stdio, and a stripped environment so no developer setting leaks in.
+fn base_command(args: &[&str], config: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(EXE);
     cmd.args(args)
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("AIDO_CONFIG", config.as_ref())
@@ -325,12 +314,80 @@ pub fn run_with(
     ] {
         cmd.env_remove(var);
     }
+    cmd
+}
+
+/// Run the aido binary with isolated config/tasks/history; every test gets
+/// a silent environment by default.
+pub fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> RunOutcome {
+    run_with(args, stdin_data, envs, empty_config())
+}
+
+/// Like [`run`] but with an explicit config path.
+pub fn run_with(
+    args: &[&str],
+    stdin_data: &[u8],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::piped());
     for (k, v) in envs {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(stdin_data).unwrap();
     let out = child.wait_with_output().unwrap();
+    RunOutcome { output: out }
+}
+
+/// Run aido with stdin attached to the platform's null device — the shape
+/// CI runners, cron and `docker run` without `-t` give a child process.
+pub fn run_null_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    let null = std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap();
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::from(null));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    RunOutcome { output: out }
+}
+
+/// Run aido with stdin attached to a pipe that already holds `stdin_data`
+/// and has no writer left — the bytes sit in the pipe buffer before the
+/// child exists, so a stdin probe can never race a parent that has not
+/// written yet (the write-after-spawn pipes above can, in theory). Small
+/// payloads only: more than a pipe buffer would block the write, as no
+/// reader exists until the child is spawned. Unix-only, like the pty
+/// helpers.
+#[cfg(unix)]
+pub fn run_prefilled_pipe(
+    args: &[&str],
+    stdin_data: &[u8],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+    // Fill the pipe and drop the write end before spawning: the child is
+    // born into a pipe holding exactly these bytes, closed behind them.
+    {
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(stdin_data).unwrap();
+    }
+    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::from(reader));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     RunOutcome { output: out }
 }
 
@@ -393,6 +450,28 @@ pub fn solid_png(w: u32, h: u32) -> Vec<u8> {
 
 pub fn image_png(w: u32, h: u32) -> image::RgbaImage {
     image::RgbaImage::from_pixel(w, h, image::Rgba([255u8, 255, 255, 255]))
+}
+
+/// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`: the
+/// decompression-bomb shape — a few hundred bytes claiming a huge canvas.
+/// A header-only dimension read sees the patched size; honoring it with a
+/// full decode would allocate gigabytes.
+pub fn huge_jpeg(w: u32, h: u32) -> Vec<u8> {
+    let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+    let mut jpg = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    // Baseline JPEGs carry one SOF0 (FF C0); byte stuffing means FF in
+    // entropy data is never followed by C0, so the first hit is it. Layout
+    // after the marker: length(2), precision(1), height(2 BE), width(2 BE).
+    let sof = find_sub(&jpg, &[0xFF, 0xC0]).expect("encoder wrote a SOF0 marker");
+    jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+    jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+    jpg
 }
 
 /// Run aido with a pseudo-terminal as stdin, for tests of "terminal
@@ -461,5 +540,75 @@ impl Drop for MasterFd {
         unsafe {
             libc::close(self.0);
         }
+    }
+}
+
+/// Run aido with a pseudo-terminal as stdin *and* stdout — a full terminal
+/// session, for tests where "stdout is a terminal" rules bind (binary
+/// output refusing a bare terminal, live streaming, ...). stderr stays
+/// piped so assertions keep working. Unix-only, like the other pty
+/// helpers.
+#[cfg(unix)]
+pub fn run_full_tty(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: std::path::PathBuf,
+) -> RunOutcome {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let mut master = 0i32;
+    let mut slave = 0i32;
+    #[cfg(target_os = "macos")]
+    let (termp, winp): (*mut libc::termios, *mut libc::winsize) =
+        (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_os = "macos"))]
+    let (termp, winp): (*const libc::termios, *const libc::winsize) =
+        (std::ptr::null(), std::ptr::null());
+    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), termp, winp) };
+    assert_eq!(rc, 0, "openpty failed");
+    let stdout_slave = unsafe { libc::dup(slave) };
+    let mut cmd = Command::new(EXE);
+    cmd.args(args)
+        .stdin(unsafe { Stdio::from_raw_fd(slave) })
+        .stdout(unsafe { Stdio::from_raw_fd(stdout_slave) })
+        .stderr(Stdio::piped())
+        .env("AIDO_CONFIG", &config)
+        .env("AIDO_TASKS_DIR", "/nonexistent/aido-test-tasks")
+        .env("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history");
+    for var in [
+        "OPENAI_API_KEY",
+        "AIDO_API_KEY",
+        "AIDO_PROFILE",
+        "AIDO_MODEL",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+    ] {
+        cmd.env_remove(var);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn");
+    // The Stdio objects (and the slave fds they own) live inside `cmd`;
+    // dropping it right after the spawn closes the parent's slave copies,
+    // so the master below actually sees the child's exit as EOF.
+    drop(cmd);
+    // Draining the master while the child runs keeps the pty buffer from
+    // blocking it. A pty master reports "all slaves closed" as EIO, which
+    // read_to_end surfaces as an error — that error *is* the EOF here.
+    let mut stdout = Vec::new();
+    {
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+        let _ = master_file.read_to_end(&mut stdout);
+    }
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&config);
+    RunOutcome {
+        output: std::process::Output {
+            status: out.status,
+            stdout,
+            stderr: out.stderr,
+        },
     }
 }

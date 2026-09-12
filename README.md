@@ -38,7 +38,7 @@ aido ask -p "写一首秋天的诗"
 echo hello | aido translate
 ```
 
-`tts` 无需任何配置和 key：只要运行时落到内置的 `openai` provider——完全没有配置文件时正属此类——语音合成默认走免费的 Edge TTS（微软非官方接口，输出 mp3）；文本类任务仍指向 OpenAI 兼容服务，需要 `AIDO_API_KEY`（或 `OPENAI_API_KEY`）。
+`tts` 无需任何配置和 key：只要运行时落到内置的 `openai` provider——完全没有配置文件时正属此类——语音合成默认走免费的 Edge TTS（微软非官方接口，输出 mp3）；文本类任务仍指向 OpenAI 兼容服务，需要 `AIDO_API_KEY`（或 `OPENAI_API_KEY`）。注意：零配置下的这条默认路由会把**合成文本发送到微软的端点**；要改用 OpenAI 的语音接口，需在配置中定义 provider（覆盖内置默认）并配置密钥，让 speech 不落在 `edge-tts` 路由上（详见下文「Edge TTS」）。
 
 ```bash
 aido tts --text "你好，世界" -o hello.mp3
@@ -95,6 +95,8 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 | `--overwrite` | 允许替换已存在的目标文件 |
 
 指定了显式去向后只执行指定去向。已存在的目标文件默认报错；写入走"同目录临时文件 + 原子提交"。`--json` 与 `--stdout` / `-o -` 互斥。
+
+`--out-dir` 写出的 `manifest.json` 记录本次交付：顶层 `version` 恒为 `1`（另有 `run_id` 与 `artifacts`），每个产物条目列出 `id` / `kind` / `mime` / `file` / `size`；自 0.3.0 起产物条目追加 `provenance` 字段（`{"type":"request","index":N}` 或 `{"type":"merged","requests":[…]}`，标明产物来自该次运行的哪个请求）——老读者应允许其缺省。
 
 ### 流式与退出码
 
@@ -177,7 +179,7 @@ instruction = """
 input_types = ["text", "image"]
 required_types = ["image"]
 output_types = ["text"]
-processor = "ocr-tiles"        # 或 "single"（默认）、"chunk-map-reduce"（长文分块）
+processor = "ocr-tiles"        # 或 "single"（默认）、"chunk-join" / "chunk-reduce"（长文分块，见下）
 
 # 可选：
 # profile = "vision"           # 默认 Profile
@@ -191,7 +193,7 @@ processor = "ocr-tiles"        # 或 "single"（默认）、"chunk-map-reduce"�
 
 ## Edge TTS（免费语音合成）
 
-`tts` 任务除了 OpenAI 兼容的 speech 服务，还内置 `edge-tts` 适配器：走微软 Edge「大声朗读」的非官方接口，无需 API key。只要运行时落到内置的 `openai` provider（完全没有配置文件时正属此类），`aido tts` 默认就走这条免费路径；混用其他服务时也可以显式配置一个只有 speech 路由的 Provider（不需要 `base_url`，端点由适配器持有）：
+`tts` 任务除了 OpenAI 兼容的 speech 服务，还内置 `edge-tts` 适配器：走微软 Edge「大声朗读」的非官方接口，无需 API key。只要运行时落到内置的 `openai` provider（完全没有配置文件时正属此类），`aido tts` 默认就走这条免费路径。**隐私提示**：这是零配置时的默认路由，不是你显式选择的服务——合成文本会原样发送到微软的端点；要改用 OpenAI 的语音接口，需在配置中定义自己的 Provider 并配置密钥（定义即整体覆盖内置的 `openai` Provider），speech 不路由到 `edge-tts` 时自动落回 `openai-speech` 适配器。混用其他服务时也可以显式配置一个只有 speech 路由的 Provider（不需要 `base_url`，端点由适配器持有）：
 
 ```toml
 [providers.edge]
@@ -215,13 +217,20 @@ aido tts article.txt -o article.mp3 --profile edge --voice zh-CN-YunxiNeural --s
 
 ## 长图 OCR
 
-视觉服务端会把超限图片等比压缩（OpenAI 约定长边 2048px，Qwen-VL 系有 `max_pixels` 上限），长图整张发送会被压到文字不可读。`ocr` 任务声明 `ocr-tiles` 策略：高超过 3072px 的竖长图自动切成若干竖条（切缝优先落在空白行，硬切处回看一小段重叠带），逐条请求后按顺序合并；只有重叠带内确实重复的行会被去掉。每个切片请求都携带任务指令。`--no-split` 可关闭。
+视觉服务端会把超限图片等比压缩（OpenAI 约定长边 2048px，Qwen-VL 系有 `max_pixels` 上限），长图整张发送会被压到文字不可读。`ocr` 任务声明 `ocr-tiles` 策略：高超过 3072px 的竖长图自动切成若干竖条（切缝优先落在空白行，硬切处回看一小段重叠带），逐条请求后按顺序合并；只有重叠带内确实重复的行会被去掉。每个切片请求都携带任务指令。未切分的材料（如同发的说明文本）按命令行原始顺序随每一个切片请求携带，超过同一携带预算（约 2000 字符）时退回只随首个请求携带并在 stderr 说明。`--no-split` 可关闭。
 
 ## 长文分块
 
-长文本超出模型上下文窗口——或像翻译这类输出随输入等比增长的任务，超出回复上限——单请求会截断或失败。`summarize` / `translate` 声明 `chunk-map-reduce` 策略：超过约 4000 字符（按字符计，中英文同一预算）的文本在段落边界切块，逐块请求（每块都携带任务指令），回复按序以段落分隔拼接。
+长文本超出模型上下文窗口——或像翻译这类输出随输入等比增长的任务，超出回复上限——单请求会截断或失败。长文分块策略把超过约 4000 字符（按字符计，中英文同一预算）的文本在段落边界切块，逐块请求（每块都携带任务指令），之后的收束方式有两种：
 
-衔接靠**上下文携带**而不是输出重叠去重：每个后续分块附上前一分块末尾的一小段（约 400 字符），明确标注"仅供衔接，不处理、不输出"。翻译对同一段源的两次措辞不会逐字一致，精确匹配去重只在 OCR 这类确定性转写上可行；上下文携带让回复永不重复，拼接即全部结果。没有段落边界的超长段落退到句子边界（中英文终止符都认），连句子都没有的巨句在字符边界硬切；过小的尾块并回前一块。`--no-split` 可关闭。自定义任务声明 `processor = "chunk-map-reduce"` 即可使用。
+- **chunk-join**（`translate` 声明）：各块回复按序以段落分隔拼接，拼接即全部结果——翻译的分段本来就是最终译文的组成部分。
+- **chunk-reduce**（`summarize` 声明）：各块结果先各自完成，再追加**一个汇总请求**，材料是全部分段结果（带分段标记），指令仍是任务原指令，回复即整份最终结果——摘要因此是一份整体摘要，而不是每段一条。单块（未超过分块阈值，或 `--no-split`）不再汇总：单块即全文。
+
+衔接靠**上下文携带**而不是输出重叠去重：每个后续分块附上前一分块末尾的一小段（约 400 字符），明确标注"仅供衔接，不处理、不输出"。翻译对同一段源的两次措辞不会逐字一致，精确匹配去重只在 OCR 这类确定性转写上可行；上下文携带让回复永不重复。没有段落边界的超长段落退到句子边界（中英文终止符都认），连句子都没有的巨句在字符边界硬切；过小的尾块并回前一块。`--no-split` 可关闭。
+
+未切分的材料（如术语表）按命令行原始顺序随**每一个**分块请求携带——分块文本顶替其源文件的位置，每个分块都看得到它；当未切分材料总量超过单块字符预算的一半（约 2000 字符）时，重复携带不再划算，退回只随首个请求携带，并在 stderr 说明。
+
+自定义任务声明 `processor = "chunk-join"` 或 `processor = "chunk-reduce"` 即可选用；旧名 `"chunk-map-reduce"` 仍被接受，等价于 `chunk-join`。
 
 ## 批处理（per-part）
 

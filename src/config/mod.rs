@@ -208,10 +208,18 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 }
             }
         }
-        if profile.model.is_none() {
-            issues.push(format!(
+        // `config init` writes `model = "YOUR_MODEL"`; a profile still
+        // carrying that placeholder (or an empty model) fails at run time,
+        // so check must flag it instead of reporting ok.
+        match profile.model.as_deref().map(str::trim) {
+            None => issues.push(format!(
                 "profile '{name}': no model set; the adapter default would be used"
-            ));
+            )),
+            Some(m) if m.is_empty() || m == "YOUR_MODEL" => issues.push(format!(
+                "profile '{name}': no model configured; set model in the config \
+                 ('YOUR_MODEL' is the config init placeholder)"
+            )),
+            Some(_) => {}
         }
     }
     // The profile resolution will actually use: an explicit
@@ -273,6 +281,12 @@ default_profile = "default"
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key_env = "AIDO_API_KEY"
+
+# Speech routes to the keyless Edge Read Aloud protocol (Microsoft's
+# unofficial endpoint; the text is sent there, no API key). Delete the
+# speech line to use OpenAI's speech API, which needs the key above.
+[providers.openai.routes]
+speech = "edge-tts"
 
 [profiles.default]
 provider = "openai"

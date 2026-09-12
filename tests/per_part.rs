@@ -282,6 +282,107 @@ fn shared_text_rides_with_every_part() {
 }
 
 #[test]
+fn shared_text_past_the_carry_budget_warns_once_per_plan() {
+    // The carry budget is half the 4000-char chunk target, so 2001 shared
+    // chars repeat in every part's request past it: the plan notes the
+    // cost once — sharing continues, nothing is dropped.
+    let (a, b) = two_images("perpart-warnbig");
+    let out_dir = temp_dir("perpart-warnbig-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let big = "词".repeat(2001);
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--text",
+            big.as_str(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert_eq!(
+        err.matches("rides with every part's request").count(),
+        1,
+        "{err}"
+    );
+    // And the batch still ran whole with the shared text in every request.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for raw in &requests {
+        assert!(
+            String::from_utf8_lossy(raw).contains("词词"),
+            "shared text rides with every part's request"
+        );
+    }
+}
+
+#[test]
+fn a_small_shared_text_and_quiet_keep_the_budget_note_silent() {
+    let (a, b) = two_images("perpart-warnsmall");
+    let out_dir = temp_dir("perpart-warnsmall-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--text",
+            "focus on headers",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(
+        !err.contains("rides with every part's request"),
+        "small shared text earns no note: {err}"
+    );
+
+    // The same oversized batch under --quiet suppresses the note too.
+    let (a, b) = two_images("perpart-warnquiet");
+    let out_dir = temp_dir("perpart-warnquiet-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let big = "词".repeat(2001);
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--quiet",
+            "--text",
+            big.as_str(),
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(
+        !err.contains("rides with every part's request"),
+        "--quiet suppresses the note: {err}"
+    );
+}
+
+#[test]
 fn no_split_still_batches_one_request_per_file() {
     let (a, b) = two_images("perpart-nosplit");
     let out_dir = temp_dir("perpart-nosplit-out");
@@ -311,8 +412,11 @@ fn no_split_still_batches_one_request_per_file() {
 }
 
 #[test]
-fn dry_run_shows_the_batch_plan_without_requesting() {
-    let (a, b) = two_images("perpart-dry");
+fn a_dry_run_batch_without_out_dir_is_refused_like_the_real_run() {
+    // The delivery-target rules are pure prechecks, so --dry-run does not
+    // exempt a batch from them: no plan is shown for a run that would be
+    // rejected anyway.
+    let (a, b) = two_images("perpart-dry-nodir");
     let cfg = batch_cfg("http://127.0.0.1:1");
     let out = run_ocr(
         &cfg,
@@ -325,11 +429,43 @@ fn dry_run_shows_the_batch_plan_without_requesting() {
             b.to_str().unwrap(),
         ],
     );
+    out.assert_code(2);
+    assert!(out.stderr().contains("--out-dir"), "{}", out.stderr());
+    assert!(!out.stdout().contains("per-part batch"), "{}", out.stdout());
+}
+
+#[test]
+fn dry_run_shows_the_batch_plan_without_requesting() {
+    // The dead base_url is the point: a valid batch dry-runs to a printed
+    // plan and exit 0, so no request can have gone anywhere.
+    let (a, b) = two_images("perpart-dry");
+    let out_dir = temp_dir("perpart-dry-out");
+    let cfg = batch_cfg("http://127.0.0.1:1");
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--dry-run",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
     out.assert_code(0);
     let stdout = out.stdout();
     assert!(stdout.contains("per-part batch"), "{stdout}");
     assert!(stdout.contains("a.png"), "{stdout}");
     assert!(stdout.contains("b.png"), "{stdout}");
+    // The plan's destinations name the collection directory.
+    assert!(
+        stdout.contains(&format!("directory {}", out_dir.display())),
+        "{stdout}"
+    );
+    // And nothing was delivered: the directory stays empty.
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
 }
 
 #[test]
@@ -448,7 +584,10 @@ fn a_truncated_part_fails_alone_and_the_rest_deliver() {
     );
     let err = out.stderr();
     assert!(err.contains("part 'a.png' failed"), "{err}");
-    assert!(err.contains("truncated"), "{err}");
+    // The failure names the status's own reason (finish_reason "length"),
+    // not a hardcoded "truncated"; the separate token-limit hint may
+    // still say truncated, so match the whole failure line.
+    assert!(err.contains("part 'a.png' failed: length"), "{err}");
 }
 
 #[test]
@@ -664,6 +803,102 @@ fn json_report_on_a_partial_batch_carries_the_failures() {
     // The survivor is right there in the report, deliverable.
     assert_eq!(report["artifacts"].as_array().unwrap().len(), 1);
     assert_eq!(report["artifacts"][0]["id"], "b");
+}
+
+#[test]
+fn a_recorded_partial_batch_restores_with_its_failure_list() {
+    // The original run's report names the failed part and exits 6; the
+    // restored report (`last --json`) must say the same about the run
+    // instead of presenting a clean success.
+    let (a, b) = two_images("perpart-lastjson");
+    let out_dir = temp_dir("perpart-lastjson-out");
+    let restore_dir = temp_dir("perpart-lastjson-restore");
+    let server = MultiServer::start_statuses(&[
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"boom"}}"#,
+        ),
+        ("200 OK", chat_body("text of B")),
+    ]);
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"test-model\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let history = temp_dir("perpart-lastjson-hist");
+    let arg = cfg.display().to_string();
+    let hist = history.display().to_string();
+    let envs = [
+        ("AIDO_CONFIG", arg.as_str()),
+        ("AIDO_HISTORY_DIR", hist.as_str()),
+    ];
+    let out = run_tty_with(
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &envs,
+        cfg.clone(),
+    );
+    out.assert_code(6);
+
+    // The record's manifest carries the structured failures next to the
+    // warning strings, so a restore can reproduce the original report.
+    let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1, "the batch is recorded once");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    let recorded = manifest["failed_parts"].as_array().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0][0], "a.png");
+    assert!(recorded[0][1].as_str().unwrap().contains("boom"));
+    assert_eq!(manifest["parts_total"], 2);
+    // The human warning string stays as-is alongside the structured pairs.
+    let warnings = manifest["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("part 'a.png' failed")),
+        "{warnings:?}"
+    );
+
+    // The restored JSON report matches the original run's: the failed
+    // part named, the partial error set, the survivor still delivered.
+    let out = run_tty_with(
+        &["last", "--json", "--out-dir", restore_dir.to_str().unwrap()],
+        &envs,
+        cfg,
+    );
+    out.assert_code(0);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(report["error"]["kind"], "partial");
+    assert_eq!(
+        report["error"]["message"],
+        "1 input part(s) failed; the rest were delivered"
+    );
+    let failed = report["failed_parts"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["part"], "a.png");
+    assert!(failed[0]["error"].as_str().unwrap().contains("boom"));
+    assert_eq!(report["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(report["artifacts"][0]["id"], "b");
+    assert_eq!(
+        std::fs::read_to_string(restore_dir.join("b.txt")).unwrap(),
+        "text of B"
+    );
 }
 
 #[test]

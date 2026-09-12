@@ -7,8 +7,8 @@
 //! those limits; slice replies merge at their boundaries, removing only
 //! lines the overlap bands genuinely duplicated.
 
-use super::{synthetic_text, RequestStep};
-use crate::api::image_as_png;
+use super::{carry_guard, step_material, synthetic_text, RequestStep, StepRole};
+use crate::api::{ensure_decode_size, image_as_png, image_dimensions};
 use crate::domain::{InputPart, MediaKind};
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -24,9 +24,6 @@ const MIN_TAIL: u32 = 128;
 /// A seam with no quiet row nearby cuts through content; re-showing a thin
 /// band lets the split line survive whole in at least one slice.
 const HARD_CUT_OVERLAP: u32 = 32;
-/// Refuse to decode absurdly large images even when the byte size is small
-/// (decompression-bomb guard).
-const MAX_DECODE_PIXELS: u64 = 200_000_000;
 
 /// Lines the merge gate holds back at a slice boundary while deciding
 /// whether the next slice repeats them.
@@ -35,19 +32,21 @@ const MERGE_WINDOW: usize = 3;
 pub const SLICE_NOTE: &str = "This image is one slice of a taller image that was \
      split so its text stays legible; process only what is visible in this slice.";
 
-/// Plan the request sequence: unsliced material travels with the first
-/// request, each tall image's slices follow in order, and every slice
-/// request carries the task's instruction (the runner re-attaches it).
-/// `quiet` suppresses the split note on stderr.
+/// Plan the request sequence: unsliced material rides with every slice's
+/// request in command-line order while it fits the carry budget
+/// ([`carry_guard`]); past it, the material travels with the first request
+/// only. Each tall image's slices follow in order, and every slice request
+/// carries the task's instruction (the runner re-attaches it). `quiet`
+/// suppresses the split note on stderr.
 pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>> {
     let mut untouched: Vec<InputPart> = Vec::new();
-    // (image name, slices, per-slice hard flags): flag i marks the
+    // (source part, slices, per-slice hard flags): flag i marks the
     // boundary after slice i, whose overlap band slice i+1 re-shows.
-    let mut sliced: Vec<(String, Vec<InputPart>, Vec<bool>)> = Vec::new();
+    let mut sliced: Vec<(&InputPart, Vec<InputPart>, Vec<bool>)> = Vec::new();
     for part in inputs {
         if part.kind == MediaKind::Image {
             if let Some((chunks, hard_flags)) = slice_if_tall(part, quiet)? {
-                sliced.push((part.name.clone(), chunks, hard_flags));
+                sliced.push((part, chunks, hard_flags));
                 continue;
             }
         }
@@ -61,26 +60,31 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
             hard_cut_end: false,
             part: None,
             artifact_stem: None,
+            role: StepRole::Map,
         }]);
     }
+    let split: Vec<&InputPart> = sliced.iter().map(|(part, _, _)| *part).collect();
+    let carry_every = carry_guard(&untouched, quiet);
 
     let mut steps = Vec::new();
-    for (image_name, chunks, hard_flags) in sliced {
+    for (source, chunks, hard_flags) in &sliced {
+        let part = *source;
         let total = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let first = steps.is_empty();
+        for (i, chunk) in chunks.iter().enumerate() {
             let mut step_inputs = Vec::new();
-            if first {
-                step_inputs.extend(untouched.iter().cloned());
-                untouched.clear();
-            } else {
+            if !steps.is_empty() {
                 step_inputs.push(synthetic_text(usize::MAX, "slice note", SLICE_NOTE));
             }
-            step_inputs.push(chunk);
+            // Real material keeps the command-line order, this slice
+            // standing in at its source part's position. Unsliced material
+            // rides with every slice while it fits the budget; past it,
+            // only the run's first request carries it.
+            let carry = steps.is_empty() || carry_every;
+            step_inputs.extend(step_material(inputs, part, chunk.clone(), &split, carry));
             steps.push(RequestStep {
                 index: steps.len(),
                 inputs: step_inputs,
-                label: format!("slice {}/{} of {image_name}", i + 1, total),
+                label: format!("slice {}/{} of {}", i + 1, total, part.name),
                 // The merge gate may only compare at a boundary that
                 // re-shows an overlap band: cut i's hardness belongs to
                 // the step whose bottom edge it cuts, and a tail slice
@@ -88,6 +92,7 @@ pub fn plan_steps(inputs: &[InputPart], quiet: bool) -> Result<Vec<RequestStep>>
                 hard_cut_end: hard_flags[i],
                 part: None,
                 artifact_stem: None,
+                role: StepRole::Map,
             });
         }
     }
@@ -106,22 +111,22 @@ fn slice_height_for(w: u32) -> u32 {
 }
 
 fn slice_if_tall(part: &InputPart, quiet: bool) -> Result<Option<(Vec<InputPart>, Vec<bool>)>> {
-    let png = image_as_png(part)?;
-    // Every image here is PNG, so the IHDR — always the first chunk —
-    // carries the dimensions without paying for a full decode first.
-    let Some((w, h)) = png_dimensions(&png) else {
-        return Ok(None);
+    let bytes = match &part.content {
+        crate::domain::InputContent::Media(b) => b,
+        _ => anyhow::bail!("'{}' is not an image", part.name),
     };
+    // Dimensions come from the container header alone (PNG IHDR, JPEG SOF,
+    // WebP VP8X), so the decompression-bomb guard runs before any pixel is
+    // decoded — and an image that needs no slicing is not decoded here at
+    // all; its full decode, if any, happens once at the adapter boundary.
+    let (w, h) = image_dimensions(bytes)
+        .with_context(|| format!("cannot read the dimensions of image '{}'", part.name))?;
+    ensure_decode_size(&part.name, w, h)?;
     if !needs_splitting(w, h) {
         return Ok(None);
     }
-    if w as u64 * h as u64 > MAX_DECODE_PIXELS {
-        anyhow::bail!(
-            "image '{}' is {w}\u{d7}{h}; refusing to decode images over 200 MP",
-            part.name
-        );
-    }
 
+    let png = image_as_png(part)?;
     let img =
         image::load_from_memory(&png).with_context(|| "failed to decode tall image for slicing")?;
     let rgba = img.to_rgba8();
@@ -189,20 +194,10 @@ fn encode_slice(
         source: part.source.clone(),
         name: format!("{} [slice {}..{}]", part.name, start, end),
         kind: MediaKind::Image,
+        unknown_kind: false,
         mime: "image/png".into(),
         content: crate::domain::InputContent::Media(png),
     })
-}
-
-/// Read the size out of the PNG IHDR (the mandatory first chunk) without
-/// decoding the stream.
-fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
-    if png.len() < 24 || &png[12..16] != b"IHDR" {
-        return None;
-    }
-    let w = u32::from_be_bytes(png[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(png[20..24].try_into().ok()?);
-    Some((w, h))
 }
 
 /// Horizontal contrast per row: text lights a row up, blank and smoothly
@@ -441,8 +436,21 @@ mod tests {
             source: InputSource::File("long.png".into()),
             name: "long.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(png),
+        }
+    }
+
+    fn text_part(text: &str) -> InputPart {
+        InputPart {
+            id: 9,
+            source: InputSource::Literal,
+            name: "notes".into(),
+            kind: MediaKind::Text,
+            unknown_kind: false,
+            mime: "text/plain".into(),
+            content: InputContent::Text(text.into()),
         }
     }
 
@@ -450,6 +458,69 @@ mod tests {
         let img = image::load_from_memory(png).unwrap();
         use image::GenericImageView as _;
         img.dimensions()
+    }
+
+    /// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`:
+    /// the decompression-bomb shape — a few hundred bytes claiming a huge
+    /// canvas. The header read sees the patched size; a full decode would
+    /// have to honor it.
+    fn jpeg_declaring(w: u32, h: u32) -> Vec<u8> {
+        let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        // Baseline JPEGs carry one SOF0 (FF C0); byte stuffing means FF in
+        // entropy data is never followed by C0, so the first hit is it.
+        // Layout after the marker: length(2), precision(1), height(2 BE),
+        // width(2 BE).
+        let sof = jpg
+            .windows(2)
+            .position(|p| p == [0xFF, 0xC0])
+            .expect("encoder wrote a SOF0 marker");
+        jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+        jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+        jpg
+    }
+
+    fn jpeg_part(jpg: Vec<u8>) -> InputPart {
+        InputPart {
+            id: 0,
+            source: InputSource::File("long.jpg".into()),
+            name: "long.jpg".into(),
+            kind: MediaKind::Image,
+            unknown_kind: false,
+            mime: "image/jpeg".into(),
+            content: InputContent::Media(jpg),
+        }
+    }
+
+    #[test]
+    fn decompression_bomb_jpegs_are_refused_before_any_decode() {
+        // Square (would not even be split) and tall (would be sliced):
+        // both declare over 200 MP, and the header-only guard must refuse
+        // them before a multi-gigabyte decode — tall or not.
+        for (w, h) in [(20_000, 20_000), (4_000, 60_000)] {
+            let err = plan_steps(&[jpeg_part(jpeg_declaring(w, h))], true).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("refusing to decode"), "{msg}");
+            assert!(msg.contains(&format!("{w}\u{d7}{h}")), "{msg}");
+        }
+    }
+
+    #[test]
+    fn small_jpeg_needing_no_split_is_untouched_at_plan_time() {
+        // Below the split threshold the JPEG must not be decoded (and
+        // re-encoded) here at all — the step carries the original bytes,
+        // and only the adapter boundary decodes them.
+        let jpg = jpeg_declaring(2, 2);
+        let steps = plan_steps(&[jpeg_part(jpg.clone())], true).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "all material");
+        assert_eq!(steps[0].inputs[0].content, InputContent::Media(jpg));
     }
 
     #[test]
@@ -490,24 +561,46 @@ mod tests {
     }
 
     #[test]
-    fn unsliced_material_travels_with_the_first_slice() {
+    fn unsliced_material_travels_with_every_slice_in_order() {
         let inputs = vec![
             image_part(solid_png(100, 500)),
             image_part(striped_png(100, 3200)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].inputs.len(), 2);
-        assert_eq!(steps[1].inputs.len(), 2); // slice note + slice
+        for (i, step) in steps.iter().enumerate() {
+            let names: Vec<&str> = step.inputs.iter().map(|p| p.name.as_str()).collect();
+            let short = names.iter().position(|n| *n == "long.png").unwrap();
+            let slice = names.iter().position(|n| n.contains("[slice ")).unwrap();
+            assert!(short < slice, "step {i}: {names:?}");
+        }
+        // Later slices explain themselves with the note, ahead of the
+        // carried material.
         assert!(steps[1].inputs[0]
             .text()
             .is_some_and(|t| t.contains("slice")));
     }
 
     #[test]
-    fn ihdr_dimensions() {
-        assert_eq!(png_dimensions(&solid_png(64, 33)), Some((64, 33)));
-        assert_eq!(png_dimensions(b"not a png"), None);
+    fn text_material_rides_with_every_slice_until_over_budget() {
+        let small = vec![
+            image_part(striped_png(100, 3200)),
+            text_part("see headers only"),
+        ];
+        let steps = plan_steps(&small, true).unwrap();
+        assert_eq!(steps.len(), 2);
+        for step in &steps {
+            assert!(
+                step.inputs.iter().any(|p| p.name == "notes"),
+                "every slice request must see the text material"
+            );
+        }
+        // Over the carry budget: the text rides with the first request only.
+        let big = "词".repeat(super::super::MAX_CARRY_CHARS + 1);
+        let over = vec![text_part(&big), image_part(striped_png(100, 3200))];
+        let steps = plan_steps(&over, true).unwrap();
+        assert!(steps[0].inputs.iter().any(|p| p.name == "notes"));
+        assert!(!steps[1].inputs.iter().any(|p| p.name == "notes"));
     }
 
     #[test]

@@ -4,11 +4,13 @@
 //! commit files and directories (atomic, no-clobber by default), then the
 //! clipboard. A failure in one destination keeps earlier successes and
 //! fails the run with exit code 5; the result itself stays recoverable in
-//! history.
+//! history. The late re-validation refusals count as delivery failures
+//! too: delivery only runs after the generation succeeded, so exit 2
+//! (usage) would claim nothing happened when the model already ran.
 
 use crate::clipboard;
 use crate::domain::{
-    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, MediaKind,
+    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, ErrorKind, MediaKind,
 };
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -33,7 +35,8 @@ pub struct DeliverArgs<'a> {
     /// Per-part batches only: the (part, error) pairs that failed while
     /// the surviving parts delivered normally. They reach the JSON report
     /// (which would otherwise present a partial run as a full success);
-    /// empty everywhere else.
+    /// empty everywhere else. A restored delivery (`last`, `history show`)
+    /// passes the recorded run's pairs so its report matches the original.
     pub failed_parts: &'a [(String, String)],
 }
 
@@ -86,16 +89,31 @@ fn deliver_inner(
         .filter(|a| args.produce.contains(&a.kind))
         .collect();
     if delivered.is_empty() {
-        return Err(AppError::usage(
-            "nothing to deliver: the run produced none of the requested kinds",
-        ));
+        // Post-generation: the run could not have reached delivery without
+        // artifacts in hand, so this is a delivery refusal, not a usage
+        // error. Every asked destination records the failed attempt.
+        let message = "nothing to deliver: the run produced none of the requested kinds";
+        for destination in args.destinations {
+            states.push(DeliveryState {
+                destination: destination.clone(),
+                status: DeliveryStatus::Failed {
+                    error: message.to_string(),
+                },
+            });
+        }
+        return Err(AppError::delivery(message));
     }
 
-    // Late re-validation: what came back must fit the destinations.
+    // Late re-validation: what came back must fit the destinations. The
+    // generation already ran, so every refusal below is a delivery
+    // failure (exit 5) with the refused destination recorded — never a
+    // usage error, which would read as "wrong command, nothing happened".
     let has_stdout = args.destinations.contains(&Destination::Stdout);
     if has_stdout && !args.json && delivered.len() > 1 {
-        return Err(AppError::usage(
+        return Err(refuse_delivery(
+            Destination::Stdout,
             "several artifacts cannot share bare stdout; use --out-dir",
+            states,
         ));
     }
     let file_dest = args.destinations.iter().find_map(|d| match d {
@@ -104,15 +122,23 @@ fn deliver_inner(
     });
     if let Some(path) = &file_dest {
         if delivered.len() != 1 {
-            return Err(AppError::usage(format!(
-                "{} artifacts cannot go to one file ({}); use --out-dir",
-                delivered.len(),
-                path.display()
-            )));
+            return Err(refuse_delivery(
+                Destination::File { path: path.clone() },
+                format!(
+                    "{} artifacts cannot go to one file ({}); use --out-dir",
+                    delivered.len(),
+                    path.display()
+                ),
+                states,
+            ));
         }
         let artifact = delivered[0];
         if let Err(e) = check_extension(artifact, path) {
-            return Err(AppError::usage(e));
+            return Err(refuse_delivery(
+                Destination::File { path: path.clone() },
+                e,
+                states,
+            ));
         }
     }
     let dir_dest = args.destinations.iter().find_map(|d| match d {
@@ -154,7 +180,7 @@ fn deliver_inner(
     // --- single file
     if let Some(path) = &file_dest {
         let artifact = delivered[0];
-        match write_file_atomic(&artifact.bytes, path, args.overwrite) {
+        match write_file_atomic(&artifact.bytes, path, args.overwrite, FileMode::Default) {
             Ok(()) => {
                 if !args.quiet {
                     eprintln!("saved result to {}", path.display());
@@ -285,6 +311,26 @@ fn deliver_inner(
     Ok(())
 }
 
+/// A refused delivery attempt, recorded and classified. `deliver_inner`
+/// runs only after the generation succeeded, so a late refusal is a
+/// delivery failure (exit 5), never a usage error — the result is already
+/// recoverable in history, and the refused destination is recorded there
+/// as failed so the attempt shows.
+fn refuse_delivery(
+    destination: Destination,
+    message: impl Into<String>,
+    states: &mut Vec<DeliveryState>,
+) -> AppError {
+    let message = message.into();
+    states.push(DeliveryState {
+        destination,
+        status: DeliveryStatus::Failed {
+            error: message.clone(),
+        },
+    });
+    AppError::delivery(message)
+}
+
 /// One artifact to the clipboard. Returns the copied char count for text
 /// (0 for images). Invalid UTF-8 is an error, never a silent empty copy.
 fn deliver_clipboard(artifact: &Artifact, hold_secs: u64) -> anyhow::Result<usize> {
@@ -360,12 +406,66 @@ fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The permission policy for an atomically written file.
+pub(crate) enum FileMode {
+    /// Owner-only (0600), whatever the umask allows.
+    Private,
+    /// Inherit the process umask (`0666 & !umask`, what a plain `open`
+    /// would give): user-facing artifacts landing in shared, build or
+    /// static-site directories stay usable by other tools. An unusual
+    /// umask (e.g. 077) still yields a sane file.
+    Default,
+}
+
+#[cfg(unix)]
+impl FileMode {
+    fn bits(self) -> u32 {
+        match self {
+            FileMode::Private => 0o600,
+            FileMode::Default => 0o666 & !current_umask(),
+        }
+    }
+}
+
+/// The process umask. `umask(0)` reads it but also sets it, so the read
+/// is immediately restored; that brief window is the standard price of
+/// reading a umask (what other Rust tools do). `mode_t` is `u16` on macOS
+/// and `u32` on Linux, so the widening cast is required — and is a no-op
+/// on Linux, where the lint must be silenced.
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    let raw = unsafe { libc::umask(0) };
+    unsafe { libc::umask(raw) };
+    #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
+    let mask = raw as u32;
+    mask
+}
+
+/// Apply `mode` to a written file.
+#[cfg(unix)]
+fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode.bits()))
+}
+
+/// No mode bits off unix; the call is a no-op there.
+#[cfg(not(unix))]
+fn apply_file_mode(_path: &Path, _mode: FileMode) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Write bytes via a same-directory temp file, then commit without
 /// clobbering an existing target: the no-clobber commit is a fresh hard
 /// link (it fails atomically when the target exists — no check-then-rename
 /// race), with the temp file unlinked afterwards. `--overwrite` swaps the
-/// commit for an atomic rename.
-pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) -> AppResult<()> {
+/// commit for an atomic rename. The delivered file's mode follows `mode`;
+/// a failed chmod warns on stderr but never loses the artifact.
+pub(crate) fn write_file_atomic(
+    bytes: &[u8],
+    target: &Path,
+    overwrite: bool,
+    mode: FileMode,
+) -> AppResult<()> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(dir) = parent {
         std::fs::create_dir_all(dir)
@@ -386,12 +486,19 @@ pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) ->
             .truncate(true)
             .open(&temp)
             .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
+        // The temp name is predictable, so the file is made owner-only
+        // right away: no window where partially written bytes are
+        // readable under the open mode's default (a no-op off unix).
+        let _ = apply_file_mode(&temp, FileMode::Private);
         file.write_all(bytes)
             .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt as _;
-        #[cfg(unix)]
-        let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        // A wrong final mode must not lose the artifact: warn, keep going.
+        if let Err(e) = apply_file_mode(&temp, mode) {
+            eprintln!(
+                "warning: could not set permissions on {}: {e}",
+                target.display()
+            );
+        }
         file.sync_all()
             .map_err(|e| AppError::delivery(format!("cannot flush {}: {e}", temp.display())))?;
         Ok(())
@@ -438,9 +545,11 @@ pub(crate) fn write_file_atomic(bytes: &[u8], target: &Path, overwrite: bool) ->
     }
 }
 
-/// Directory delivery: artifact files first (each atomically committed),
-/// the manifest last — a directory without a manifest is an unfinished
-/// write, never a success story.
+/// Directory delivery: a no-clobber preflight (nothing is written unless
+/// the whole directory is free or `--overwrite` was given), then artifact
+/// files first (each atomically committed), the manifest last — a
+/// directory without a manifest is an unfinished write, never a success
+/// story.
 fn write_directory(
     artifacts: &[&Artifact],
     dir: &Path,
@@ -448,6 +557,31 @@ fn write_directory(
     overwrite: bool,
     quiet: bool,
 ) -> AppResult<Vec<(String, PathBuf)>> {
+    // The manifest is the only record of what a delivery contains, so a
+    // second run into the same directory must not silently replace it
+    // (the previous files would become unindexed orphans). Every name of
+    // this run is checked before the first byte is written — also within
+    // a per-part batch, where a mid-batch clobber would leave a half-old
+    // half-new directory behind.
+    if !overwrite {
+        let manifest_path = dir.join("manifest.json");
+        if manifest_path.exists() {
+            return Err(AppError::delivery(format!(
+                "{} already holds a previous delivery's manifest.json; \
+                 pass --overwrite to replace the whole directory, or pick another --out-dir",
+                dir.display()
+            )));
+        }
+        for artifact in artifacts {
+            let path = dir.join(artifact_file_name(artifact));
+            if path.exists() {
+                return Err(AppError::delivery(format!(
+                    "{} already exists; use --overwrite to replace it",
+                    path.display()
+                )));
+            }
+        }
+    }
     std::fs::create_dir_all(dir)
         .map_err(|e| AppError::delivery(format!("cannot create {}: {e}", dir.display())))?;
     let mut saved = Vec::new();
@@ -455,7 +589,7 @@ fn write_directory(
     for artifact in artifacts {
         let name = artifact_file_name(artifact);
         let path = dir.join(&name);
-        write_file_atomic(&artifact.bytes, &path, overwrite)
+        write_file_atomic(&artifact.bytes, &path, overwrite, FileMode::Default)
             .map_err(|e| AppError::delivery(format!("{}: {}", path.display(), e.chain())))?;
         if !quiet {
             eprintln!("saved result to {}", path.display());
@@ -481,7 +615,8 @@ fn write_directory(
             .unwrap_or_default()
             .as_bytes(),
         &manifest_path,
-        true, // the manifest is rewritten only by this run's commit
+        overwrite, // the preflight above guards the no-overwrite pass
+        FileMode::Default,
     )?;
     Ok(saved)
 }
@@ -562,13 +697,7 @@ fn json_report(
         .collect();
     let report_error = error.map(|e| {
         serde_json::json!({
-            "kind": match e.kind {
-                crate::domain::ErrorKind::Usage => "usage",
-                crate::domain::ErrorKind::Service => "service",
-                crate::domain::ErrorKind::Generation => "generation",
-                crate::domain::ErrorKind::Delivery => "delivery",
-                crate::domain::ErrorKind::Partial => "partial",
-            },
+            "kind": e.kind.as_str(),
             "message": e.chain(),
         })
     });
@@ -599,6 +728,32 @@ fn json_report(
         "deliveries": deliveries,
         "failed_parts": failed_parts,
         "error": report_error,
+    })
+}
+
+/// The JSON report for a run that failed before delivery could produce
+/// anything (usage, service and generation failures): the success
+/// report's `version` envelope and field names, with the failure carried
+/// in `error` (same `kind` names as the delivery report) and no
+/// artifacts or deliveries. `run_id` and `task` are `null` when the run
+/// never got far enough to know them.
+pub fn error_report(
+    kind: ErrorKind,
+    message: &str,
+    run_id: Option<&str>,
+    task: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "task": task,
+        "artifacts": [],
+        "deliveries": [],
+        "failed_parts": [],
+        "error": {
+            "kind": kind.as_str(),
+            "message": message,
+        },
     })
 }
 
@@ -647,11 +802,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.txt");
         std::fs::write(&target, "original").unwrap();
-        let err = write_file_atomic(b"new", &target, false).unwrap_err();
+        let err = write_file_atomic(b"new", &target, false, FileMode::Default).unwrap_err();
         assert!(err.chain().contains("already exists"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-        write_file_atomic(b"new", &target, true).unwrap();
+        write_file_atomic(b"new", &target, true, FileMode::Default).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_mode_follows_the_file_mode_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("aido-out-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let private = dir.join("private.txt");
+        write_file_atomic(b"x", &private, false, FileMode::Private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let default = dir.join("default.txt");
+        write_file_atomic(b"x", &default, false, FileMode::Default).unwrap();
+        assert_eq!(
+            std::fs::metadata(&default).unwrap().permissions().mode() & 0o777,
+            0o666 & !current_umask(),
+            "Default inherits the umask, whatever it is"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
