@@ -64,6 +64,17 @@ fn dash_reads_stdin_at_its_position_between_files() {
 #[test]
 fn unconsumed_pipe_with_explicit_material_is_an_error() {
     let file = temp_file("a.txt", b"from file\n");
+    // The bytes are in the pipe before the binary starts, so the probe
+    // cannot lose a race against the parent's write. Windows keeps the
+    // write-after-spawn pipe: no prefill helper there.
+    #[cfg(unix)]
+    let out = run_prefilled_pipe(
+        &["summarize", file.to_str().unwrap()],
+        b"pipe\n",
+        &[],
+        empty_config(),
+    );
+    #[cfg(windows)]
     let out = run(&["summarize", file.to_str().unwrap()], b"pipe\n", &[]);
     out.assert_code(2);
     assert!(out.stderr().contains("add `-`"), "stderr: {}", out.stderr());

@@ -358,6 +358,39 @@ pub fn run_null_stdin(
     RunOutcome { output: out }
 }
 
+/// Run aido with stdin attached to a pipe that already holds `stdin_data`
+/// and has no writer left — the bytes sit in the pipe buffer before the
+/// child exists, so a stdin probe can never race a parent that has not
+/// written yet (the write-after-spawn pipes above can, in theory). Small
+/// payloads only: more than a pipe buffer would block the write, as no
+/// reader exists until the child is spawned. Unix-only, like the pty
+/// helpers.
+#[cfg(unix)]
+pub fn run_prefilled_pipe(
+    args: &[&str],
+    stdin_data: &[u8],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+    // Fill the pipe and drop the write end before spawning: the child is
+    // born into a pipe holding exactly these bytes, closed behind them.
+    {
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(stdin_data).unwrap();
+    }
+    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::from(reader));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    RunOutcome { output: out }
+}
+
 pub fn request_json(raw: &[u8]) -> serde_json::Value {
     let pos = find_sub(raw, b"\r\n\r\n").unwrap();
     serde_json::from_slice(&raw[pos + 4..]).unwrap()

@@ -13,7 +13,10 @@
 //! "Piped stdin data" means stdin actually carries unread bytes — a closed
 //! pipe or `/dev/null` (what CI runners, cron and `docker run` without `-t`
 //! attach) counts as *no* data, so automation keeps working with explicit
-//! material. Only stdin that really holds bytes demands a `-`.
+//! material. A writer that is attached but still silent at probe time
+//! (`curl … | aido file`) reads the same way: the probe is a snapshot and
+//! cannot predict a silent writer, so the explicit material runs and the
+//! pipe is never drained. Only stdin that already holds bytes demands a `-`.
 //!
 //! A glob spec (a pattern the shell could not expand — quoted on Unix,
 //! always on Windows) or a directory spec expands in place to its sorted
