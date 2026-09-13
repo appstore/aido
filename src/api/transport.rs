@@ -1,6 +1,6 @@
-use super::{
-    chat, edge, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult,
-};
+#[cfg(feature = "edge-tts")]
+use super::edge;
+use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::time::Duration;
@@ -113,6 +113,10 @@ pub struct Client {
     base_url: Option<reqwest::Url>,
     api_key: Option<String>,
     timeout: Duration,
+    /// Whole-run budget. Consumed today only by the edge-tts adapter (it
+    /// bounds all chunks of one synthesis); HTTP adapters enforce only the
+    /// per-request `timeout` — so the field lives only in feature-on builds.
+    #[cfg(feature = "edge-tts")]
     total_timeout: Option<Duration>,
     adapter: Adapter,
 }
@@ -143,6 +147,7 @@ impl Client {
             base_url,
             api_key: conn.api_key.clone(),
             timeout: conn.timeout,
+            #[cfg(feature = "edge-tts")]
             total_timeout: conn.total_timeout,
             adapter: conn.adapter,
         })
@@ -189,7 +194,16 @@ impl Client {
 
     pub async fn generate(&self, request: &GenerateRequest<'_>) -> Result<GenerateResult> {
         if self.adapter == Adapter::EdgeTts {
-            return edge::synthesize(request, self.timeout, self.total_timeout).await;
+            // The variant stays compiled without the feature so a config
+            // naming 'edge-tts' still parses; only the adapter is gone.
+            #[cfg(feature = "edge-tts")]
+            {
+                return edge::synthesize(request, self.timeout, self.total_timeout).await;
+            }
+            #[cfg(not(feature = "edge-tts"))]
+            {
+                bail!(super::EDGE_TTS_NOT_COMPILED);
+            }
         }
         let resp = self
             .post(request, false)?

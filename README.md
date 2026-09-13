@@ -22,7 +22,7 @@ aido tts --text "你好" -o hello.mp3
 cargo install --path .
 ```
 
-> 源码构建需要系统装有 **cmake** 与 C 编译器：`tts` 的协议实现 `kothok-edge-tts` 经由其 `tokio-rustls` 依赖的默认特性引入了 `aws-lc-sys`（C 构建需要 cmake）。运行时 TLS 实际使用 ring，aws-lc 只是构建期的额外成本；上游修正特性声明后此要求即可移除（CI 的依赖树检查会在它消失时提醒）。
+> 源码构建需要系统装有 **cmake** 与 C 编译器：`tts` 的协议实现 `kothok-edge-tts` 经由其 `tokio-rustls` 依赖的默认特性引入了 `aws-lc-sys`（C 构建需要 cmake）。运行时 TLS 实际使用 ring，aws-lc 只是构建期的额外成本。`edge-tts` 是 aido 侧的 feature（默认开启），不开 TTS 时可用 `cargo build --no-default-features` 同时甩掉 aws-lc-sys 和 cmake 这两个构建依赖；上游修正特性声明后此要求即可移除（CI 的依赖树检查会在它消失时提醒）。
 
 ## 快速开始
 
@@ -214,6 +214,8 @@ aido tts article.txt -o article.mp3 --profile edge --voice zh-CN-YunxiNeural --s
 ```
 
 输出固定为 mp3（24kHz），长文本按 ~4 KiB 转义预算自动分块、并发合成后按序拼接，整体受 `--total-timeout` 约束（未设置时以每个分块的单请求超时为界）。协议没有指令通道，带 `-p`（或任务的固定指令）的运行在生成执行计划时就会被拒绝，`--dry-run` 也会报告。注意：这是微软的非公开接口，DRM 常量随 Edge 版本轮换，接口可能随微软调整而失效（协议实现依赖 `kothok-edge-tts`，失效时跟随上游更新）。
+
+> `edge-tts` 适配器由同名 feature 控制（默认开启）。用 `--no-default-features` 构建的二进制不含该适配器：配置里指向 `edge-tts` 的路由会在 `config check` 和生成执行计划时被拒绝（提示用 `--features edge-tts` 重新构建，或改走 `openai-speech` 路由），零配置默认也不再路由到它。
 
 ## 长图 OCR
 

@@ -117,6 +117,16 @@ pub fn build(
     // should still show the underlying io cause.
     .map_err(|e| AppError::usage(format!("{e:#}")))?;
     validate_inputs(task, &resolved, &inputs)?;
+    // Adapter availability: the EdgeTts variant stays compiled without the
+    // feature (so a config naming 'edge-tts' still parses), but no adapter
+    // is linked — refuse here, where --dry-run already reports it, instead
+    // of waiting for the send-time defense.
+    #[cfg(not(feature = "edge-tts"))]
+    if resolved.adapter == crate::api::Adapter::EdgeTts {
+        return Err(AppError::usage(
+            crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
+        ));
+    }
     // Adapter capability: the edge-tts protocol has no instruction channel.
     // Refusing at plan time (not just at send time) keeps --dry-run honest
     // about a plan that could never execute.

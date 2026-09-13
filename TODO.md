@@ -409,7 +409,7 @@
 
 - [ ] **R05 · ✅ 已修**（`86b51cc`）：`media.rs` / `clipboard.rs` 解码点补上 `image_dimensions` + `ensure_decode_size`。补测见「R05 残留补测」。
 
-- [ ] **R06 · 中 · `Cargo.toml` · edge-tts 无 aido 侧 feature gate（F24 结论只覆盖了次要建议）**
+- [x] **R06 · 中 · `Cargo.toml` · edge-tts 无 aido 侧 feature gate（F24 结论只覆盖了次要建议）**
   - F24 的「不可行」针对上游 `default-features = false`；主要建议（aido 自己加 feature + optional 依赖）未尝试。`futures-util` 全仓只有 `edge.rs` 用；kothok 只有 `transport.rs:192` 一个调用点。
   - 方案：`[features] default = ["edge-tts"]`，`edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]`，两依赖 optional；`#[cfg(feature = "edge-tts")] mod edge;`；transport 分支（off → 定向报错）；`Adapter::EdgeTts` 枚举保留（serde/clap 照常）；`default_config()` / `check()` / SAMPLE_CONFIG 按 feature 分支；CI 加 `--no-default-features` job + 断言 aws-lc-rs 不在树里；README 加一句构建说明。
 

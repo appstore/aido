@@ -1,5 +1,6 @@
 //! Application-level generation contracts. Wire formats stay in adapters.
 mod chat;
+#[cfg(feature = "edge-tts")]
 mod edge;
 mod media;
 mod responses;
@@ -136,6 +137,15 @@ impl Adapter {
 /// identically.
 pub(crate) const EDGE_NO_INSTRUCTION_CHANNEL: &str =
     "the 'edge-tts' adapter has no instruction channel";
+
+/// Refusal for the edge-tts route in a binary built without the `edge-tts`
+/// feature. The enum variant stays compiled (so configs naming `edge-tts`
+/// still parse); the plan-time guard and the transport's send-time defense
+/// must stay worded identically.
+#[cfg(not(feature = "edge-tts"))]
+pub(crate) const EDGE_TTS_NOT_COMPILED: &str =
+    "the 'edge-tts' adapter is not compiled into this binary (rebuild with \
+     --features edge-tts, or use the openai-speech route)";
 
 /// One request to one adapter. `instruction` is the task's fixed direction,
 /// `requirement` is this run's -p; they stay separate until the adapter
