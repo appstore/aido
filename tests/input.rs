@@ -112,6 +112,24 @@ fn null_stdin_with_explicit_material_runs() {
     assert_eq!(out.stdout(), "ok\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn closed_fd0_with_explicit_material_runs() {
+    // The same run with fd 0 closed outright (`0<&-`): no bytes to
+    // consume, so no unconsumed-pipe rejection — the file material runs
+    // exactly as it would from a terminal.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run_closed_stdin(
+        &["summarize", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
 #[test]
 fn instruction_only_task_runs_with_a_closed_empty_stdin() {
     // `aido ask -p "hi" < /dev/null`: stdin is a pipe but carries no
@@ -122,6 +140,29 @@ fn instruction_only_task_runs_with_a_closed_empty_stdin() {
         &["ask", "-p", "hi"],
         b"",
         &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+    let req = request_json(&server.request());
+    // The -p instruction is the whole request; no material part joins it.
+    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(req["messages"][0]["role"], "user");
+    assert_eq!(req["messages"][0]["content"], "hi");
+}
+
+#[cfg(unix)]
+#[test]
+fn instruction_only_task_runs_with_a_closed_fd0() {
+    // `aido ask -p "hi" 0<&-`: fd 0 is outright closed, so the probe's
+    // fstat fails with EBADF — a certain "no unread bytes", not the
+    // uncertainty that keeps the strict behavior. The run must proceed on
+    // the instruction alone instead of dying on a read of a closed fd.
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run_closed_stdin(
+        &["ask", "-p", "hi"],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
     );
     out.assert_code(0);
     assert_eq!(out.stdout(), "ok\n");

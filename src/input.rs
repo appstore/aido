@@ -101,13 +101,19 @@ impl<'a> InputEnv<'a> {
 ///
 /// When nothing can be determined the answer is `true`: the caller only
 /// uses this to *reject* a run, so uncertainty keeps the old strict
-/// behavior instead of silently ignoring possible input.
+/// behavior instead of silently ignoring possible input. One fstat
+/// failure is not uncertainty but a verdict: `EBADF` means fd 0 is
+/// closed (`0<&-`, a daemonized process), and a closed fd carries no
+/// unread bytes.
 #[cfg(unix)]
 fn fd0_has_unread_bytes() -> bool {
     unsafe {
         let mut stat: libc::stat = std::mem::zeroed();
         if libc::fstat(libc::STDIN_FILENO, &mut stat) != 0 {
-            return true;
+            return !matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
         }
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFCHR => false,

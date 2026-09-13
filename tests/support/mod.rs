@@ -391,6 +391,38 @@ pub fn run_prefilled_pipe(
     RunOutcome { output: out }
 }
 
+/// Run aido with fd 0 outright CLOSED — the `aido … 0<&-` shape, also
+/// what a daemonized process is born with. Not the same as the null
+/// device (`run_null_stdin`): there is no file to fstat, so the probe's
+/// "no unread bytes" verdict has to come from the EBADF errno itself.
+/// Unix-only, like the other fd-level helpers: a `pre_exec` closure is
+/// the one way `std::process` can hand a child a closed fd 0.
+#[cfg(unix)]
+pub fn run_closed_stdin(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> RunOutcome {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = base_command(args, config);
+    // Runs in the forked child after std's stdio dup2s and before exec:
+    // close(2) is async-signal-safe there, and registering any closure
+    // also forces std onto the fork/exec path instead of posix_spawn.
+    // The return value is ignored — EBADF would mean fd 0 was already
+    // closed, which is exactly the state being asked for.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::close(libc::STDIN_FILENO);
+            Ok(())
+        });
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    RunOutcome { output: out }
+}
+
 pub fn request_json(raw: &[u8]) -> serde_json::Value {
     let pos = find_sub(raw, b"\r\n\r\n").unwrap();
     serde_json::from_slice(&raw[pos + 4..]).unwrap()

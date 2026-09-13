@@ -439,8 +439,9 @@
 - [x] **R13 · 低 · `src/processors/mod.rs:144` · `step_material` 用 `ptr::eq` 判断源 part，失配静默**
   - 方案：改按 `InputPart.id` 比较；循环后 `debug_assert!(piece.is_none())`。
 
-- [ ] **R14 · 低 · `src/input.rs:113` · fd 0 已关闭时探测返回 true**
+- [x] **R14 · 低 · `src/input.rs:113` · fd 0 已关闭时探测返回 true**
   - fstat 失败一律 `true`；`EBADF` 是确定无数据。方案：unix 分支分 errno——EBADF → false，其余保持 true。
+  - 落地：fstat 失败分 errno（`std::io::Error::last_os_error`）；测试 `run_closed_stdin`（`pre_exec` 关闭 fd 0）覆盖 `ask -p`（指令运行）与带显式材料两条路径。注：测试与 helper 由配额截断前的 subagent 写就，生产修复在主线完成。
 
 - [ ] **R15 · 低 · `src/config/mod.rs:218/:293` · `"YOUR_MODEL"` 字面量三处无共享常量**
   - 方案：`pub(crate) const MODEL_PLACEHOLDER`；check() 与文案共用；测试锁 SAMPLE_CONFIG 不漂移。
