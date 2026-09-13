@@ -376,7 +376,7 @@
 
 ## 完成标准
 
-- 全部 33 条勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿。
+- 全部 33 条勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿。（第三部分追加 F34–F36 后为 36 条，同样适用本标准。）
 - 批次 2 的 F02/F09 连带更新 README 行为说明（原文要求同 commit）。
 - TODO.md 随每次勾选一起提交。
 - ⚠ 批次 4 的 F15/F16/F19 与批次 5 整批（F18、F20–F25）方案为补全，动手前建议人工复核（或补全 review 文档）。
