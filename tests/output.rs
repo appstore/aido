@@ -492,6 +492,32 @@ fn json_error_report_covers_errors_before_clap_parses() {
 }
 
 #[test]
+fn json_error_report_covers_clap_parse_errors() {
+    // An unknown flag dies inside clap's own parser, which exits without
+    // ever reaching fail(); with --json in argv, stdout still carries the
+    // usage report while stderr keeps clap's own message. Help (exit 0)
+    // must not grow a report.
+    let out = run(&["--json", "--bogus-flag"], b"", &[]);
+    assert_json_error_report(&out, 2, "usage");
+    let report: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert!(report["run_id"].is_null(), "no run yet: {report}");
+    assert!(report["task"].is_null(), "no run yet: {report}");
+    assert!(
+        out.stderr().contains("--bogus-flag"),
+        "stderr keeps clap's message: {}",
+        out.stderr()
+    );
+
+    let out = run(&["--json", "--help"], b"", &[]);
+    out.assert_code(0);
+    assert!(
+        out.stdout().contains("Usage"),
+        "help stays plain text: {}",
+        out.stdout()
+    );
+}
+
+#[test]
 fn json_error_report_covers_service_exit_three() {
     let server = Server::start(
         "500 Internal Server Error",

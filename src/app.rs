@@ -57,6 +57,18 @@ pub async fn run() -> i32 {
     ) {
         Ok(cli) => cli,
         Err(e) => {
+            // A parse error exits here without ever reaching fail(), so
+            // the --json contract needs the report emitted by hand; the
+            // naive argv scan is the only signal available (clap never
+            // produced a Cli). Help and version print to stdout and exit
+            // 0 — no report for those.
+            if e.use_stderr() && wants_json {
+                let report = output::error_report(ErrorKind::Usage, &e.to_string(), None, None);
+                let mut out = std::io::stdout().lock();
+                let _ = serde_json::to_writer_pretty(&mut out, &report);
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+            }
             let _ = e.print();
             return if e.use_stderr() { 2 } else { 0 };
         }

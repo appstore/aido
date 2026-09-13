@@ -367,7 +367,7 @@
   - 方案：改走 `refuse_delivery`，记录后再返回。
   - 测试：`image --count 2 --copy --out-dir` → 退出 5、manifest `deliveries` 记录 clipboard failed、目录未写任何文件、`last --out-dir` 可恢复两图。
 
-- [ ] **F36 · 低 · `src/app.rs:59` · clap 解析错误的 `--json` 无报告（F11 范围外残留）**
+- [x] **F36 · 低 · `src/app.rs:59` · clap 解析错误的 `--json` 无报告（F11 范围外残留）**
   - 问题：未知旗标等错误由 `Cli::try_parse_from` 的 Err 分支直接退出 2，不经过 `fail()`；argv 里有 `--json` 时 stdout 仍为空。F11 只覆盖了 normalize 失败与 `fail()` 两条路径。
   - 方案：该分支里 `e.use_stderr()` 为真且朴素扫描命中 `--json` 时，先把 `error_report(Usage, …)` 打到 stdout，再 `e.print()` 到 stderr；help/version（退出 0）不受影响。`--json=true` 这类畸形写法朴素扫描不命中，维持现状（可接受，与 normalize 路径同一取舍）。
   - 测试：`--json --bogus-flag` → 退出 2、stdout 一份合法 JSON、`error.kind = usage`、stderr 仍含 clap 的报错。
