@@ -34,6 +34,32 @@ fn chunk_cfg(url: &str) -> std::path::PathBuf {
     ))
 }
 
+/// The same config but with recording on, for the failure tests that
+/// assert what history kept.
+fn chunk_hist_cfg(url: &str) -> std::path::PathBuf {
+    settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"test-model\"\n\
+         [providers.srv]\nbase_url = \"{url}\""
+    ))
+}
+
+/// The recorded run's parsed manifest (one run dir, expected).
+fn recorded_manifest(dir: &std::path::Path) -> (std::path::PathBuf, serde_json::Value) {
+    let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    runs.sort();
+    assert_eq!(runs.len(), 1, "exactly one run is recorded");
+    let run = runs.pop().unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("manifest.json")).unwrap()).unwrap();
+    (run, manifest)
+}
+
 #[test]
 fn long_text_splits_into_two_requests_and_replies_join() {
     let file = temp_file("book.txt", long_text().as_bytes());
@@ -390,4 +416,169 @@ fn oversized_glossary_falls_back_to_the_first_request_only() {
             i + 1
         );
     }
+}
+
+// --- a failing reduce run keeps its map replies (R07) ----------------------
+
+#[test]
+fn reduce_failure_keeps_every_map_reply_in_history() {
+    // Three chunks, so three paid map replies — and the reduce request
+    // dies with a 500. The run fails (exit 3) and delivers nothing, but
+    // the record keeps all three map replies as intermediate artifacts
+    // instead of dropping content the user already paid for.
+    let file = temp_file("book.txt", three_chunk_text().as_bytes());
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("第一块的摘要")),
+        ("200 OK", chat_body("第二块的摘要")),
+        ("200 OK", chat_body("第三块的摘要")),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"service exploded"}}"#,
+        ),
+    ]);
+    let dir = temp_dir("chunk-reduce-fail");
+    let cfg = chunk_hist_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--out-dir",
+            dir.join("never").to_str().unwrap(),
+            file.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(3);
+    // Map replies never stream live in a reduce run, and the failed
+    // reduce request streamed nothing: stdout carries no text at all.
+    assert!(out.stdout().is_empty(), "{}", out.stdout());
+    let err = out.stderr();
+    assert!(err.contains("request 4/4 failed"), "{err}");
+    assert!(err.contains("service exploded"), "{err}");
+    assert!(err.contains("kept 3 intermediate map replies"), "{err}");
+    assert!(err.contains("aido history show"), "{err}");
+
+    // The record holds one artifact per non-empty map reply, and each
+    // file carries exactly that reply's text.
+    let (run_dir, manifest) = recorded_manifest(&dir);
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    assert!(
+        manifest["generation"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("request 4/4 failed"),
+        "{}",
+        manifest
+    );
+    let ids: Vec<&str> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["text-chunk-1", "text-chunk-2", "text-chunk-3"]);
+    let files: Vec<&str> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        files,
+        ["text-chunk-1.txt", "text-chunk-2.txt", "text-chunk-3.txt"]
+    );
+    for (i, text) in ["第一块的摘要", "第二块的摘要", "第三块的摘要"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join(files[i])).unwrap(),
+            *text,
+            "map reply {} is kept verbatim",
+            i + 1
+        );
+    }
+    // Nothing was delivered: the out-dir never came to be.
+    assert!(!dir.join("never").exists());
+    assert_eq!(server.requests().len(), 4, "the run stops at the reduce");
+
+    // `history show` still refuses to restore the incomplete run, but
+    // its message now says the intermediates exist in the directory.
+    let shown = run(
+        &["history", "show", "1"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+    );
+    shown.assert_code(0);
+    let stdout = shown.stdout();
+    assert!(stdout.contains("artifacts are not delivered"), "{stdout}");
+    assert!(
+        stdout.contains("kept 3 intermediate chunk result(s)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn map_failure_keeps_the_replies_that_arrived() {
+    // The second of three map requests fails: the run stops with only
+    // chunk 1's reply in hand, and the record keeps exactly that one
+    // intermediate artifact.
+    let file = temp_file("book.txt", three_chunk_text().as_bytes());
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("第一块的摘要")),
+        (
+            "500 Internal Server Error",
+            r#"{"error":{"message":"service exploded"}}"#,
+        ),
+    ]);
+    let dir = temp_dir("chunk-map-fail");
+    let cfg = chunk_hist_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "summarize",
+            "--profile",
+            "test",
+            "--no-stream",
+            file.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(3);
+    assert!(out.stdout().is_empty(), "{}", out.stdout());
+    let err = out.stderr();
+    assert!(err.contains("request 2/4 failed"), "{err}");
+    assert!(err.contains("kept 1 intermediate map reply"), "{err}");
+
+    let (run, manifest) = recorded_manifest(&dir);
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1, "{}", manifest);
+    assert_eq!(artifacts[0]["id"], "text-chunk-1");
+    assert_eq!(artifacts[0]["file"], "text-chunk-1.txt");
+    assert_eq!(
+        std::fs::read_to_string(run.join("text-chunk-1.txt")).unwrap(),
+        "第一块的摘要"
+    );
+    // The failed map step's section is empty, so no artifact exists for
+    // chunk 2 — and chunk 3 was never requested.
+    assert!(!run.join("text-chunk-2.txt").exists());
+    assert!(!run.join("text-chunk-3.txt").exists());
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "the run stops at the failed map request"
+    );
 }

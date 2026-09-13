@@ -171,15 +171,18 @@ fn plan_map_steps(inputs: &[InputPart], quiet: bool, note: &str) -> Result<Vec<R
 /// Build the reduce request's material from the collected map replies: a
 /// consolidation note plus one labeled section per reply, so the model
 /// sees distinct sections of one document instead of one anonymous wall
-/// of text.
-pub fn reduce_inputs(sections: &[String]) -> Vec<InputPart> {
+/// of text. Each reply carries the index of the request that produced it;
+/// the material itself ignores it (a reply's place in the sequence is its
+/// position), so the runner can also use the pair to give a kept
+/// intermediate reply the right provenance when the run fails.
+pub fn reduce_inputs(sections: &[(usize, String)]) -> Vec<InputPart> {
     let total = sections.len();
     let mut parts = vec![synthetic_text(
         usize::MAX,
         "consolidation note",
         REDUCE_NOTE,
     )];
-    for (i, text) in sections.iter().enumerate() {
+    for (i, (_, text)) in sections.iter().enumerate() {
         parts.push(synthetic_text(
             usize::MAX,
             &format!("chunk {}/{} result", i + 1, total),
@@ -808,7 +811,7 @@ mod tests {
 
     #[test]
     fn reduce_material_labels_every_chunk_result() {
-        let parts = reduce_inputs(&[" 一\n\n".to_string(), "二".to_string()]);
+        let parts = reduce_inputs(&[(0, " 一\n\n".to_string()), (1, "二".to_string())]);
         // Consolidation note + one section per map reply.
         assert_eq!(parts.len(), 3);
         assert!(parts[0].text().unwrap().contains("one longer document"));
@@ -817,6 +820,19 @@ mod tests {
         assert!(one.ends_with("一"), "reply whitespace trimmed: {one}");
         assert!(parts[2].text().unwrap().contains("--- result 2 of 2 ---"));
         assert!(parts[2].text().unwrap().contains("二"));
+    }
+
+    #[test]
+    fn reduce_material_depends_on_position_not_step_index() {
+        // The step index rides with each reply for provenance only: the
+        // material a request sees is byte-identical however the replies
+        // map onto requests.
+        let sparse = reduce_inputs(&[(2, "一".to_string()), (5, "二".to_string())]);
+        let dense = reduce_inputs(&[(0, "一".to_string()), (1, "二".to_string())]);
+        assert_eq!(sparse.len(), dense.len());
+        for (a, b) in sparse.iter().zip(dense.iter()) {
+            assert_eq!(a.text().unwrap(), b.text().unwrap());
+        }
     }
 
     // --- ChunkGate ---------------------------------------------------------

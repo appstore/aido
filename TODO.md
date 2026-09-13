@@ -413,7 +413,7 @@
   - F24 的「不可行」针对上游 `default-features = false`；主要建议（aido 自己加 feature + optional 依赖）未尝试。`futures-util` 全仓只有 `edge.rs` 用；kothok 只有 `transport.rs:192` 一个调用点。
   - 方案：`[features] default = ["edge-tts"]`，`edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]`，两依赖 optional；`#[cfg(feature = "edge-tts")] mod edge;`；transport 分支（off → 定向报错）；`Adapter::EdgeTts` 枚举保留（serde/clap 照常）；`default_config()` / `check()` / SAMPLE_CONFIG 按 feature 分支；CI 加 `--no-default-features` job + 断言 aws-lc-rs 不在树里；README 加一句构建说明。
 
-- [ ] **R07 · 中 · `src/runner.rs:443` · reduce 运行失败 = 全部 map 回复丢失（F06 残留）**
+- [x] **R07 · 中 · `src/runner.rs:443` · reduce 运行失败 = 全部 map 回复丢失（F06 残留）**
   - 失败时清 `merged`（半截 reduce 回复），`sections`（N 条已付费的 map 回复）无任何去处——`summarize` 正是「分很多块、每块都花钱」的那类。
   - 方案：`sections` 改 `Vec<(usize, String)>`；失败且 `g.reduces` 时把非空 section 变成中间产物（id `{stem}-chunk-{n}`、provenance `Request{index}`，只进历史不交付，运行本就 Incomplete）+ warning；`RunOutput` 加 `live_chars`（DeltaSink 计数），app.rs 「已流出 stdout」警告条件换掉被打破的 proxy；`history show` 拒绝信息补「保留了 N 段中间结果」。
   - 测试：3 块 summarize、reduce 500 → exit 3、历史 3 条中间产物、stdout 空；map 第 2 块失败 → 保留 1 段。

@@ -290,9 +290,11 @@ async fn dispatch(
             // `output.status` is Complete for an unsatisfied generation:
             // its validated artifacts stay in the record's directory
             // instead of being dropped. A run whose requests died mid-way
-            // keeps the same promise for whatever text did arrive — but a
-            // first-request failure has no text to keep, so it records
-            // metadata only, exactly like a truncated stream.
+            // keeps the same promise for whatever text did arrive — the
+            // merged replies, or a reduce run's collected map replies as
+            // intermediate artifacts — but a failure before any text
+            // arrived records metadata only, exactly like a truncated
+            // stream.
             let keep_artifacts = output.status.is_complete()
                 || (output.failure.is_some() && !output.artifacts.is_empty());
             best_effort(
@@ -300,15 +302,15 @@ async fn dispatch(
                 "failed to record the run",
             );
             // Text that already streamed live cannot be taken back; point
-            // the user at the record that now holds it. Only a run that
-            // actually streamed whole replies into a kept artifact can
-            // make that claim — a reduce run streams no map reply and
-            // keeps no artifact, and a truncated stream records metadata
-            // only (no `failure`, no warning).
+            // the user at the record that now holds it. `live_chars` says
+            // what actually reached the terminal: a reduce run streams no
+            // map reply (its kept intermediates were buffered), and a
+            // truncated stream records metadata only (no `failure`, no
+            // warning).
             if output.live_stdout
                 && output.failure.is_some()
                 && output.steps_done > 0
-                && !output.artifacts.is_empty()
+                && output.live_chars > 0
             {
                 eprintln!(
                     "warning: 已输出前 {}/{} 个分片的结果；完整记录见 aido history show {}",
@@ -521,9 +523,17 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
         HistoryCmd::Show { target } => {
             let record = resolve_run(target)?;
             if !record.generation.is_complete() {
+                let kept = if record.artifacts.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; this run kept {} intermediate chunk result(s) in its history directory",
+                        record.artifacts.len()
+                    )
+                };
                 println!(
                     "run {}: generation {} — artifacts are not delivered for \
-                     incomplete runs; try another index, or `aido last` for \
+                     incomplete runs{kept}; try another index, or `aido last` for \
                      the newest complete run",
                     record.run_id,
                     generation_label(&record.generation)

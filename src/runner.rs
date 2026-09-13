@@ -22,6 +22,11 @@ pub struct RunOutput {
     pub warnings: Vec<String>,
     /// Live stdout already printed the text (cannot be taken back).
     pub live_stdout: bool,
+    /// Characters actually printed live across the run's sinks. Unlike
+    /// `live_stdout` (the mode) this is 0 when nothing reached the
+    /// terminal — a reduce run keeps its map replies as buffered
+    /// intermediates, so a failure there streamed nothing to take back.
+    pub live_chars: u64,
     /// Per-part batches only: the parts that failed, in input order.
     /// Surviving parts' artifacts are complete and deliverable; the run
     /// exits 6 (partial) after normal delivery.
@@ -30,8 +35,10 @@ pub struct RunOutput {
     pub parts_total: usize,
     /// The request error that stopped a single-document run mid-way; a
     /// batch never sets this (its failures are per-part). Whatever text
-    /// already merged still reached `artifacts`, so the caller records
-    /// the partial run and classifies the exit code from this error.
+    /// already arrived still reached `artifacts` — merged replies, or a
+    /// reduce run's map replies kept as intermediates — so the caller
+    /// records the partial run and classifies the exit code from this
+    /// error.
     pub failure: Option<AppError>,
     /// Steps whose replies completed, of `steps_total` planned requests.
     pub steps_done: usize,
@@ -84,6 +91,9 @@ struct DeltaSink {
     merged: String,
     live: bool,
     chars_seen: u64,
+    /// Only the text printed live: `chars_seen` also counts buffered
+    /// sinks, whose output never reached the terminal.
+    live_chars: u64,
 }
 
 impl DeltaSink {
@@ -93,6 +103,7 @@ impl DeltaSink {
         if self.live {
             print!("{text}");
             let _ = std::io::stdout().flush();
+            self.live_chars += text.chars().count() as u64;
         }
     }
 }
@@ -212,9 +223,11 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         requests: Vec<usize>,
         sink: Rc<RefCell<DeltaSink>>,
         gate: Option<SliceMerger>,
-        /// A reduce group's per-map-step replies, in step order: the reduce
-        /// request's future material, never delivered on their own.
-        sections: Vec<String>,
+        /// A reduce group's per-map-step replies, each paired with the
+        /// index of the request that produced it: the reduce request's
+        /// future material, never delivered on their own — unless the run
+        /// fails, when history keeps them as intermediate artifacts.
+        sections: Vec<(usize, String)>,
         /// Whether this group ends in a reduce step (chunk-reduce). The
         /// decision is per group, not per run: in a per-part batch one
         /// long file's reduce step must not treat a single-chunk file's
@@ -231,6 +244,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let mut group: Option<Group> = None;
     let mut skip_part: Option<usize> = None;
     let mut total_chars = 0u64;
+    let mut total_live_chars = 0u64;
 
     // Merge a finished group into an artifact. An empty part in a batch
     // is a failure, not a silent gap.
@@ -242,6 +256,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             }
             let merged = g.sink.borrow();
             total_chars += merged.chars_seen;
+            total_live_chars += merged.live_chars;
             if !merged.merged.is_empty() {
                 // One reply is that request's artifact; several joined
                 // replies name every request they merged, in order.
@@ -298,6 +313,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 merged: String::new(),
                 live: live_stdout && !batch,
                 chars_seen: 0,
+                live_chars: 0,
             }));
             // A reduce group never merges through a gate: map replies
             // accumulate as sections (the reduce request's material) and
@@ -335,7 +351,11 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // only the reduce reply streams live.
         let reduces = group.as_ref().unwrap().reduces;
         if reduces && step.role == StepRole::Map {
-            group.as_mut().unwrap().sections.push(String::new());
+            group
+                .as_mut()
+                .unwrap()
+                .sections
+                .push((step.index, String::new()));
         }
         if !plan.quiet {
             let label = if plan.steps.len() > 1 {
@@ -379,7 +399,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         let mut on_delta = |delta: &str| {
             let g = group.as_mut().unwrap();
             if collect_section {
-                g.sections.last_mut().unwrap().push_str(delta);
+                g.sections.last_mut().unwrap().1.push_str(delta);
                 return;
             }
             match g.gate.as_mut() {
@@ -449,12 +469,38 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                         ),
                     };
                     // A reduce group has no final result without its reduce
-                    // reply: map replies are intermediate material and a
-                    // half-streamed reduce reply is not the consolidation
-                    // either, so nothing is kept as the artifact.
+                    // reply: a half-streamed reduce reply is not the
+                    // consolidation, so nothing of it is kept. The map
+                    // replies are different — each is a paid, complete
+                    // reply — so every non-empty section survives as an
+                    // intermediate artifact in the run's record (never
+                    // delivered: the run is incomplete).
                     if let Some(g) = group.as_mut() {
                         if g.reduces {
                             g.sink.borrow_mut().merged.clear();
+                            let name = part_name(plan, g.id, &g.stem);
+                            let mut kept = 0usize;
+                            for (i, (step_index, text)) in g.sections.iter().enumerate() {
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                kept += 1;
+                                artifacts.push(Artifact {
+                                    id: format!("{}-chunk-{}", g.stem, i + 1),
+                                    kind: MediaKind::Text,
+                                    mime: "text/plain".into(),
+                                    format: "text".into(),
+                                    bytes: text.clone().into_bytes(),
+                                    provenance: Provenance::Request { index: *step_index },
+                                });
+                            }
+                            if kept > 0 {
+                                let plural = if kept == 1 { "y" } else { "ies" };
+                                warnings.push(format!(
+                                    "kept {kept} intermediate map repl{plural} of '{name}' \
+                                     after the failure; not delivered — see aido history show"
+                                ));
+                            }
                         }
                     }
                     failure = Some(error);
@@ -497,6 +543,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         status: overall,
         warnings,
         live_stdout,
+        live_chars: total_live_chars,
         failed_parts,
         parts_total: if batch { parts_total } else { 0 },
         failure,
@@ -554,6 +601,33 @@ fn absorb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_chars_counts_only_what_was_printed_live() {
+        // The same text through a buffered and a live sink: `chars_seen`
+        // grows in both, `live_chars` only where the terminal saw it.
+        let mut buffered = DeltaSink {
+            merged: String::new(),
+            live: false,
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        buffered.emit("一二三");
+        assert_eq!(buffered.chars_seen, 3);
+        assert_eq!(buffered.live_chars, 0);
+
+        // The live sink prints; the test's captured stdout swallows it.
+        let mut live = DeltaSink {
+            merged: String::new(),
+            live: true,
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        live.emit("一二三");
+        live.emit("四");
+        assert_eq!(live.chars_seen, 4);
+        assert_eq!(live.live_chars, 4);
+    }
 
     #[test]
     fn batch_failure_carries_the_status_own_reason() {
