@@ -313,7 +313,7 @@ async fn dispatch(
                 && output.live_chars > 0
             {
                 eprintln!(
-                    "warning: 已输出前 {}/{} 个分片的结果；完整记录见 aido history show {}",
+                    "warning: the first {}/{} parts already streamed to stdout; the full record is in `aido history show {}`",
                     output.steps_done, output.steps_total, run_id
                 );
             }

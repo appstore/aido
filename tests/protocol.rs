@@ -268,7 +268,10 @@ fn live_partial_run_warns_where_the_full_record_lives() {
         out.stdout()
     );
     let err = out.stderr();
-    assert!(err.contains("已输出前 2/3 个分片的结果"), "{err}");
+    assert!(
+        err.contains("the first 2/3 parts already streamed to stdout"),
+        "{err}"
+    );
     let runs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()

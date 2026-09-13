@@ -418,7 +418,7 @@
   - 方案：`sections` 改 `Vec<(usize, String)>`；失败且 `g.reduces` 时把非空 section 变成中间产物（id `{stem}-chunk-{n}`、provenance `Request{index}`，只进历史不交付，运行本就 Incomplete）+ warning；`RunOutput` 加 `live_chars`（DeltaSink 计数），app.rs 「已流出 stdout」警告条件换掉被打破的 proxy；`history show` 拒绝信息补「保留了 N 段中间结果」。
   - 测试：3 块 summarize、reduce 500 → exit 3、历史 3 条中间产物、stdout 空；map 第 2 块失败 → 保留 1 段。
 
-- [ ] **R08 · 中 · `src/app.rs:314` · 全仓唯一一条中文运行时输出**
+- [x] **R08 · 中 · `src/app.rs:314` · 全仓唯一一条中文运行时输出**
   - 「warning: 已输出前 N/M 个分片的结果…」是上一轮方案的描述文字被当字面量抄入。改为英文（`the first N/M parts already streamed to stdout; the full record is in 'aido history show {}'`）。
 
 - [ ] **R09 · 低 · `src/app.rs:49` · `wants_json` 的 argv 扫描会把值误当旗标**
