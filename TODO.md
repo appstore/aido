@@ -398,7 +398,7 @@
   - 方案：:241 改 `env.stdin_has_data()`；空读仍报错（probe 说有数据却空读 = 管道中途关闭）；删除 `InputEnv::stdin_is_terminal` 字段（全仓仅 input.rs 引用）。
   - 测试：反转单测 `empty_piped_stdin_is_an_error_without_clipboard_fallback`（input.rs:672）与集成 `empty_piped_stdin_is_an_error_and_never_touches_the_clipboard`（tests/input.rs:115）；新增 probe=true 空读仍报错、ask -p 空管道 exit 0、ocr --copy + /dev/null → 剪贴板兜底。
 
-- [ ] **R02 · 高 · `src/runner.rs:184` · chunk-reduce 的 reduce 判定是运行级，吞掉单块文件的输出（F02 残留）**
+- [x] **R02 · 高 · `src/runner.rs:184` · chunk-reduce 的 reduce 判定是运行级，吞掉单块文件的输出（F02 残留）**
   - `reduce_plan` 因任一文件置 true → per_part 批中单块文件（无 reduce 步）的唯一回复被收进 `sections`，`merged` 为空 → 记为失败 part。用户付费拿到失败记录。`parse_task()` 不校验组合，无测试覆盖。
   - 方案（正式支持组合）：`Group` 加 `reduces: bool`（按 `s.part == step.part && s.role == Reduce` 建组时算）；删运行级 `reduce_plan`；四处使用点全换（gate :295、sections push :325、collect_section :366、失败清空 :443）。
   - 测试：自定义任务 `per_part = true` + `chunk-reduce`，一长一短两文件 + `--out-dir` → 两份产物均非空；长文件 reduce 请求携带两条 map 回复。

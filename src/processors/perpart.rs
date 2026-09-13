@@ -251,4 +251,41 @@ mod tests {
             .chain(&steps[4..7])
             .all(|s| s.role == crate::processors::StepRole::Map));
     }
+
+    #[test]
+    fn a_single_chunk_part_plans_no_reduce_step_next_to_a_chunked_part() {
+        // per_part plus chunk-reduce is a supported combination: the long
+        // file's part ends in its own reduce step, while the single-chunk
+        // file's part is one map step whose reply is the part's whole
+        // result — a chunk that is already the whole document takes no
+        // reduce step, so the runner must not collect its reply as
+        // intermediate material either.
+        let part = |id: usize, path: &str, text: String| InputPart {
+            id,
+            source: InputSource::File(std::path::PathBuf::from(path)),
+            name: path.into(),
+            kind: MediaKind::Text,
+            unknown_kind: false,
+            mime: "text/plain".into(),
+            content: InputContent::Text(text),
+        };
+        let inputs = [
+            part(1, "long.md", "字".repeat(9000)),
+            part(2, "short.md", "one short line".into()),
+        ];
+        let steps = plan_steps(&inputs, ProcessorKind::ChunkReduce, true).unwrap();
+        // 3 map + 1 reduce for the long file, then 1 map for the short one.
+        assert_eq!(steps.len(), 5);
+        assert!(steps[..4].iter().all(|s| s.part == Some(1)));
+        assert!(steps[..3]
+            .iter()
+            .all(|s| s.role == crate::processors::StepRole::Map));
+        assert_eq!(steps[3].role, crate::processors::StepRole::Reduce);
+        assert_eq!(steps[3].part, Some(1));
+        assert_eq!(steps[4].part, Some(2));
+        assert_eq!(steps[4].role, crate::processors::StepRole::Map);
+        assert!(!steps
+            .iter()
+            .any(|s| s.part == Some(2) && s.role == crate::processors::StepRole::Reduce));
+    }
 }

@@ -100,7 +100,7 @@ impl DeltaSink {
 /// Merges a multi-request run's replies into one text stream. The right
 /// join depends on the strategy: ocr-tiles re-shows overlap bands and
 /// dedups them; chunk-join carries context instead, so chunks join with
-/// a plain paragraph break. A chunk-reduce run never merges — its map
+/// a plain paragraph break. A chunk-reduce group never merges — its map
 /// replies are intermediate and the reduce reply is the whole artifact.
 enum SliceMerger {
     Boundary(BoundaryGate),
@@ -178,10 +178,6 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     }
     let batch = part_sizes.iter().filter(|(id, _)| id.is_some()).count() > 1;
     let parts_total = part_sizes.iter().filter(|(id, _)| id.is_some()).count();
-    // A chunk-reduce run (map steps plus one reduce step per group) holds
-    // map replies back as the reduce request's material instead of
-    // merging them for delivery.
-    let reduce_plan = plan.steps.iter().any(|s| s.role == StepRole::Reduce);
     let group_size = |id: Option<usize>| {
         part_sizes
             .iter()
@@ -216,9 +212,14 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         requests: Vec<usize>,
         sink: Rc<RefCell<DeltaSink>>,
         gate: Option<SliceMerger>,
-        /// A reduce run's per-map-step replies, in step order: the reduce
+        /// A reduce group's per-map-step replies, in step order: the reduce
         /// request's future material, never delivered on their own.
         sections: Vec<String>,
+        /// Whether this group ends in a reduce step (chunk-reduce). The
+        /// decision is per group, not per run: in a per-part batch one
+        /// long file's reduce step must not treat a single-chunk file's
+        /// only map reply as intermediate material.
+        reduces: bool,
     }
     // Warnings and failures name the part by its input name (`b.png`),
     // not its artifact stem (`b`).
@@ -284,15 +285,24 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             }
         }
         if group.is_none() {
+            // A chunk-reduce group (map steps plus one reduce step of THIS
+            // part) holds map replies back as the reduce request's material
+            // instead of merging them for delivery; a group without a
+            // reduce step — a single-chunk file in a per-part batch, say —
+            // delivers its map replies as its own output.
+            let reduces = plan
+                .steps
+                .iter()
+                .any(|s| s.part == step.part && s.role == StepRole::Reduce);
             let sink = Rc::new(RefCell::new(DeltaSink {
                 merged: String::new(),
                 live: live_stdout && !batch,
                 chars_seen: 0,
             }));
-            // A reduce run never merges through a gate: map replies
+            // A reduce group never merges through a gate: map replies
             // accumulate as sections (the reduce request's material) and
             // the reduce reply is a single request's output.
-            let gate = (group_size(step.part) > 1 && !reduce_plan).then(|| {
+            let gate = (group_size(step.part) > 1 && !reduces).then(|| {
                 let gate_sink = sink.clone();
                 match plan.processor {
                     ProcessorKind::ChunkJoin | ProcessorKind::ChunkReduce => {
@@ -317,12 +327,14 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 sink,
                 gate,
                 sections: Vec::new(),
+                reduces,
             });
         }
-        // Map replies of a reduce run are intermediate: each accumulates
+        // Map replies of a reduce group are intermediate: each accumulates
         // into its own section and never reaches stdout or an artifact —
         // only the reduce reply streams live.
-        if reduce_plan && step.role == StepRole::Map {
+        let reduces = group.as_ref().unwrap().reduces;
+        if reduces && step.role == StepRole::Map {
             group.as_mut().unwrap().sections.push(String::new());
         }
         if !plan.quiet {
@@ -363,7 +375,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // requests; a single request goes straight to the sink. The
         // closure's last use is inside the request call (plus the
         // buffered replay right after), so later group access is fine.
-        let collect_section = reduce_plan && step.role == StepRole::Map;
+        let collect_section = reduces && step.role == StepRole::Map;
         let mut on_delta = |delta: &str| {
             let g = group.as_mut().unwrap();
             if collect_section {
@@ -436,12 +448,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                             error.chain()
                         ),
                     };
-                    // A reduce run has no final result without its reduce
+                    // A reduce group has no final result without its reduce
                     // reply: map replies are intermediate material and a
                     // half-streamed reduce reply is not the consolidation
                     // either, so nothing is kept as the artifact.
-                    if reduce_plan {
-                        if let Some(g) = group.as_mut() {
+                    if let Some(g) = group.as_mut() {
+                        if g.reduces {
                             g.sink.borrow_mut().merged.clear();
                         }
                     }

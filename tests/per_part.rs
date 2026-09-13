@@ -924,6 +924,106 @@ fn a_batch_cannot_target_the_clipboard() {
     assert!(out.stderr().contains("clipboard"), "{}", out.stderr());
 }
 
+/// Three paragraphs of exactly 2000 chars each: any two overflow the
+/// 4000-char packing target, so the text chunks into exactly three.
+fn three_chunk_text() -> String {
+    (0..3)
+        .map(|i| format!("第{i}部分。{}", "甲".repeat(1995)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[test]
+fn a_single_chunk_file_delivers_its_map_reply_in_a_chunk_reduce_batch() {
+    // The combination a custom task may declare — per_part plus
+    // chunk-reduce — is supported: the long file's part maps its chunks
+    // and consolidates them with one reduce request of its own, while the
+    // single-chunk file's only map reply is the part's artifact itself.
+    // The pre-fix bug treated that reply as intermediate material for a
+    // reduce step that never existed and recorded the part as failed
+    // ("no usable text") despite the request succeeding.
+    let tasks = temp_dir("perpart-mixedreduce-tasks");
+    std::fs::write(
+        tasks.join("digest.toml"),
+        "operation = 'generate'\n\
+         instruction = 'summarize the material'\n\
+         input_types = ['text']\n\
+         output_types = ['text']\n\
+         processor = 'chunk-reduce'\n\
+         per_part = true\n",
+    )
+    .unwrap();
+    let dir = temp_dir("perpart-mixedreduce");
+    let long = dir.join("long.md");
+    std::fs::write(&long, three_chunk_text().as_bytes()).unwrap();
+    let short = dir.join("short.md");
+    std::fs::write(&short, "one short line.\n").unwrap();
+    let out_dir = temp_dir("perpart-mixedreduce-out");
+    let server = MultiServer::start(&[
+        chat_body("第一块的摘要"),
+        chat_body("第二块的摘要"),
+        chat_body("第三块的摘要"),
+        chat_body("长文的最终摘要"),
+        chat_body("短文的摘要"),
+    ]);
+    let cfg = batch_cfg(&server.url());
+    let arg = cfg.display().to_string();
+    let out = run_tty_with(
+        &[
+            "digest",
+            "--profile",
+            "test",
+            "--no-stream",
+            long.to_str().unwrap(),
+            short.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", arg.as_str()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+        ],
+        cfg,
+    );
+    out.assert_code(0);
+    // Both parts deliver: the long file the reduce reply, the short file
+    // its map reply verbatim.
+    assert_eq!(
+        std::fs::read_to_string(out_dir.join("long.txt")).unwrap(),
+        "长文的最终摘要"
+    );
+    assert_eq!(
+        std::fs::read_to_string(out_dir.join("short.txt")).unwrap(),
+        "短文的摘要"
+    );
+    let err = out.stderr();
+    assert!(err.contains("split into 3 chunks"), "{err}");
+    assert!(!err.contains("failed"), "{err}");
+
+    // The long file cost 3 map requests plus 1 reduce; the short file 1
+    // map request — nothing else.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 5);
+    // The reduce request's material is the long file's collected map
+    // replies, labeled per section.
+    let reduce = request_json(&requests[3])["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for piece in ["第一块的摘要", "第二块的摘要", "第三块的摘要"] {
+        assert!(reduce.contains(piece), "missing {piece} in: {reduce}");
+    }
+    assert!(reduce.contains("--- result 1 of 3 ---"), "{reduce}");
+    // The short file's only request is its own map step: its material is
+    // the short text itself, not reduce sections.
+    let short_map = request_json(&requests[4])["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(short_map.contains("one short line."), "{short_map}");
+    assert!(!short_map.contains("--- result"), "{short_map}");
+}
+
 /// Count data-URL images in a raw request body.
 fn count_images(raw: &[u8]) -> usize {
     let mut n = 0;
