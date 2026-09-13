@@ -425,7 +425,7 @@
   - `args_os().any(|a| a == "--json")` 不区分位置；`aido ask -p "--json"` 会让失败路径多吐一份 JSON。F36 之后此扫描的覆盖面变大。
   - 方案：扫描挪进 cli.rs 复用 `FLAGS` arity 表（跳过取值旗标的值、`--flag=value` 自包含、遇 `--` 停止）。
 
-- [ ] **R10 · 低 · `src/domain.rs:110` · `Restored` 文档「never written to disk」与交付 manifest 矛盾；历史不存 provenance**
+- [x] **R10 · 低 · `src/domain.rs:110` · `Restored` 文档「never written to disk」与交付 manifest 矛盾；历史不存 provenance**
   - out-dir manifest 会写 `{"type":"restored"}`（tests/provenance.rs:293 直接断言了这一点）；历史 `ManifestArtifact` 不存 provenance，恢复链路丢「哪个请求产出什么」。
   - 方案：`ManifestArtifact` 加 `#[serde(default)] provenance: Option<Provenance>`，save 写入 / load 读回（缺省退 `Restored`，老记录可读）；修正 domain.rs 注释；更新 provenance.rs 测试 + 老记录兼容测试。
 

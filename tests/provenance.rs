@@ -1,9 +1,10 @@
 //! Artifact provenance end to end: every delivered artifact names the
 //! request(s) that produced it — a single reply is `request`, several
 //! joined replies (ocr slices, chunk joins) are `merged` with the request
-//! list in order, and artifacts restored from history are `restored`.
-//! The provenance lives in the `--out-dir` delivery manifest (history
-//! manifests store metadata only), so every test reads that manifest.
+//! list in order. The provenance lives in the `--out-dir` delivery
+//! manifest and in the history record, so a restored run re-delivers the
+//! original request numbers; only records written before 0.3.0 restore as
+//! `restored`. Every test here reads the delivery manifest.
 
 mod support;
 
@@ -259,9 +260,10 @@ fn a_speech_artifact_names_its_request() {
 }
 
 #[test]
-fn restored_artifacts_carry_restored_provenance() {
-    // `last` re-delivers a recorded run without a new request: its
-    // delivery manifest must say "restored", not claim a fresh request.
+fn restored_artifacts_keep_their_recorded_provenance() {
+    // `last` re-delivers a recorded run without a new request: history
+    // stores each artifact's provenance, so the delivery manifest keeps
+    // naming the request that originally produced it.
     let server = Server::json(chat_body("KEPT"));
     let hist = temp_dir("prov-restore-hist");
     let restore = temp_dir("prov-restore-out");
@@ -289,6 +291,45 @@ fn restored_artifacts_carry_restored_provenance() {
         &[("AIDO_HISTORY_DIR", &hist_str)],
     );
     out.assert_code(0);
+    let manifest = manifest_of(&restore);
+    assert_eq!(
+        manifest["artifacts"][0]["provenance"],
+        serde_json::json!({"type": "request", "index": 0})
+    );
+}
+
+#[test]
+fn artifacts_from_pre_provenance_records_restore_as_restored() {
+    // A record written before 0.3.0 carries no provenance: its artifacts
+    // were not produced in this process, so `last --out-dir` must deliver
+    // them as "restored" — the old behavior stays readable.
+    let hist = temp_dir("prov-old-hist");
+    let restore = temp_dir("prov-old-out");
+
+    // The shape save_generation writes, minus the provenance field.
+    let run_dir = hist.join("20260101-000000.001");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("text.txt"), "OLD").unwrap();
+    std::fs::write(
+        run_dir.join("manifest.json"),
+        r#"{"version":1,"run_id":"20260101-000000.001","task":"summarize",
+            "created_at":"2026-01-01T00:00:00Z",
+            "generation":{"status":"complete"},
+            "artifacts":[{"id":"text","kind":"text","mime":"text/plain",
+            "format":"text","file":"text.txt","size":3}]}"#,
+    )
+    .unwrap();
+
+    let out = run(
+        &["last", "--out-dir", restore.to_str().unwrap()],
+        b"",
+        &[("AIDO_HISTORY_DIR", hist.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(
+        std::fs::read_to_string(restore.join("text.txt")).unwrap(),
+        "OLD"
+    );
     let manifest = manifest_of(&restore);
     assert_eq!(
         manifest["artifacts"][0]["provenance"],

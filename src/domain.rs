@@ -108,8 +108,9 @@ pub enum Provenance {
     /// reply order (an ocr run's slices, a chunk-join run's chunks).
     Merged { requests: Vec<usize> },
     /// Restored from history (`aido last`, `history show`); not produced
-    /// in this process. Set only when artifacts are loaded back — history
-    /// manifests store no provenance, so this is never written to disk.
+    /// in this process. Set only when loaded artifacts carry no recorded
+    /// provenance (records written before 0.3.0); delivery manifests may
+    /// serialize it.
     Restored,
 }
 
