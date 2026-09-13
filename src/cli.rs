@@ -168,6 +168,52 @@ fn flag_arity(token: &str) -> Option<bool> {
     None // not a flag
 }
 
+/// Whether raw argv asks for the JSON report — decided before clap parses.
+///
+/// A normalize error or a clap parse error fires before any `Cli` exists,
+/// so `app::run` must judge the `--json` error contract from raw argv.
+/// The scan has to be arity-aware: a token equal to `--json` that is
+/// merely the value of a value-taking flag (`aido ask -p "--json"`) is
+/// not a request. That is why it lives here, beside the normalizer: the
+/// `FLAGS`/`SHORT_VALUE_FLAGS` arity tables are the single source of
+/// truth, and this scan mirrors exactly which tokens the normalizer
+/// consumes as values.
+pub(crate) fn argv_wants_json() -> bool {
+    wants_json_in(&std::env::args_os().skip(1).collect::<Vec<_>>())
+}
+
+/// The argv scan behind [`argv_wants_json`], over an explicit slice so
+/// tests can drive it: walk the tokens, let a separated value flag
+/// swallow its value, stop at `--`, and look for a real `--json`.
+fn wants_json_in(argv: &[OsString]) -> bool {
+    let mut iter = argv.iter();
+    while let Some(token) = iter.next() {
+        // Non-UTF-8 argv entries can only be file paths (or a consumed
+        // value); either way they are never the `--json` flag.
+        let Some(t) = token.to_str() else { continue };
+        if t == "--" {
+            // Everything past the separator is a literal path.
+            return false;
+        }
+        if t == "--json" {
+            return true;
+        }
+        if flag_arity(t) == Some(true) && !value_attached(t) {
+            // A separated value flag: the next token is its value and can
+            // never be a flag — the normalizer consumes it the same way
+            // (`-p --` is a prompt of "--", not a separator).
+            iter.next();
+        }
+    }
+    false
+}
+
+/// A value flag whose value rides inside the token itself — `--flag=v`,
+/// `-pv`, `-p=v` — so it consumes no further argv token.
+fn value_attached(t: &str) -> bool {
+    t.contains('=') || short_attached(t).is_some()
+}
+
 /// Rewrite argv into its normalized form.
 pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     let mut slots: Vec<Slot> = Vec::new();
@@ -1014,5 +1060,44 @@ mod tests {
             "{:?}",
             n.argv
         );
+    }
+
+    #[test]
+    fn wants_json_scan_mirrors_flag_arity() {
+        // A "--json" that is a value-taking flag's value is not a request.
+        assert!(!wants_json_in(&os(&["ask", "-p", "--json"])));
+        assert!(!wants_json_in(&os(&["summarize", "--text", "--json"])));
+        assert!(!wants_json_in(&os(&["--prompt=--json"])));
+        assert!(!wants_json_in(&os(&["-p=--json"])));
+        assert!(!wants_json_in(&os(&["-p--json"])));
+        assert!(!wants_json_in(&os(&["-m", "--json"])));
+        assert!(!wants_json_in(&os(&["-o", "--json"])));
+        assert!(!wants_json_in(&os(&["--model", "--json"])));
+        // Past the separator everything is a literal path.
+        assert!(!wants_json_in(&os(&["--", "--json"])));
+        assert!(!wants_json_in(&os(&["ask", "--", "--json"])));
+        // A real --json flag, wherever it stands.
+        assert!(wants_json_in(&os(&["--json"])));
+        assert!(wants_json_in(&os(&["--json", "--bogus"])));
+        assert!(wants_json_in(&os(&["ask", "--json", "-p", "hi"])));
+        assert!(wants_json_in(&os(&["--text", "hi", "--json"])));
+        // `-p` swallows the separator as its value, so a later --json
+        // still parses as the flag — the normalizer consumes it too.
+        assert!(wants_json_in(&os(&["-p", "--", "--json"])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wants_json_scan_handles_non_utf8_tokens() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0xff, 0xfe]);
+        // A non-UTF-8 token is a file path, never a flag: the scan goes on.
+        assert!(wants_json_in(&[bad.clone(), OsString::from("--json")]));
+        // A value flag still swallows it; the skip works on OsStrings.
+        assert!(wants_json_in(&[
+            OsString::from("-p"),
+            bad,
+            OsString::from("--json")
+        ]));
     }
 }

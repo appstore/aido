@@ -421,7 +421,7 @@
 - [x] **R08 · 中 · `src/app.rs:314` · 全仓唯一一条中文运行时输出**
   - 「warning: 已输出前 N/M 个分片的结果…」是上一轮方案的描述文字被当字面量抄入。改为英文（`the first N/M parts already streamed to stdout; the full record is in 'aido history show {}'`）。
 
-- [ ] **R09 · 低 · `src/app.rs:49` · `wants_json` 的 argv 扫描会把值误当旗标**
+- [x] **R09 · 低 · `src/app.rs:49` · `wants_json` 的 argv 扫描会把值误当旗标**
   - `args_os().any(|a| a == "--json")` 不区分位置；`aido ask -p "--json"` 会让失败路径多吐一份 JSON。F36 之后此扫描的覆盖面变大。
   - 方案：扫描挪进 cli.rs 复用 `FLAGS` arity 表（跳过取值旗标的值、`--flag=value` 自包含、遇 `--` 停止）。
 

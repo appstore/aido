@@ -44,9 +44,10 @@ struct RunState {
 
 pub async fn run() -> i32 {
     // A normalize error fires before clap ever parses, so the --json
-    // decision starts as a naive argv scan; once parsing succeeded, the
+    // decision starts as an arity-aware argv scan (a "--json" that is
+    // some flag's value is not a request); once parsing succeeded, the
     // parsed flag overrides it.
-    let wants_json = std::env::args_os().any(|a| a == "--json");
+    let wants_json = cli::argv_wants_json();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let normalized = match cli::normalize(argv) {
         Ok(n) => n,
@@ -59,7 +60,7 @@ pub async fn run() -> i32 {
         Err(e) => {
             // A parse error exits here without ever reaching fail(), so
             // the --json contract needs the report emitted by hand; the
-            // naive argv scan is the only signal available (clap never
+            // argv scan is the only signal available (clap never
             // produced a Cli). Help and version print to stdout and exit
             // 0 — no report for those.
             if e.use_stderr() && wants_json {

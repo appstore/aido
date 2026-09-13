@@ -518,6 +518,25 @@ fn json_error_report_covers_clap_parse_errors() {
 }
 
 #[test]
+fn json_scan_does_not_treat_a_flag_value_as_the_json_flag() {
+    // `--json` here is -p's value, not a request for the report: the
+    // clap error must stay plain (no JSON on stdout), because the
+    // arity-aware scan knows -p consumes the next token.
+    let out = run(&["ask", "-p", "--json", "--bogus-flag"], b"", &[]);
+    out.assert_code(2);
+    assert!(
+        out.stdout().is_empty(),
+        "no JSON report without a real --json: {}",
+        out.stdout()
+    );
+    assert!(
+        out.stderr().contains("--bogus-flag"),
+        "stderr keeps clap's message: {}",
+        out.stderr()
+    );
+}
+
+#[test]
 fn json_error_report_covers_service_exit_three() {
     let server = Server::start(
         "500 Internal Server Error",
