@@ -374,9 +374,85 @@
 
 ---
 
-## 完成标准
+## 完成标准（第一至三部分，F01–F36）
 
-- 全部 33 条勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿。（第三部分追加 F34–F36 后为 36 条，同样适用本标准。）
+- 全部 36 条勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿。
 - 批次 2 的 F02/F09 连带更新 README 行为说明（原文要求同 commit）。
 - TODO.md 随每次勾选一起提交。
 - ⚠ 批次 4 的 F15/F16/F19 与批次 5 整批（F18、F20–F25）方案为补全，动手前建议人工复核（或补全 review 文档）。
+
+---
+
+# 第四部分 · R 复审残留（2026-09-13，对 `524efc1`）
+
+## 背景与结论
+
+- 第三方复审基于 `509f8f6` 提出 R01–R16（3 高 / 5 中 / 8 低）。核对 `509f8f6..524efc1`：**R03（=F34）、R04（=F36）、R05（输出侧护栏）已被其后 4 个提交修掉**；其余 13 条成立。
+- 用户确认三个方向：R02 **正式支持** per_part + chunk-reduce（不加加载期校验）；R06 **实现** aido 侧 feature gate（推翻 F24 的「不可行」结论——optional 依赖这条路未试过）；13 条全修。
+- 工作方式不变：每条独立 subagent 修复（改码 + 补测 + fmt/clippy/test 全绿 + 自 review + 勾选 + 独立 commit，`fix(scope): … (Rnn)`）。
+
+## 逐条
+
+- [ ] **R01 · 高 · `src/input.rs:241` · `specs.is_empty()` 分支仍用 `stdin_is_terminal`（F01 只修了一半）**
+  - 有显式材料路径已切到 `stdin_has_data()`；无显式材料路径（`aido ocr --copy < /dev/null`、`aido ask -p … < /dev/null`）仍报 "stdin is empty"，与模块文档表格第 3 行（none + no → clipboard）直接矛盾。
+  - 方案：:241 改 `env.stdin_has_data()`；空读仍报错（probe 说有数据却空读 = 管道中途关闭）；删除 `InputEnv::stdin_is_terminal` 字段（全仓仅 input.rs 引用）。
+  - 测试：反转单测 `empty_piped_stdin_is_an_error_without_clipboard_fallback`（input.rs:672）与集成 `empty_piped_stdin_is_an_error_and_never_touches_the_clipboard`（tests/input.rs:115）；新增 probe=true 空读仍报错、ask -p 空管道 exit 0、ocr --copy + /dev/null → 剪贴板兜底。
+
+- [ ] **R02 · 高 · `src/runner.rs:184` · chunk-reduce 的 reduce 判定是运行级，吞掉单块文件的输出（F02 残留）**
+  - `reduce_plan` 因任一文件置 true → per_part 批中单块文件（无 reduce 步）的唯一回复被收进 `sections`，`merged` 为空 → 记为失败 part。用户付费拿到失败记录。`parse_task()` 不校验组合，无测试覆盖。
+  - 方案（正式支持组合）：`Group` 加 `reduces: bool`（按 `s.part == step.part && s.role == Reduce` 建组时算）；删运行级 `reduce_plan`；四处使用点全换（gate :295、sections push :325、collect_section :366、失败清空 :443）。
+  - 测试：自定义任务 `per_part = true` + `chunk-reduce`，一长一短两文件 + `--out-dir` → 两份产物均非空；长文件 reduce 请求携带两条 map 回复。
+
+- [ ] **R03 · ✅ 已修**（`6bfc543` F34 + `75fd55f` F35）：`late_refusal()` 记录状态后落进 `--json` 尾声，六类拒绝全覆盖；测试 `json_report_still_prints_when_a_late_refusal_fails_delivery`。补测见「R03 残留补测」。
+
+- [ ] **R04 · ✅ 已修**（`b0b3bcd` F36）：clap 解析错误在 `wants_json` 时先打 `error_report` 再 `e.print()`；`--json --help` 无报告。
+
+- [ ] **R05 · ✅ 已修**（`86b51cc`）：`media.rs` / `clipboard.rs` 解码点补上 `image_dimensions` + `ensure_decode_size`。补测见「R05 残留补测」。
+
+- [ ] **R06 · 中 · `Cargo.toml` · edge-tts 无 aido 侧 feature gate（F24 结论只覆盖了次要建议）**
+  - F24 的「不可行」针对上游 `default-features = false`；主要建议（aido 自己加 feature + optional 依赖）未尝试。`futures-util` 全仓只有 `edge.rs` 用；kothok 只有 `transport.rs:192` 一个调用点。
+  - 方案：`[features] default = ["edge-tts"]`，`edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]`，两依赖 optional；`#[cfg(feature = "edge-tts")] mod edge;`；transport 分支（off → 定向报错）；`Adapter::EdgeTts` 枚举保留（serde/clap 照常）；`default_config()` / `check()` / SAMPLE_CONFIG 按 feature 分支；CI 加 `--no-default-features` job + 断言 aws-lc-rs 不在树里；README 加一句构建说明。
+
+- [ ] **R07 · 中 · `src/runner.rs:443` · reduce 运行失败 = 全部 map 回复丢失（F06 残留）**
+  - 失败时清 `merged`（半截 reduce 回复），`sections`（N 条已付费的 map 回复）无任何去处——`summarize` 正是「分很多块、每块都花钱」的那类。
+  - 方案：`sections` 改 `Vec<(usize, String)>`；失败且 `g.reduces` 时把非空 section 变成中间产物（id `{stem}-chunk-{n}`、provenance `Request{index}`，只进历史不交付，运行本就 Incomplete）+ warning；`RunOutput` 加 `live_chars`（DeltaSink 计数），app.rs 「已流出 stdout」警告条件换掉被打破的 proxy；`history show` 拒绝信息补「保留了 N 段中间结果」。
+  - 测试：3 块 summarize、reduce 500 → exit 3、历史 3 条中间产物、stdout 空；map 第 2 块失败 → 保留 1 段。
+
+- [ ] **R08 · 中 · `src/app.rs:314` · 全仓唯一一条中文运行时输出**
+  - 「warning: 已输出前 N/M 个分片的结果…」是上一轮方案的描述文字被当字面量抄入。改为英文（`the first N/M parts already streamed to stdout; the full record is in 'aido history show {}'`）。
+
+- [ ] **R09 · 低 · `src/app.rs:49` · `wants_json` 的 argv 扫描会把值误当旗标**
+  - `args_os().any(|a| a == "--json")` 不区分位置；`aido ask -p "--json"` 会让失败路径多吐一份 JSON。F36 之后此扫描的覆盖面变大。
+  - 方案：扫描挪进 cli.rs 复用 `FLAGS` arity 表（跳过取值旗标的值、`--flag=value` 自包含、遇 `--` 停止）。
+
+- [ ] **R10 · 低 · `src/domain.rs:110` · `Restored` 文档「never written to disk」与交付 manifest 矛盾；历史不存 provenance**
+  - out-dir manifest 会写 `{"type":"restored"}`（tests/provenance.rs:293 直接断言了这一点）；历史 `ManifestArtifact` 不存 provenance，恢复链路丢「哪个请求产出什么」。
+  - 方案：`ManifestArtifact` 加 `#[serde(default)] provenance: Option<Provenance>`，save 写入 / load 读回（缺省退 `Restored`，老记录可读）；修正 domain.rs 注释；更新 provenance.rs 测试 + 老记录兼容测试。
+
+- [ ] **R11 · 低 · `src/domain.rs:419` · `From<io::Error>` 双写导致 `chain()` 打印两遍；多行 chain 进单行上下文**
+  - 同一错误进 `message` 和 `source`；`generation_label()` 的 `incomplete ({reason})` 是 `history list` 的单行表格。
+  - 方案：`chain()` 跳过与 message 完全相同的首层 cause；新增 `chain_inline()`（换行 → `"; "`）；runner.rs:436/:452 改用 inline。
+
+- [ ] **R12 · 低 · `src/output.rs:471` · `current_umask()` 每产物调一次，进程级窗口**
+  - 方案：缓存 `OnceLock<u32>`。
+
+- [ ] **R13 · 低 · `src/processors/mod.rs:144` · `step_material` 用 `ptr::eq` 判断源 part，失配静默**
+  - 方案：改按 `InputPart.id` 比较；循环后 `debug_assert!(piece.is_none())`。
+
+- [ ] **R14 · 低 · `src/input.rs:113` · fd 0 已关闭时探测返回 true**
+  - fstat 失败一律 `true`；`EBADF` 是确定无数据。方案：unix 分支分 errno——EBADF → false，其余保持 true。
+
+- [ ] **R15 · 低 · `src/config/mod.rs:218/:293` · `"YOUR_MODEL"` 字面量三处无共享常量**
+  - 方案：`pub(crate) const MODEL_PLACEHOLDER`；check() 与文案共用；测试锁 SAMPLE_CONFIG 不漂移。
+
+- [ ] **R16 · 低 · `src/plan.rs:385` · 任务 `[defaults]` 除 to/voice 外静默忽略（F18 暴露的旧行为）**
+  - `speed = 1.2` 写进 `[defaults]` 无任何反馈。方案：`parse_task()` 校验——`to` 恒可；`voice` 需在 `params` 声明；其余 bail。内置任务只有 translate 用 `[defaults] to` + `params=["to"]`，不受影响。
+
+- [ ] **R03 残留补测 · `last --json -o <已存在文件>`（无 --overwrite）→ exit 5 恰一份 JSON 报告**（代码路径正确，无测试）
+
+- [ ] **R05 残留补测 · 假服务器返回声明超大尺寸的小图片 → exit 3、进程不 OOM**（输出侧护栏目前只有单测）
+
+## 完成标准（第四部分适用）
+
+- 本部分全部勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo check --locked --no-default-features` 全绿。
+- CI test.yml 增设 no-default-features job（含 aws-lc-rs 不在树断言）。
