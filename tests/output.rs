@@ -652,6 +652,89 @@ fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
     assert_eq!(std::fs::read(recovered.join("image-2.png")).unwrap(), png);
 }
 
+#[test]
+fn clipboard_refusal_records_the_failed_attempt() {
+    // --count 2 --copy overflows the clipboard after the generation: a
+    // late refusal, so like every delivery failure the attempt must show
+    // in the run record (deliveries names the clipboard as failed), the
+    // out-dir stays untouched, and `aido last --out-dir` recovers both.
+    let encoded = encode_png();
+    let body = serde_json::json!({"data":[{"b64_json":encoded},{"b64_json":encoded}]}).to_string();
+    let server = Server::json(&body);
+    let history = temp_dir("clip-refusal-hist");
+    let out_dir = temp_dir("clip-refusal-out");
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--count",
+            "2",
+            "--copy",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(5);
+    assert!(
+        out.stderr()
+            .contains("the clipboard takes exactly one artifact"),
+        "stderr: {}",
+        out.stderr()
+    );
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "a refusal delivers nothing"
+    );
+
+    let mut entries: Vec<_> = std::fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one run dir, got {entries:?}");
+    let run_dir = entries.pop().unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("manifest.json")).unwrap())
+            .unwrap();
+    let deliveries = manifest["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1, "deliveries: {deliveries:?}");
+    assert_eq!(deliveries[0]["destination"]["type"], "clipboard");
+    assert!(
+        deliveries[0]["status"]["failed"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one"),
+        "deliveries: {deliveries:?}"
+    );
+
+    // Recovery: the two images are complete in the record.
+    let recovered = temp_dir("clip-refusal-recovered");
+    let out = run(
+        &["last", "--out-dir", recovered.to_str().unwrap()],
+        b"",
+        &[
+            ("AIDO_CONFIG", empty_config().to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+    assert!(recovered.join("image-1.png").exists());
+    assert!(recovered.join("image-2.png").exists());
+}
+
 pub fn encode_png() -> String {
     let png = solid_png(2, 2);
     let alphabet: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -362,7 +362,7 @@
   - 方案：把全部拒绝判定收进 `late_refusal()`（记录状态、返回错误）；`deliver_inner` 拒绝时跳过实际交付、但仍落到尾部 JSON 尾声（`--json` 下报告即 stdout 的交付，被拒目标在 `deliveries` 里标 failed）；结尾统一按 `failed` 返回 Err。`fail()` 的排除保持不变——交付路径至此必已打印报告。
   - 测试：两图 + `--json -o one.png` → 退出 5、stdout 恰一份合法 JSON、`error.kind = delivery`、`artifacts` 为 2、`deliveries` 含 failed 的 file 与 succeeded 的 stdout（报告本身）。
 
-- [ ] **F35 · 低 · `src/output.rs:148` · 剪贴板两条交付拒绝不记录 DeliveryState（F10 精神残留）**
+- [x] **F35 · 低 · `src/output.rs:148` · 剪贴板两条交付拒绝不记录 DeliveryState（F10 精神残留）**
   - 问题：「the clipboard takes exactly one artifact」「audio cannot go to the clipboard」两条早退分类正确（退出 5）但不 push 状态就返回，`record.deliveries` 为空——正是 F10 批评的「历史里看不出交付尝试过」，只是这两条在 F10 之前就是 delivery 分类，不在原 finding 点名的三处 usage 之内，非回归。
   - 方案：改走 `refuse_delivery`，记录后再返回。
   - 测试：`image --count 2 --copy --out-dir` → 退出 5、manifest `deliveries` 记录 clipboard failed、目录未写任何文件、`last --out-dir` 可恢复两图。

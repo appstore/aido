@@ -147,13 +147,17 @@ fn deliver_inner(
     });
     if args.destinations.contains(&Destination::Clipboard) {
         if delivered.len() != 1 {
-            return Err(AppError::delivery(
+            return Err(refuse_delivery(
+                Destination::Clipboard,
                 "the clipboard takes exactly one artifact; use --out-dir",
+                states,
             ));
         }
         if delivered[0].kind == MediaKind::Audio {
-            return Err(AppError::delivery(
+            return Err(refuse_delivery(
+                Destination::Clipboard,
                 "audio cannot go to the clipboard; use -o FILE",
+                states,
             ));
         }
     }
