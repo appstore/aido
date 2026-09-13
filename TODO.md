@@ -433,7 +433,7 @@
   - 同一错误进 `message` 和 `source`；`generation_label()` 的 `incomplete ({reason})` 是 `history list` 的单行表格。
   - 方案：`chain()` 跳过与 message 完全相同的首层 cause；新增 `chain_inline()`（换行 → `"; "`）；runner.rs:436/:452 改用 inline。
 
-- [ ] **R12 · 低 · `src/output.rs:471` · `current_umask()` 每产物调一次，进程级窗口**
+- [x] **R12 · 低 · `src/output.rs:471` · `current_umask()` 每产物调一次，进程级窗口**
   - 方案：缓存 `OnceLock<u32>`。
 
 - [ ] **R13 · 低 · `src/processors/mod.rs:144` · `step_material` 用 `ptr::eq` 判断源 part，失配静默**

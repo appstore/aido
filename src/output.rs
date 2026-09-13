@@ -463,18 +463,26 @@ impl FileMode {
     }
 }
 
-/// The process umask. `umask(0)` reads it but also sets it, so the read
-/// is immediately restored; that brief window is the standard price of
-/// reading a umask (what other Rust tools do). `mode_t` is `u16` on macOS
-/// and `u32` on Linux, so the widening cast is required — and is a no-op
-/// on Linux, where the lint must be silenced.
+/// The process umask, read exactly once per process. `umask(0)` reads it
+/// but also sets it, so the read is immediately restored; that brief
+/// window is the standard price of reading a umask (what other Rust tools
+/// do). The umask is process-global, so repeated reads would multiply the
+/// window on the multithreaded runtime — another thread creating a file
+/// while umask is 0 would get world-writable permissions — and buy
+/// nothing, as aido never changes its own umask; the OnceLock makes the
+/// window happen exactly once. `mode_t` is `u16` on macOS and `u32` on
+/// Linux, so the widening cast is required — and is a no-op on Linux,
+/// where the lint must be silenced.
 #[cfg(unix)]
 fn current_umask() -> u32 {
-    let raw = unsafe { libc::umask(0) };
-    unsafe { libc::umask(raw) };
-    #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
-    let mask = raw as u32;
-    mask
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        let raw = unsafe { libc::umask(0) };
+        unsafe { libc::umask(raw) };
+        #[allow(clippy::unnecessary_cast)] // no-op on Linux, real on macOS
+        let mask = raw as u32;
+        mask
+    })
 }
 
 /// Apply `mode` to a written file.
