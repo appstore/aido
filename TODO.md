@@ -447,8 +447,9 @@
   - 方案：`pub(crate) const MODEL_PLACEHOLDER`；check() 与文案共用；测试锁 SAMPLE_CONFIG 不漂移。
   - 落地：常量 + check() 比较与报错文案共用 + sample_config() 从同一常量插值（feature-on 样例字节不变）；漂移由既有 F23 集成测试双向锁死（init→check 报 → 替换后 ok）。
 
-- [ ] **R16 · 低 · `src/plan.rs:385` · 任务 `[defaults]` 除 to/voice 外静默忽略（F18 暴露的旧行为）**
+- [x] **R16 · 低 · `src/plan.rs:385` · 任务 `[defaults]` 除 to/voice 外静默忽略（F18 暴露的旧行为）**
   - `speed = 1.2` 写进 `[defaults]` 无任何反馈。方案：`parse_task()` 校验——`to` 恒可；`voice` 需在 `params` 声明；其余 bail。内置任务只有 translate 用 `[defaults] to` + `params=["to"]`，不受影响。
+  - 落地：核对发现 `to` 的默认值同样有 `accepts_param("to")` 守卫，故规则统一为「`to`/`voice` 且须在 `params` 声明」；报错文案指明正确去处（`[options]` 或 CLI）。用户任务文件解析失败走既有「warning + 跳过该文件」路径。测试：speed 默认被拒、未声明 voice 被拒、声明 to 默认正常。
 
 - [x] **R03 残留补测 · `last --json -o <已存在文件>`（无 --overwrite）→ exit 5 恰一份 JSON 报告**（代码路径正确，无测试；测试 `last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_file`，tests/output.rs）
 

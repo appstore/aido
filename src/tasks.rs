@@ -264,6 +264,23 @@ fn parse_task(name: &str, src: &str, builtin: bool) -> Result<Task> {
         };
         params.push(p);
     }
+    // A task default only feeds the two typed parameters that read it:
+    // `to` (compose_instruction) and `voice` (param_value) — and both
+    // only when the task declares the parameter. Anything else under
+    // [defaults] was silently ignored; reject it at load time and name
+    // the places the value actually belongs.
+    for key in file.defaults.keys() {
+        let defaultable = matches!(key.as_str(), "to" | "voice")
+            && params.iter().any(|p| p.name() == key.as_str());
+        if !defaultable {
+            bail!(
+                "task '{name}': [defaults] key '{key}' has no effect: only 'to' and \
+                 'voice' take task defaults, and the task must declare them in \
+                 params; use [options] to send the value to the adapter, or set \
+                 it on the CLI"
+            );
+        }
+    }
     let defaults = toml_to_json_map(&file.defaults, name, "defaults")?;
     let options = toml_to_json_map(&file.options, name, "options")?;
     Ok(Task {
@@ -390,6 +407,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("x"));
+    }
+
+    #[test]
+    fn non_defaultable_defaults_keys_are_rejected_with_their_destinations() {
+        // speed is a real parameter but CLI/options-only: a task default
+        // for it was silently ignored before.
+        let err = parse_task(
+            "x",
+            "operation = 'speech'\noutput_types = ['audio']\nparams = ['voice', 'speed']\n\
+             [defaults]\nspeed = 1.2\n",
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("speed"), "{msg}");
+        assert!(msg.contains("[options]"), "{msg}");
+
+        // voice defaults only when the task declares the parameter.
+        let err = parse_task(
+            "x",
+            "operation = 'speech'\noutput_types = ['audio']\nparams = ['speed']\n\
+             [defaults]\nvoice = 'alloy'\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("voice"), "{}", err.to_string());
+
+        // the defaultable pair keeps working: declared to with a default.
+        let task = parse_task(
+            "x",
+            "operation = 'generate'\noutput_types = ['text']\nparams = ['to']\n\
+             [defaults]\nto = 'auto'\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(task.default_param("to").unwrap(), "auto");
     }
 
     #[test]
