@@ -403,11 +403,11 @@
   - 方案（正式支持组合）：`Group` 加 `reduces: bool`（按 `s.part == step.part && s.role == Reduce` 建组时算）；删运行级 `reduce_plan`；四处使用点全换（gate :295、sections push :325、collect_section :366、失败清空 :443）。
   - 测试：自定义任务 `per_part = true` + `chunk-reduce`，一长一短两文件 + `--out-dir` → 两份产物均非空；长文件 reduce 请求携带两条 map 回复。
 
-- [ ] **R03 · ✅ 已修**（`6bfc543` F34 + `75fd55f` F35）：`late_refusal()` 记录状态后落进 `--json` 尾声，六类拒绝全覆盖；测试 `json_report_still_prints_when_a_late_refusal_fails_delivery`。补测见「R03 残留补测」。
+- [x] **R03 · ✅ 已修**（`6bfc543` F34 + `75fd55f` F35）：`late_refusal()` 记录状态后落进 `--json` 尾声，六类拒绝全覆盖；测试 `json_report_still_prints_when_a_late_refusal_fails_delivery`。补测见「R03 残留补测」。
 
-- [ ] **R04 · ✅ 已修**（`b0b3bcd` F36）：clap 解析错误在 `wants_json` 时先打 `error_report` 再 `e.print()`；`--json --help` 无报告。
+- [x] **R04 · ✅ 已修**（`b0b3bcd` F36）：clap 解析错误在 `wants_json` 时先打 `error_report` 再 `e.print()`；`--json --help` 无报告。
 
-- [ ] **R05 · ✅ 已修**（`86b51cc`）：`media.rs` / `clipboard.rs` 解码点补上 `image_dimensions` + `ensure_decode_size`。补测见「R05 残留补测」。
+- [x] **R05 · ✅ 已修**（`86b51cc`）：`media.rs` / `clipboard.rs` 解码点补上 `image_dimensions` + `ensure_decode_size`。补测见「R05 残留补测」。
 
 - [x] **R06 · 中 · `Cargo.toml` · edge-tts 无 aido 侧 feature gate（F24 结论只覆盖了次要建议）**
   - F24 的「不可行」针对上游 `default-features = false`；主要建议（aido 自己加 feature + optional 依赖）未尝试。`futures-util` 全仓只有 `edge.rs` 用；kothok 只有 `transport.rs:192` 一个调用点。
@@ -459,3 +459,4 @@
 
 - 本部分全部勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo check --locked --no-default-features` 全绿。
 - CI test.yml 增设 no-default-features job（含 aws-lc-rs 不在树断言）。
+- **状态（2026-09-14 收尾）**：R01–R16 + 2 项补测全部落地，15 个提交（e7a5700..cc47119）。实测 **205 单元 + 174 集成 = 379 通过、0 失败、1 忽略**（忽略项为既有的 live Edge 端点用例）；`--no-default-features` 下 clippy/check 全绿且 `cargo tree -i aws-lc-rs` 确认不在树。执行方式：R01–R13 与补测由逐条 subagent 完成；R14 的测试在 subagent 被配额截断前写就、生产修复由主线完成，R15/R16 由主线直接完成（同每条独立 commit 的纪律）。
