@@ -173,6 +173,13 @@ fn instruction_only_task_runs_with_a_closed_fd0() {
     assert_eq!(req["messages"][0]["content"], "hi");
 }
 
+// The test isolation only strips DISPLAY/WAYLAND_DISPLAY, which makes the
+// clipboard fail deterministically on headless Linux; macOS runners have a
+// working NSPasteboard, so there the fallback legitimately finds material
+// and the exact assertion below is Linux-only. The behavior itself stays
+// covered on every platform by the injected-clipboard unit tests on
+// `Input` in src/input.rs.
+#[cfg(target_os = "linux")]
 #[test]
 fn closed_empty_stdin_falls_through_to_the_clipboard() {
     // Material task, no specs, empty pipe, no clipboard available: the
