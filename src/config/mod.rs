@@ -18,6 +18,11 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// The `model` value `config init` writes as a stand-in. `check()` flags
+/// it so a fresh sample never reports ok, and the sample interpolates it
+/// from this one constant — check and init cannot drift apart.
+pub(crate) const MODEL_PLACEHOLDER: &str = "YOUR_MODEL";
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -227,16 +232,16 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 }
             }
         }
-        // `config init` writes `model = "YOUR_MODEL"`; a profile still
-        // carrying that placeholder (or an empty model) fails at run time,
-        // so check must flag it instead of reporting ok.
+        // `config init` writes the placeholder model; a profile still
+        // carrying it (or an empty model) fails at run time, so check
+        // must flag it instead of reporting ok.
         match profile.model.as_deref().map(str::trim) {
             None => issues.push(format!(
                 "profile '{name}': no model set; the adapter default would be used"
             )),
-            Some(m) if m.is_empty() || m == "YOUR_MODEL" => issues.push(format!(
+            Some(m) if m.is_empty() || m == MODEL_PLACEHOLDER => issues.push(format!(
                 "profile '{name}': no model configured; set model in the config \
-                 ('YOUR_MODEL' is the config init placeholder)"
+                 ('{MODEL_PLACEHOLDER}' is the config init placeholder)"
             )),
             Some(_) => {}
         }
@@ -308,9 +313,12 @@ const SAMPLE_SPEECH_ROUTE: &str = r#"
 /// The sample `config init` writes: head, the feature-gated speech-route
 /// segment, then the tail. `concat!` cannot join consts on this toolchain,
 /// so the join happens here at runtime — init runs once, and both halves
-/// stay plain readable raw strings.
+/// stay plain readable raw strings. The tail names the placeholder model
+/// through `{MODEL_PLACEHOLDER}`, filled from the same constant `check()`
+/// flags, so the two can never disagree.
 fn sample_config() -> String {
     format!("{SAMPLE_CONFIG_HEAD}{SAMPLE_SPEECH_ROUTE}{SAMPLE_CONFIG_TAIL}")
+        .replace("{MODEL_PLACEHOLDER}", MODEL_PLACEHOLDER)
 }
 
 const SAMPLE_CONFIG_HEAD: &str = r#"# aido configuration.
@@ -336,7 +344,7 @@ api_key_env = "AIDO_API_KEY"
 const SAMPLE_CONFIG_TAIL: &str = r#"
 [profiles.default]
 provider = "openai"
-model = "YOUR_MODEL"
+model = "{MODEL_PLACEHOLDER}"
 
 # A local vision setup (vLLM / SGLang / llama.cpp / Ollama / LM Studio):
 # [providers.local]

@@ -443,8 +443,9 @@
   - fstat 失败一律 `true`；`EBADF` 是确定无数据。方案：unix 分支分 errno——EBADF → false，其余保持 true。
   - 落地：fstat 失败分 errno（`std::io::Error::last_os_error`）；测试 `run_closed_stdin`（`pre_exec` 关闭 fd 0）覆盖 `ask -p`（指令运行）与带显式材料两条路径。注：测试与 helper 由配额截断前的 subagent 写就，生产修复在主线完成。
 
-- [ ] **R15 · 低 · `src/config/mod.rs:218/:293` · `"YOUR_MODEL"` 字面量三处无共享常量**
+- [x] **R15 · 低 · `src/config/mod.rs:218/:293` · `"YOUR_MODEL"` 字面量三处无共享常量**
   - 方案：`pub(crate) const MODEL_PLACEHOLDER`；check() 与文案共用；测试锁 SAMPLE_CONFIG 不漂移。
+  - 落地：常量 + check() 比较与报错文案共用 + sample_config() 从同一常量插值（feature-on 样例字节不变）；漂移由既有 F23 集成测试双向锁死（init→check 报 → 替换后 ok）。
 
 - [ ] **R16 · 低 · `src/plan.rs:385` · 任务 `[defaults]` 除 to/voice 外静默忽略（F18 暴露的旧行为）**
   - `speed = 1.2` 写进 `[defaults]` 无任何反馈。方案：`parse_task()` 校验——`to` 恒可；`voice` 需在 `params` 声明；其余 bail。内置任务只有 translate 用 `[defaults] to` + `params=["to"]`，不受影响。
