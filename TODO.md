@@ -393,7 +393,7 @@
 
 ## 逐条
 
-- [ ] **R01 · 高 · `src/input.rs:241` · `specs.is_empty()` 分支仍用 `stdin_is_terminal`（F01 只修了一半）**
+- [x] **R01 · 高 · `src/input.rs:241` · `specs.is_empty()` 分支仍用 `stdin_is_terminal`（F01 只修了一半）**
   - 有显式材料路径已切到 `stdin_has_data()`；无显式材料路径（`aido ocr --copy < /dev/null`、`aido ask -p … < /dev/null`）仍报 "stdin is empty"，与模块文档表格第 3 行（none + no → clipboard）直接矛盾。
   - 方案：:241 改 `env.stdin_has_data()`；空读仍报错（probe 说有数据却空读 = 管道中途关闭）；删除 `InputEnv::stdin_is_terminal` 字段（全仓仅 input.rs 引用）。
   - 测试：反转单测 `empty_piped_stdin_is_an_error_without_clipboard_fallback`（input.rs:672）与集成 `empty_piped_stdin_is_an_error_and_never_touches_the_clipboard`（tests/input.rs:115）；新增 probe=true 空读仍报错、ask -p 空管道 exit 0、ocr --copy + /dev/null → 剪贴板兜底。

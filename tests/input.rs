@@ -113,13 +113,49 @@ fn null_stdin_with_explicit_material_runs() {
 }
 
 #[test]
-fn empty_piped_stdin_is_an_error_and_never_touches_the_clipboard() {
+fn instruction_only_task_runs_with_a_closed_empty_stdin() {
+    // `aido ask -p "hi" < /dev/null`: stdin is a pipe but carries no
+    // bytes, so the decision falls past stdin to the instruction alone.
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run(
+        &["ask", "-p", "hi"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+    let req = request_json(&server.request());
+    // The -p instruction is the whole request; no material part joins it.
+    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(req["messages"][0]["role"], "user");
+    assert_eq!(req["messages"][0]["content"], "hi");
+}
+
+#[test]
+fn closed_empty_stdin_falls_through_to_the_clipboard() {
+    // Material task, no specs, empty pipe, no clipboard available: the
+    // decision must move past stdin to the clipboard fallback and fail
+    // there — not with the old "stdin is empty" rejection.
     let out = run(&["summarize"], b"", &[]);
     out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("clipboard"), "stderr: {err}");
+    assert!(!err.contains("stdin is empty"), "stderr: {err}");
+}
+
+#[test]
+fn null_stdin_ocr_copy_previews_the_clipboard_under_dry_run() {
+    // The README's opening shape: `aido ocr --copy < /dev/null`. No
+    // specs, /dev/null carries no bytes, requires_material + --dry-run →
+    // the placeholder clipboard part, exit 0 without touching desktop
+    // clipboard state.
+    let out = run_null_stdin(&["ocr", "--copy", "--dry-run"], &[], empty_config());
+    out.assert_code(0);
+    let stdout = out.stdout();
     assert!(
-        out.stderr().contains("stdin is empty"),
-        "stderr: {}",
-        out.stderr()
+        stdout.contains("clipboard (not read under --dry-run)"),
+        "{stdout}"
     );
 }
 
