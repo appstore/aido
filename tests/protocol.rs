@@ -653,6 +653,59 @@ fn decompression_bomb_jpeg_is_refused_as_a_usage_error() {
     assert!(err.contains("20000"), "{err}");
 }
 
+#[test]
+fn generated_image_bomb_is_refused_as_a_service_error() {
+    // The output-side twin of the input-side bomb test above: the fake
+    // server replies to an image generation with the same few hundred
+    // bytes of JPEG declaring 20 000×20 000 (400 MP). The adapter boundary
+    // must read the header alone and refuse the decode before the
+    // validation pass could allocate the full bitmap — a compromised
+    // endpoint must not be able to OOM the process — so the run dies as a
+    // service error (the reply failed to parse, exit 3) and nothing is
+    // written to the -o target.
+    let jpg = huge_jpeg(20_000, 20_000);
+    assert!(
+        jpg.len() < 4096,
+        "the bomb must stay tiny: {} bytes",
+        jpg.len()
+    );
+    let body = serde_json::json!({"data":[{"b64_json":b64(&jpg)}]}).to_string();
+    let server = Server::json(&body);
+    let dir = temp_dir("images-bomb");
+    let file = dir.join("out.png");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"gpt-image-1\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run_tty_with(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(3);
+    let err = out.stderr();
+    assert!(err.contains("refusing to decode"), "{err}");
+    assert!(err.contains("400 MP"), "{err}");
+    assert!(
+        out.stdout().is_empty(),
+        "a failed generation delivers nothing"
+    );
+    assert!(
+        !file.exists(),
+        "the refused image must not be written to the target"
+    );
+}
+
 // --- flag semantics -------------------------------------------------------
 
 #[test]

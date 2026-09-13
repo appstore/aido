@@ -750,6 +750,85 @@ fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
 }
 
 #[test]
+fn last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_file() {
+    // The restore path (`aido last` → deliver_restored → output::deliver)
+    // runs the same JSON epilogue as a live run. Here the -o target already
+    // exists and no --overwrite is given, so the refusal happens inside
+    // deliver_to_destinations (the no-clobber commit fails): the run must
+    // exit 5 with stdout still carrying exactly one JSON report — the
+    // recorded artifact, the stdout delivery (this report), the refused
+    // file destination, and the delivery error — while the existing file
+    // keeps its original bytes.
+    let server = Server::json(chat_body("kept in history"));
+    let history = temp_dir("restore-refusal-hist");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 5\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(0);
+
+    // Restore into a target that already exists, without --overwrite.
+    let file = temp_dir("restore-refusal-target").join("summary.txt");
+    std::fs::write(&file, "original bytes").unwrap();
+    let out = run(
+        &["last", "--json", "-o", file.to_str().unwrap()],
+        b"",
+        &[
+            ("AIDO_CONFIG", empty_config().to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(5);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
+    assert_eq!(report["version"], 1, "report: {report}");
+    assert_eq!(report["error"]["kind"], "delivery", "report: {report}");
+    let message = report["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("summary.txt"), "report: {report}");
+    assert!(message.contains("--overwrite"), "report: {report}");
+    // The restored report describes the recorded run, not a new one.
+    assert!(report["run_id"].is_string(), "report: {report}");
+    assert_eq!(report["task"], "summarize", "report: {report}");
+    assert_eq!(report["artifacts"].as_array().unwrap().len(), 1);
+    let deliveries = report["deliveries"].as_array().unwrap();
+    // stdout (this very report) and the refused file
+    assert_eq!(deliveries.len(), 2, "deliveries: {deliveries:?}");
+    assert!(
+        deliveries
+            .iter()
+            .any(|d| d["destination"] == "stdout" && d["status"] == "succeeded"),
+        "deliveries: {deliveries:?}"
+    );
+    assert!(
+        deliveries.iter().any(|d| d["destination"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("summary.txt")
+            && d["status"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("failed")),
+        "deliveries: {deliveries:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "original bytes",
+        "the old content survives"
+    );
+    assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
+}
+
+#[test]
 fn clipboard_refusal_records_the_failed_attempt() {
     // --count 2 --copy overflows the clipboard after the generation: a
     // late refusal, so like every delivery failure the attempt must show

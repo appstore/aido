@@ -448,9 +448,9 @@
 - [ ] **R16 · 低 · `src/plan.rs:385` · 任务 `[defaults]` 除 to/voice 外静默忽略（F18 暴露的旧行为）**
   - `speed = 1.2` 写进 `[defaults]` 无任何反馈。方案：`parse_task()` 校验——`to` 恒可；`voice` 需在 `params` 声明；其余 bail。内置任务只有 translate 用 `[defaults] to` + `params=["to"]`，不受影响。
 
-- [ ] **R03 残留补测 · `last --json -o <已存在文件>`（无 --overwrite）→ exit 5 恰一份 JSON 报告**（代码路径正确，无测试）
+- [x] **R03 残留补测 · `last --json -o <已存在文件>`（无 --overwrite）→ exit 5 恰一份 JSON 报告**（代码路径正确，无测试；测试 `last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_file`，tests/output.rs）
 
-- [ ] **R05 残留补测 · 假服务器返回声明超大尺寸的小图片 → exit 3、进程不 OOM**（输出侧护栏目前只有单测）
+- [x] **R05 残留补测 · 假服务器返回声明超大尺寸的小图片 → exit 3、进程不 OOM**（输出侧护栏目前只有单测；测试 `generated_image_bomb_is_refused_as_a_service_error`，tests/protocol.rs）
 
 ## 完成标准（第四部分适用）
 
