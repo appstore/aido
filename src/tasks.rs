@@ -39,17 +39,6 @@ impl Operation {
             _ => None,
         }
     }
-
-    /// The adapter name used when a provider route is not configured
-    /// explicitly; also the key into `[providers.X.routes]`.
-    pub fn default_route(self) -> &'static str {
-        match self {
-            Self::Generate => "openai-chat",
-            Self::Speech => "openai-speech",
-            Self::Transcribe => "openai-transcription",
-            Self::Image => "openai-images",
-        }
-    }
 }
 
 impl std::fmt::Display for Operation {
@@ -74,8 +63,15 @@ pub enum ProcessorKind {
     /// per-slice, replies merge at slice boundaries.
     OcrTiles,
     /// Text strategy: oversized text is chunked at paragraph boundaries,
-    /// one request per chunk, replies joined in order.
-    ChunkMapReduce,
+    /// one request per chunk, replies joined in order. `chunk-map-reduce`
+    /// — the strategy's name before a reduce step existed — still parses
+    /// as this kind, so old custom tasks keep working.
+    #[serde(alias = "chunk-map-reduce")]
+    ChunkJoin,
+    /// Text strategy: the same per-chunk map requests, then one reduce
+    /// request that consolidates the chunk replies into a single final
+    /// result under the task's instruction.
+    ChunkReduce,
 }
 
 /// Typed CLI parameters a task accepts (`--to`, `--voice`, ...); validated
@@ -111,14 +107,16 @@ impl TaskParam {
         })
     }
 
-    /// The adapter option this parameter maps to for an operation.
-    pub fn maps_to(self) -> &'static str {
+    /// The adapter option this parameter maps to, or None when the
+    /// parameter takes effect in the plan itself (`--to` rewrites the
+    /// instruction; it is not an adapter option).
+    pub fn maps_to(self) -> Option<&'static str> {
         match self {
-            Self::To => "__instruction_suffix", // handled in the plan, not an option
-            Self::Voice => "voice",
-            Self::Speed => "speed",
-            Self::Count => "n",
-            Self::Size => "size",
+            Self::To => None, // handled in the plan, not an option
+            Self::Voice => Some("voice"),
+            Self::Speed => Some("speed"),
+            Self::Count => Some("n"),
+            Self::Size => Some("size"),
         }
     }
 }
@@ -266,6 +264,23 @@ fn parse_task(name: &str, src: &str, builtin: bool) -> Result<Task> {
         };
         params.push(p);
     }
+    // A task default only feeds the two typed parameters that read it:
+    // `to` (compose_instruction) and `voice` (param_value) — and both
+    // only when the task declares the parameter. Anything else under
+    // [defaults] was silently ignored; reject it at load time and name
+    // the places the value actually belongs.
+    for key in file.defaults.keys() {
+        let defaultable = matches!(key.as_str(), "to" | "voice")
+            && params.iter().any(|p| p.name() == key.as_str());
+        if !defaultable {
+            bail!(
+                "task '{name}': [defaults] key '{key}' has no effect: only 'to' and \
+                 'voice' take task defaults, and the task must declare them in \
+                 params; use [options] to send the value to the adapter, or set \
+                 it on the CLI"
+            );
+        }
+    }
     let defaults = toml_to_json_map(&file.defaults, name, "defaults")?;
     let options = toml_to_json_map(&file.options, name, "options")?;
     Ok(Task {
@@ -368,6 +383,10 @@ mod tests {
         let ocr = &all["ocr"];
         assert_eq!(ocr.processor, ProcessorKind::OcrTiles);
         assert!(ocr.required_types.contains(&MediaKind::Image));
+        // The two text strategies are separate now: translate joins the
+        // chunk replies, summarize consolidates them in one more request.
+        assert_eq!(all["translate"].processor, ProcessorKind::ChunkJoin);
+        assert_eq!(all["summarize"].processor, ProcessorKind::ChunkReduce);
         let tts = &all["tts"];
         assert_eq!(tts.operation, Operation::Speech);
         // tts is useless without material to speak
@@ -388,6 +407,61 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("x"));
+    }
+
+    #[test]
+    fn non_defaultable_defaults_keys_are_rejected_with_their_destinations() {
+        // speed is a real parameter but CLI/options-only: a task default
+        // for it was silently ignored before.
+        let err = parse_task(
+            "x",
+            "operation = 'speech'\noutput_types = ['audio']\nparams = ['voice', 'speed']\n\
+             [defaults]\nspeed = 1.2\n",
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("speed"), "{msg}");
+        assert!(msg.contains("[options]"), "{msg}");
+
+        // voice defaults only when the task declares the parameter.
+        let err = parse_task(
+            "x",
+            "operation = 'speech'\noutput_types = ['audio']\nparams = ['speed']\n\
+             [defaults]\nvoice = 'alloy'\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("voice"), "{}", err.to_string());
+
+        // the defaultable pair keeps working: declared to with a default.
+        let task = parse_task(
+            "x",
+            "operation = 'generate'\noutput_types = ['text']\nparams = ['to']\n\
+             [defaults]\nto = 'auto'\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(task.default_param("to").unwrap(), "auto");
+    }
+
+    #[test]
+    fn processor_names_parse_with_the_old_name_aliasing_join() {
+        let parse = |processor: &str| {
+            parse_task(
+                "x",
+                &format!(
+                    "operation = 'generate'\noutput_types = ['text']\nprocessor = '{processor}'\n"
+                ),
+                false,
+            )
+            .unwrap()
+            .processor
+        };
+        assert_eq!(parse("chunk-join"), ProcessorKind::ChunkJoin);
+        assert_eq!(parse("chunk-reduce"), ProcessorKind::ChunkReduce);
+        // The pre-split name keeps its old meaning: join, no reduce.
+        assert_eq!(parse("chunk-map-reduce"), ProcessorKind::ChunkJoin);
     }
 
     #[test]

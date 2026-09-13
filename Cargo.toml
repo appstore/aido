@@ -6,6 +6,13 @@ edition = "2021"
 rust-version = "1.88"
 description = "Send material to an AI task (OCR, translate, TTS, images, ...) and deliver the result to stdout, files or the clipboard"
 
+[features]
+default = ["edge-tts"]
+# Keyless Microsoft Read-Aloud TTS. Optional: closing it drops the whole
+# kothok-edge-tts subtree (and aws-lc-sys, which needs cmake) from the
+# build graph. Build with --no-default-features for an aido without TTS.
+edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
+
 [dependencies]
 anyhow = "1"
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
@@ -14,12 +21,13 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 # 自己展开 glob（引号包裹 / Windows 下 shell 不会展开）；零传递依赖。
 glob = "0.3"
-# Edge TTS 适配器：非官方 Read Aloud 协议（DRM 常量会轮换，跟随 0.2.x 补丁更新）。
-# 已知代价：kothok 经由其 tokio-rustls 依赖的默认特性把 aws-lc-sys（源码构建
-# 需要 cmake）拉进依赖树，运行时 TLS 实际用 ring。上游修正特性声明后可移除，
-# CI 的依赖树检查会在 aws-lc-rs 消失时提醒。
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-kothok-edge-tts = "0.2.10"
+# Edge TTS 适配器（"edge-tts" feature，默认开启）：非官方 Read Aloud 协议
+# （DRM 常量会轮换，跟随 0.2.x 补丁更新）。feature 开启时的已知代价：kothok
+# 经由其 tokio-rustls 依赖的默认特性把 aws-lc-sys（源码构建需要 cmake）拉进
+# 依赖树，运行时 TLS 实际用 ring——aws-lc 只是构建期成本，关闭 feature 即可
+# 整体移除；上游修正特性声明后此代价也会自然消失。
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+kothok-edge-tts = { version = "0.2.10", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde = { version = "1", features = ["derive"] }

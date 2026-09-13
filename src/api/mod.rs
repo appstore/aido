@@ -1,16 +1,17 @@
 //! Application-level generation contracts. Wire formats stay in adapters.
 mod chat;
+#[cfg(feature = "edge-tts")]
 mod edge;
 mod media;
 mod responses;
 mod sse;
 mod transport;
 
-use crate::domain::{Artifact, GenerationStatus, InputPart, MediaKind};
-use anyhow::{bail, Result};
+use crate::domain::{GenerationStatus, InputPart, MediaKind};
+use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
-pub use transport::{normalize_base_url, Client, Connection};
+pub use transport::{cleartext_key_warning, normalize_base_url, Client, Connection};
 
 pub type MediaMode = MediaKind;
 
@@ -137,6 +138,15 @@ impl Adapter {
 pub(crate) const EDGE_NO_INSTRUCTION_CHANNEL: &str =
     "the 'edge-tts' adapter has no instruction channel";
 
+/// Refusal for the edge-tts route in a binary built without the `edge-tts`
+/// feature. The enum variant stays compiled (so configs naming `edge-tts`
+/// still parse); the plan-time guard and the transport's send-time defense
+/// must stay worded identically.
+#[cfg(not(feature = "edge-tts"))]
+pub(crate) const EDGE_TTS_NOT_COMPILED: &str =
+    "the 'edge-tts' adapter is not compiled into this binary (rebuild with \
+     --features edge-tts, or use the openai-speech route)";
+
 /// One request to one adapter. `instruction` is the task's fixed direction,
 /// `requirement` is this run's -p; they stay separate until the adapter
 /// maps them onto whatever instruction channel the protocol has.
@@ -164,6 +174,19 @@ impl GenerateRequest<'_> {
     }
 }
 
+/// One media artifact an adapter produced, before the runner turns it into
+/// a domain [`Artifact`]. An adapter sees one exchange, never the run, so
+/// neither the run-wide id nor the provenance (which request produced it,
+/// merged or not) is the adapter's to invent — the runner assigns both.
+#[derive(Debug)]
+pub struct RawArtifact {
+    pub kind: MediaKind,
+    pub mime: String,
+    /// Codec/container for media ("png", "mp3").
+    pub format: String,
+    pub bytes: Vec<u8>,
+}
+
 /// One adapter response, in domain terms. Text is not an artifact yet —
 /// the runner promotes it when the run's artifacts are assembled. The
 /// default status is Complete because every parse path that keeps the
@@ -171,7 +194,12 @@ impl GenerateRequest<'_> {
 #[derive(Debug, Default)]
 pub struct GenerateResult {
     pub text: String,
-    pub artifacts: Vec<Artifact>,
+    pub artifacts: Vec<RawArtifact>,
+    /// The run's request this reply answers (0-based, as planned).
+    /// Adapters cannot know their place in a run; the runner sets it from
+    /// the step it dispatched and stamps media artifacts' provenance with
+    /// it.
+    pub request_index: usize,
     pub status: GenerationStatus,
     pub warnings: Vec<String>,
 }
@@ -268,13 +296,49 @@ pub(crate) fn plain_text(inputs: &[InputPart]) -> Result<String> {
     Ok(parts.join("\n\n"))
 }
 
+/// Refuse to decode absurdly large images even when the byte size is small
+/// (decompression-bomb guard): a few KB of JPEG or WebP can declare
+/// hundreds of millions of pixels, whose full decode allocates gigabytes.
+/// Shared by the adapter boundary and the OCR tiler so one limit guards
+/// every decode.
+pub(crate) const MAX_DECODE_PIXELS: u64 = 200_000_000;
+
+/// Declared image dimensions from the container header alone (PNG IHDR,
+/// JPEG SOF, WebP VP8X) — no pixels are decoded, so the decompression-bomb
+/// guard can run before any large allocation.
+pub(crate) fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("failed to detect the image format")?
+        .into_dimensions()
+        .context("failed to read the image dimensions")
+}
+
+/// The shared decompression-bomb refusal, so the wording stays identical
+/// wherever an image is about to be decoded.
+pub(crate) fn ensure_decode_size(name: &str, w: u32, h: u32) -> Result<()> {
+    if u64::from(w) * u64::from(h) > MAX_DECODE_PIXELS {
+        bail!(
+            "image '{name}' is {w}\u{d7}{h} ({} MP); refusing to decode images over {} MP",
+            u64::from(w) * u64::from(h) / 1_000_000,
+            MAX_DECODE_PIXELS / 1_000_000
+        );
+    }
+    Ok(())
+}
+
 /// Image parts as PNG bytes (the only encoding the chat/responses routes
 /// send); non-PNG inputs are re-encoded here, at the adapter boundary.
+/// The declared dimensions are checked first — a header-only read — so a
+/// small JPEG/WebP declaring a huge canvas is refused instead of decoded.
 pub(crate) fn image_as_png(part: &InputPart) -> Result<Vec<u8>> {
     let bytes = match &part.content {
         crate::domain::InputContent::Media(b) => b,
         _ => bail!("'{}' is not an image", part.name),
     };
+    let (w, h) = image_dimensions(bytes)
+        .with_context(|| format!("cannot read the dimensions of image '{}'", part.name))?;
+    ensure_decode_size(&part.name, w, h)?;
     if part.mime == "image/png" {
         return Ok(bytes.clone());
     }
@@ -309,9 +373,102 @@ mod tests {
             source,
             name: name.into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
+    }
+
+    fn image_part(name: &str, mime: &str, bytes: Vec<u8>) -> InputPart {
+        InputPart {
+            id: 0,
+            source: InputSource::File(name.into()),
+            name: name.into(),
+            kind: MediaKind::Image,
+            unknown_kind: false,
+            mime: mime.into(),
+            content: InputContent::Media(bytes),
+        }
+    }
+
+    fn tiny_jpeg() -> Vec<u8> {
+        let img = image::GrayImage::from_pixel(2, 2, image::Luma([128]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        jpg
+    }
+
+    /// A real 2×2 JPEG whose SOF0 segment is patched to declare `w`×`h`:
+    /// the decompression-bomb shape — a few hundred bytes claiming a huge
+    /// canvas.
+    fn jpeg_declaring(w: u32, h: u32) -> Vec<u8> {
+        let mut jpg = tiny_jpeg();
+        // Layout after the FF C0 marker: length(2), precision(1), height
+        // (2 BE), width (2 BE).
+        let sof = jpg
+            .windows(2)
+            .position(|p| p == [0xFF, 0xC0])
+            .expect("encoder wrote a SOF0 marker");
+        jpg[sof + 5..sof + 7].copy_from_slice(&(h as u16).to_be_bytes());
+        jpg[sof + 7..sof + 9].copy_from_slice(&(w as u16).to_be_bytes());
+        jpg
+    }
+
+    #[test]
+    fn image_dimensions_reads_headers_without_decoding() {
+        let img = image::RgbaImage::from_pixel(3, 4, image::Rgba([0, 0, 0, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(image_dimensions(&png).unwrap(), (3, 4));
+        assert_eq!(
+            image_dimensions(&jpeg_declaring(640, 480)).unwrap(),
+            (640, 480)
+        );
+        assert!(image_dimensions(b"not an image").is_err());
+    }
+
+    #[test]
+    fn image_as_png_refuses_images_over_the_decode_limit() {
+        let part = image_part("huge.jpg", "image/jpeg", jpeg_declaring(20_000, 20_000));
+        let err = image_as_png(&part).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to decode"), "{msg}");
+        assert!(msg.contains("400 MP"), "{msg}");
+        assert!(msg.contains("200 MP"), "{msg}");
+    }
+
+    #[test]
+    fn image_as_png_reencodes_small_jpegs_unchallenged() {
+        // A legitimate tiny JPEG passes the guard and comes back as PNG.
+        let part = image_part("shot.jpg", "image/jpeg", tiny_jpeg());
+        let png = image_as_png(&part).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        use image::GenericImageView as _;
+        assert_eq!(image::load_from_memory(&png).unwrap().dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn generated_image_bombs_are_refused_before_the_validation_decode() {
+        let err = media::image_bytes(jpeg_declaring(20_000, 20_000)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to decode"), "{msg}");
+        assert!(msg.contains("400 MP"), "{msg}");
+    }
+
+    #[test]
+    fn generated_small_images_still_pass_the_guard() {
+        let art = media::image_bytes(tiny_jpeg()).unwrap();
+        assert_eq!(art.kind, MediaKind::Image);
+        assert_eq!(art.mime, "image/jpeg");
+        assert_eq!(art.format, "jpeg");
+        assert!(!art.bytes.is_empty());
     }
 
     #[test]

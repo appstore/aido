@@ -18,6 +18,11 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// The `model` value `config init` writes as a stand-in. `check()` flags
+/// it so a fresh sample never reports ok, and the sample interpolates it
+/// from this one constant — check and init cannot drift apart.
+pub(crate) const MODEL_PLACEHOLDER: &str = "YOUR_MODEL";
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -144,20 +149,26 @@ fn parse_config(path: &Path) -> Result<Config> {
 }
 
 /// A config with the built-in default provider: official OpenAI, key from
-/// AIDO_API_KEY / OPENAI_API_KEY. Keeps zero-config usage working. Speech
-/// routes to the keyless Edge TTS adapter — the one operation that can run
-/// without any credentials, so the zero-config default makes it work
-/// instead of failing on a missing API key.
+/// AIDO_API_KEY / OPENAI_API_KEY. Keeps zero-config usage working. With the
+/// edge-tts feature (the default build) speech routes to the keyless Edge
+/// TTS adapter — the one operation that can run without any credentials.
+/// Without the feature there is no speech route: speech falls back to the
+/// conventional openai-speech adapter, so zero-config tts honestly fails on
+/// the missing API key instead of silently sending text to Microsoft.
 pub fn default_config() -> Config {
+    // The edge-tts adapter owns its endpoint and ignores this provider's
+    // connection entirely (feature off: no route at all).
+    #[cfg(feature = "edge-tts")]
+    let routes = BTreeMap::from([("speech".to_string(), crate::api::Adapter::EdgeTts)]);
+    #[cfg(not(feature = "edge-tts"))]
+    let routes: BTreeMap<String, crate::api::Adapter> = BTreeMap::new();
     let mut cfg = Config::default();
     cfg.providers.insert(
         "openai".into(),
         Provider {
             base_url: Some("https://api.openai.com/v1".into()),
             api_key_env: Some("AIDO_API_KEY".into()),
-            // The edge-tts adapter owns its endpoint and ignores this
-            // provider's connection entirely.
-            routes: BTreeMap::from([("speech".to_string(), crate::api::Adapter::EdgeTts)]),
+            routes,
         },
     );
     cfg.profiles.insert(
@@ -206,12 +217,33 @@ pub fn check(cfg: &Config) -> Vec<String> {
                         ));
                     }
                 }
+                // A route naming edge-tts can never run in a binary built
+                // without the feature; say so here, while the user is
+                // editing the config, instead of at send time.
+                #[cfg(not(feature = "edge-tts"))]
+                for (key, adapter) in &provider.routes {
+                    if *adapter == Adapter::EdgeTts {
+                        issues.push(format!(
+                            "provider '{provider_name}': route '{key}' names the \
+                             edge-tts adapter, which this binary does not include \
+                             (rebuild with --features edge-tts)"
+                        ));
+                    }
+                }
             }
         }
-        if profile.model.is_none() {
-            issues.push(format!(
+        // `config init` writes the placeholder model; a profile still
+        // carrying it (or an empty model) fails at run time, so check
+        // must flag it instead of reporting ok.
+        match profile.model.as_deref().map(str::trim) {
+            None => issues.push(format!(
                 "profile '{name}': no model set; the adapter default would be used"
-            ));
+            )),
+            Some(m) if m.is_empty() || m == MODEL_PLACEHOLDER => issues.push(format!(
+                "profile '{name}': no model configured; set model in the config \
+                 ('{MODEL_PLACEHOLDER}' is the config init placeholder)"
+            )),
+            Some(_) => {}
         }
     }
     // The profile resolution will actually use: an explicit
@@ -245,7 +277,7 @@ pub fn init() -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&path, SAMPLE_CONFIG)
+    std::fs::write(&path, sample_config())
         .with_context(|| format!("failed to write {}", path.display()))?;
     println!("sample config written to: {}", path.display());
     println!("\nnext steps:");
@@ -255,7 +287,41 @@ pub fn init() -> Result<()> {
     Ok(())
 }
 
-const SAMPLE_CONFIG: &str = r#"# aido configuration.
+/// The sample's speech-route segment. With the edge-tts feature (the
+/// default build) it keeps `aido tts` keyless via the Edge Read Aloud
+/// protocol; a binary built without the feature cannot run that route, so
+/// the segment ships commented out with a pointer at the feature — speech
+/// then stays on OpenAI's speech API, which needs the key above.
+#[cfg(feature = "edge-tts")]
+const SAMPLE_SPEECH_ROUTE: &str = r#"
+# Speech routes to the keyless Edge Read Aloud protocol (Microsoft's
+# unofficial endpoint; the text is sent there, no API key). Delete the
+# speech line to use OpenAI's speech API, which needs the key above.
+[providers.openai.routes]
+speech = "edge-tts"
+"#;
+
+#[cfg(not(feature = "edge-tts"))]
+const SAMPLE_SPEECH_ROUTE: &str = r#"
+# This build excludes the edge-tts adapter, so the keyless speech route
+# below stays commented out (rebuild with --features edge-tts to enable
+# it); speech then uses OpenAI's speech API, which needs the key above.
+# [providers.openai.routes]
+# speech = "edge-tts"
+"#;
+
+/// The sample `config init` writes: head, the feature-gated speech-route
+/// segment, then the tail. `concat!` cannot join consts on this toolchain,
+/// so the join happens here at runtime — init runs once, and both halves
+/// stay plain readable raw strings. The tail names the placeholder model
+/// through `{MODEL_PLACEHOLDER}`, filled from the same constant `check()`
+/// flags, so the two can never disagree.
+fn sample_config() -> String {
+    format!("{SAMPLE_CONFIG_HEAD}{SAMPLE_SPEECH_ROUTE}{SAMPLE_CONFIG_TAIL}")
+        .replace("{MODEL_PLACEHOLDER}", MODEL_PLACEHOLDER)
+}
+
+const SAMPLE_CONFIG_HEAD: &str = r#"# aido configuration.
 # Providers own connections; profiles own model choice; tasks reference
 # profiles. Credentials are environment variable names, never values.
 
@@ -273,10 +339,12 @@ default_profile = "default"
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key_env = "AIDO_API_KEY"
+"#;
 
+const SAMPLE_CONFIG_TAIL: &str = r#"
 [profiles.default]
 provider = "openai"
-model = "YOUR_MODEL"
+model = "{MODEL_PLACEHOLDER}"
 
 # A local vision setup (vLLM / SGLang / llama.cpp / Ollama / LM Studio):
 # [providers.local]

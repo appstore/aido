@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// The three content kinds aido understands on either side of a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Text,
@@ -67,6 +67,11 @@ pub struct InputPart {
     /// clipboard get a synthesized one), used for labels and history.
     pub name: String,
     pub kind: MediaKind,
+    /// Set only by the `--dry-run` clipboard placeholder: `kind` above is
+    /// a stand-in (text), not the real kind, which the actual run learns
+    /// when it reads the clipboard. Validation treats such a part as
+    /// acceptable to any task instead of judging the stand-in kind.
+    pub unknown_kind: bool,
     pub mime: String,
     pub content: InputContent,
 }
@@ -92,13 +97,20 @@ pub enum InputContent {
 // ---------------------------------------------------------------------------
 
 /// Which request produced an artifact, so `--dry-run` plans and run records
-/// can explain provenance. One run may issue several requests (OCR slices).
+/// can explain provenance. One run may issue several requests (OCR slices,
+/// text chunks): a merged artifact names every request whose reply it joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Provenance {
     /// Produced by request `index` (0-based) of the run.
     Request { index: usize },
-    /// Restored from history; not produced in this process.
+    /// Joined from the replies of several requests of one run, named in
+    /// reply order (an ocr run's slices, a chunk-join run's chunks).
+    Merged { requests: Vec<usize> },
+    /// Restored from history (`aido last`, `history show`); not produced
+    /// in this process. Set only when loaded artifacts carry no recorded
+    /// provenance (records written before 0.3.0); delivery manifests may
+    /// serialize it.
     Restored,
 }
 
@@ -222,6 +234,15 @@ pub struct RunRecord {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Per-part batches only: the (part name, error) pairs that failed
+    /// while the surviving parts delivered, so a restored run's report can
+    /// name them instead of reading as a full success. The defaults keep
+    /// records written before this field parsing.
+    #[serde(default)]
+    pub failed_parts: Vec<(String, String)>,
+    /// Total parts of the per-part batch (0 outside one).
+    #[serde(default)]
+    pub parts_total: usize,
     #[serde(default)]
     pub deliveries: Vec<DeliveryState>,
 }
@@ -298,6 +319,18 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// The name this kind carries in the JSON run report's `error.kind`,
+    /// shared by the success report and the error report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::Service => "service",
+            Self::Generation => "generation",
+            Self::Delivery => "delivery",
+            Self::Partial => "partial",
+        }
+    }
+
     pub fn exit_code(self) -> i32 {
         match self {
             Self::Usage => 2,
@@ -347,14 +380,41 @@ impl AppError {
         Self::new(ErrorKind::Partial, message)
     }
 
-    /// The full message plus every underlying cause, one per line.
+    /// The message plus every underlying cause, one per line, following
+    /// `source()` to the end of the chain. A cause that repeats the text of
+    /// the line before it is skipped, so a `From` conversion that stores one
+    /// error's text as both message and source (as `From<io::Error>` does)
+    /// does not print it twice.
     pub fn chain(&self) -> String {
-        let mut out = self.message.clone();
-        if let Some(err) = self.source.as_deref() {
-            out.push_str(": ");
-            out.push_str(&err.to_string());
+        self.chain_lines().join("\n")
+    }
+
+    /// The same walk as [`chain`](Self::chain), joined with `"; "` instead
+    /// of newlines, for contexts that render a single line: history list
+    /// labels and batch part failure listings. The same duplicate-cause
+    /// skip applies.
+    pub fn chain_inline(&self) -> String {
+        self.chain_lines().join("; ")
+    }
+
+    /// The message and every distinct cause text, in chain order. A cause
+    /// whose `to_string()` equals the segment appended just before it is
+    /// dropped: it carries no new information — `From<io::Error>` attaches
+    /// the wrapped error itself, whose text already became the message.
+    fn chain_lines(&self) -> Vec<String> {
+        let mut lines = vec![self.message.clone()];
+        let mut cause: Option<&dyn std::error::Error> = match &self.source {
+            Some(err) => Some(err.as_ref()),
+            None => None,
+        };
+        while let Some(err) = cause {
+            let line = err.to_string();
+            if Some(&line) != lines.last() {
+                lines.push(line);
+            }
+            cause = err.source();
         }
-        out
+        lines
     }
 }
 
@@ -404,6 +464,7 @@ mod tests {
             source: InputSource::Literal,
             name: format!("part-{id}"),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
@@ -415,6 +476,7 @@ mod tests {
             source: InputSource::File("a.png".into()),
             name: "a.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
         }
@@ -455,6 +517,8 @@ mod tests {
                 provenance: Provenance::Request { index: 0 },
             }],
             warnings: Vec::new(),
+            failed_parts: Vec::new(),
+            parts_total: 0,
             deliveries: vec![DeliveryState {
                 destination: Destination::Clipboard,
                 status: DeliveryStatus::Failed {
@@ -473,6 +537,145 @@ mod tests {
         let err = AppError::from(io_err);
         assert!(err.chain().contains("gone"));
         assert_eq!(err.kind.exit_code(), 3);
+    }
+
+    #[test]
+    fn app_error_from_io_error_prints_the_message_once() {
+        // `From<io::Error>` stores the same text as message and source; the
+        // chain walk must not print it twice.
+        let err = AppError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert_eq!(err.chain(), "gone");
+        assert_eq!(err.chain_inline(), "gone");
+    }
+
+    /// A cause layer with fixed text and an optional deeper cause, so tests
+    /// build chains without one struct per layer.
+    #[derive(Debug)]
+    struct Cause {
+        text: &'static str,
+        deeper: Option<Box<Cause>>,
+    }
+
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Cause {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.deeper
+                .as_deref()
+                .map(|c| c as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn app_error_chain_skips_a_repeated_layer_and_keeps_distinct_ones() {
+        // A cause repeating the text of the layer above it carries no new
+        // information and is skipped; the distinct deeper cause still
+        // renders, one line per layer.
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "outer".into(),
+            source: Some(Box::new(Cause {
+                text: "outer",
+                deeper: Some(Box::new(Cause {
+                    text: "deep cause",
+                    deeper: None,
+                })),
+            })),
+        };
+        let chain = err.chain();
+        let lines: Vec<&str> = chain.lines().collect();
+        assert_eq!(lines, ["outer", "deep cause"]);
+    }
+
+    #[test]
+    fn app_error_chain_inline_joins_one_line_and_dedups() {
+        // Same walk as chain(), but "; "-joined and with the same duplicate
+        // skip: single-line contexts (history list labels, batch part
+        // failure listings) get every distinct layer on their one row.
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "top message".into(),
+            source: Some(Box::new(Cause {
+                text: "top message",
+                deeper: Some(Box::new(Cause {
+                    text: "mid cause",
+                    deeper: Some(Box::new(Cause {
+                        text: "leaf cause",
+                        deeper: None,
+                    })),
+                })),
+            })),
+        };
+        let inline = err.chain_inline();
+        assert_eq!(inline, "top message; mid cause; leaf cause");
+        assert!(!inline.contains('\n'));
+    }
+
+    #[test]
+    fn app_error_chain_walks_every_cause_layer_one_per_line() {
+        // `From<io::Error>` only ever attaches one layer, so build a source
+        // chain two layers deep by hand: the walk must not stop after the
+        // first cause.
+        #[derive(Debug)]
+        struct Leaf;
+        impl std::fmt::Display for Leaf {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("leaf cause")
+            }
+        }
+        impl std::error::Error for Leaf {}
+
+        #[derive(Debug)]
+        struct Mid;
+        impl std::fmt::Display for Mid {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("mid cause")
+            }
+        }
+        impl std::error::Error for Mid {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Leaf)
+            }
+        }
+
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "top message".into(),
+            source: Some(Box::new(Mid)),
+        };
+        let chain = err.chain();
+        let lines: Vec<&str> = chain.lines().collect();
+        assert_eq!(lines, ["top message", "mid cause", "leaf cause"]);
+    }
+
+    #[test]
+    fn provenance_keeps_the_tagged_form_old_records_carry() {
+        // The shape the --out-dir delivery manifests carry. Old records
+        // hold "request" and "restored"; "merged" only joins them, so
+        // every historical form still parses.
+        assert_eq!(
+            serde_json::to_value(Provenance::Request { index: 0 }).unwrap(),
+            serde_json::json!({"type": "request", "index": 0})
+        );
+        for (raw, parsed) in [
+            (
+                r#"{"type":"request","index":3}"#,
+                Provenance::Request { index: 3 },
+            ),
+            (r#"{"type":"restored"}"#, Provenance::Restored),
+            (
+                r#"{"type":"merged","requests":[0,1,2]}"#,
+                Provenance::Merged {
+                    requests: vec![0, 1, 2],
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<Provenance>(raw).unwrap(), parsed);
+        }
     }
 
     #[test]

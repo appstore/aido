@@ -2,13 +2,21 @@
 //!
 //! Decision table (contract §2.2):
 //!
-//! | explicit material | stdin non-terminal | behavior                          |
-//! |-------------------|-------------------|-----------------------------------|
-//! | none              | yes               | read stdin; empty is an error     |
-//! | contains `-`      | yes               | read stdin at the `-` position    |
-//! | none              | no                | clipboard (or instruction-only)   |
-//! | some, no `-`      | yes               | error: consume the pipe with `-`  |
-//! | some              | no                | explicit material; `-` reads EOF  |
+//! | explicit material | piped stdin data | behavior                          |
+//! |-------------------|------------------|-----------------------------------|
+//! | none              | yes              | read stdin; empty is an error     |
+//! | contains `-`      | yes              | read stdin at the `-` position    |
+//! | none              | no               | clipboard (or instruction-only)   |
+//! | some, no `-`      | yes              | error: consume the pipe with `-`  |
+//! | some              | no               | explicit material; `-` reads EOF  |
+//!
+//! "Piped stdin data" means stdin actually carries unread bytes — a closed
+//! pipe or `/dev/null` (what CI runners, cron and `docker run` without `-t`
+//! attach) counts as *no* data, so automation keeps working with explicit
+//! material. A writer that is attached but still silent at probe time
+//! (`curl … | aido file`) reads the same way: the probe is a snapshot and
+//! cannot predict a silent writer, so the explicit material runs and the
+//! pipe is never drained. Only stdin that already holds bytes demands a `-`.
 //!
 //! A glob spec (a pattern the shell could not expand — quoted on Unix,
 //! always on Windows) or a directory spec expands in place to its sorted
@@ -22,7 +30,7 @@ use crate::cli::SourceSpec;
 use crate::domain::{InputContent, InputPart, InputSource, MediaKind};
 use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
-use std::io::{IsTerminal, Read};
+use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
@@ -37,8 +45,10 @@ const MAX_EXPANSION: usize = 4096;
 
 /// Injectable environment so tests never touch the real clipboard or tty.
 pub struct InputEnv<'a> {
-    pub stdin_is_terminal: bool,
     stdin: &'a mut dyn Read,
+    /// Whether stdin actually carries unread bytes right now; a fresh
+    /// process gets [`fd0_has_unread_bytes`], tests hand in a plain bool.
+    stdin_data_probe: &'a mut (dyn FnMut() -> bool + 'a),
     clipboard: &'a mut (dyn FnMut() -> Result<crate::clipboard::ClipboardContent> + 'a),
 }
 
@@ -46,8 +56,8 @@ impl InputEnv<'static> {
     pub fn real() -> Self {
         // Leaks nothing: stdin and the clipboard live for the process.
         Self {
-            stdin_is_terminal: std::io::stdin().is_terminal(),
             stdin: Box::leak(Box::new(std::io::stdin())),
+            stdin_data_probe: Box::leak(Box::new(fd0_has_unread_bytes)),
             clipboard: Box::leak(Box::new(crate::clipboard::read)),
         }
     }
@@ -56,14 +66,21 @@ impl InputEnv<'static> {
 impl<'a> InputEnv<'a> {
     pub fn custom(
         stdin: &'a mut dyn Read,
-        stdin_is_terminal: bool,
+        stdin_data_probe: &'a mut (dyn FnMut() -> bool + 'a),
         clipboard: &'a mut dyn FnMut() -> Result<crate::clipboard::ClipboardContent>,
     ) -> Self {
         Self {
-            stdin_is_terminal,
             stdin,
+            stdin_data_probe,
             clipboard,
         }
+    }
+
+    /// Whether stdin holds unread bytes — not just "is not a terminal".
+    /// This is what separates a real pipe (`cat x | aido ...`) from the
+    /// closed pipe or `/dev/null` CI attaches.
+    fn stdin_has_data(&mut self) -> bool {
+        (self.stdin_data_probe)()
     }
 
     fn read_stdin(&mut self) -> &mut dyn Read {
@@ -75,9 +92,125 @@ impl<'a> InputEnv<'a> {
     }
 }
 
+/// Whether fd 0 actually carries unread bytes, by handle kind:
+///
+/// * character devices (`/dev/null`) — never;
+/// * a redirected file — whatever remains past the current offset;
+/// * pipes and sockets — the exact pending byte count, with a
+///   zero-timeout poll as the last resort.
+///
+/// When nothing can be determined the answer is `true`: the caller only
+/// uses this to *reject* a run, so uncertainty keeps the old strict
+/// behavior instead of silently ignoring possible input. One fstat
+/// failure is not uncertainty but a verdict: `EBADF` means fd 0 is
+/// closed (`0<&-`, a daemonized process), and a closed fd carries no
+/// unread bytes.
+#[cfg(unix)]
+fn fd0_has_unread_bytes() -> bool {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::STDIN_FILENO, &mut stat) != 0 {
+            return !matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFCHR => false,
+            libc::S_IFREG => {
+                let offset = libc::lseek(libc::STDIN_FILENO, 0, libc::SEEK_CUR);
+                stat.st_size > offset
+            }
+            _ => {
+                let mut pending: libc::c_int = 0;
+                if libc::ioctl(
+                    libc::STDIN_FILENO,
+                    libc::FIONREAD as libc::c_ulong,
+                    &mut pending,
+                ) == 0
+                {
+                    pending > 0
+                } else {
+                    let mut fds = [libc::pollfd {
+                        fd: libc::STDIN_FILENO,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    libc::poll(fds.as_mut_ptr(), 1, 0) > 0 && fds[0].revents & libc::POLLIN != 0
+                }
+            }
+        }
+    }
+}
+
+/// Windows twin of the unix probe: pipes are peeked, redirected files
+/// compare size against the current position, and character devices (the
+/// `NUL` automation attaches) never carry bytes.
+#[cfg(windows)]
+fn fd0_has_unread_bytes() -> bool {
+    use std::os::raw::{c_int, c_ulong, c_void};
+    type Handle = *mut c_void;
+    const STD_INPUT_HANDLE: c_ulong = 0xFFFF_FFF6;
+    const FILE_TYPE_DISK: c_ulong = 1;
+    const FILE_TYPE_PIPE: c_ulong = 3;
+    const FILE_CURRENT: c_ulong = 1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(kind: c_ulong) -> Handle;
+        fn GetFileType(handle: Handle) -> c_ulong;
+        fn PeekNamedPipe(
+            handle: Handle,
+            buffer: *mut c_void,
+            buffer_size: c_ulong,
+            bytes_read: *mut c_ulong,
+            total_bytes_avail: *mut c_ulong,
+            bytes_left_in_message: *mut c_ulong,
+        ) -> c_int;
+        fn GetFileSizeEx(handle: Handle, size: *mut i64) -> c_int;
+        fn SetFilePointerEx(
+            handle: Handle,
+            distance: i64,
+            new_position: *mut i64,
+            method: c_ulong,
+        ) -> c_int;
+    }
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        if stdin.is_null() {
+            return true;
+        }
+        match GetFileType(stdin) {
+            FILE_TYPE_DISK => {
+                let mut size = 0i64;
+                let mut position = 0i64;
+                if GetFileSizeEx(stdin, &mut size) != 0
+                    && SetFilePointerEx(stdin, 0, &mut position, FILE_CURRENT) != 0
+                {
+                    size > position
+                } else {
+                    true
+                }
+            }
+            FILE_TYPE_PIPE => {
+                let mut available = 0u32;
+                PeekNamedPipe(
+                    stdin,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                ) != 0
+                    && available > 0
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Read every spec into an ordered list of parts. `requires_material`
-/// decides whether a task with no specs and a terminal stdin may run on
-/// the instruction alone. Under `dry_run` the clipboard is never touched:
+/// decides whether a task with no specs and no stdin data may run on the
+/// instruction alone. Under `dry_run` the clipboard is never touched:
 /// paste slots become clearly-labeled placeholders so a plan can be
 /// checked without reading (or depending on) desktop state.
 pub fn gather(
@@ -107,7 +240,10 @@ pub fn gather(
     let limit = total_limit.unwrap_or(DEFAULT_TOTAL_BYTES);
 
     if specs.is_empty() {
-        if !env.stdin_is_terminal {
+        // The probe, not tty-ness: a closed pipe or /dev/null carries no
+        // data, so automation keeps the clipboard (or instruction-only)
+        // row of the decision table instead of a spurious "stdin is empty".
+        if env.stdin_has_data() {
             let bytes = read_limited(env.stdin, MAX_PART_BYTES, "stdin")?;
             if bytes.is_empty() {
                 bail!("stdin is empty; nothing to send (the clipboard is never a fallback)");
@@ -127,7 +263,7 @@ pub fn gather(
         return Ok(Vec::new());
     }
 
-    if !env.stdin_is_terminal && !specs.iter().any(|s| matches!(s, SourceSpec::Stdin)) {
+    if env.stdin_has_data() && !specs.iter().any(|s| matches!(s, SourceSpec::Stdin)) {
         bail!(
             "stdin is piped but not consumed; add `-` where the piped data belongs \
              (e.g. `aido code-review -`), or redirect stdin from the terminal"
@@ -176,6 +312,7 @@ pub fn gather(
                     source: InputSource::Literal,
                     name: format!("--text #{}", parts.len() + 1),
                     kind: MediaKind::Text,
+                    unknown_kind: false,
                     mime: "text/plain".into(),
                     content: InputContent::Text(value.clone()),
                 };
@@ -229,12 +366,15 @@ fn part_size(part: &InputPart) -> usize {
 /// A stand-in for clipboard material under `--dry-run`: the plan can be
 /// checked without reading (or requiring) desktop clipboard state. The
 /// real run still reads the clipboard and still fails on an empty one.
+/// `unknown_kind` marks the kind above as a placeholder: type validation
+/// cannot judge what has not been read, so the plan stays checkable.
 fn dry_run_clipboard_part(id: usize) -> InputPart {
     InputPart {
         id,
         source: InputSource::Clipboard,
         name: "clipboard (not read under --dry-run)".into(),
         kind: MediaKind::Text,
+        unknown_kind: true,
         mime: "text/plain".into(),
         content: InputContent::Text(String::new()),
     }
@@ -251,6 +391,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 source: InputSource::Clipboard,
                 name: "clipboard".into(),
                 kind: MediaKind::Text,
+                unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(t),
             })
@@ -264,6 +405,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 source: InputSource::Clipboard,
                 name: "clipboard.png".into(),
                 kind: MediaKind::Image,
+                unknown_kind: false,
                 mime: "image/png".into(),
                 content: InputContent::Media(png),
             })
@@ -369,8 +511,12 @@ fn expand_glob(pattern: &str, cap: usize) -> Result<Vec<PathBuf>> {
         require_literal_separator: true,
         require_literal_leading_dot: true,
     };
-    let paths = glob::glob_with(&glob_pattern, options)
-        .map_err(|e| anyhow::anyhow!("invalid glob pattern '{pattern}': {e}"))?;
+    // The literal file already got its chance above, so an unparseable
+    // pattern is usually a typo'd filename: lead with the shell-equivalent
+    // "no such file" fact, keeping the syntax detail as secondary context.
+    let paths = glob::glob_with(&glob_pattern, options).map_err(|e| {
+        anyhow::anyhow!("no files match '{pattern}' (it is also not a valid glob pattern: {e})")
+    })?;
     // glob 0.3 unwraps `to_str()` on scanned directory entries while
     // filtering leading dots, so a non-UTF-8 filename (legacy zip
     // extraction, GBK names) would panic the whole run. Expansion reads
@@ -428,6 +574,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             source,
             name,
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
         });
@@ -438,6 +585,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             source,
             name,
             kind: MediaKind::Audio,
+            unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
         });
@@ -452,6 +600,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
                 source,
                 name,
                 kind: MediaKind::Text,
+                unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(text),
             })
@@ -498,12 +647,14 @@ mod tests {
     use crate::clipboard::ClipboardContent;
     use std::io::Cursor;
 
-    fn env(stdin_data: &'static [u8], terminal: bool) -> InputEnv<'static> {
+    fn env(stdin_data: &'static [u8]) -> InputEnv<'static> {
         // The cursor and closure are leaked here on purpose: test-scoped,
-        // tiny, and it keeps every call site a one-liner.
+        // tiny, and it keeps every call site a one-liner. The data probe
+        // mirrors what a real pipe would report: bytes pending or not.
+        let has_data = !stdin_data.is_empty();
         InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(stdin_data))),
-            stdin_is_terminal: terminal,
+            stdin_data_probe: Box::leak(Box::new(move || has_data)),
             clipboard: Box::leak(Box::new(|| Ok(ClipboardContent::Text("clip".into())))),
         }
     }
@@ -514,7 +665,7 @@ mod tests {
 
     #[test]
     fn piped_stdin_alone_is_material() {
-        let mut e = env(b"hello\n", false);
+        let mut e = env(b"hello\n");
         let parts = gather(&[], true, None, false, &mut e).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].text(), Some("hello\n"));
@@ -522,17 +673,78 @@ mod tests {
     }
 
     #[test]
-    fn empty_piped_stdin_is_an_error_without_clipboard_fallback() {
-        let mut e = env(b"", false);
+    fn empty_closed_stdin_falls_back_to_the_clipboard() {
+        // No pending bytes (closed pipe, /dev/null) is the decision
+        // table's no-data row: the clipboard takes over instead of the
+        // old "stdin is empty" rejection.
+        let mut e = env(b"");
+        let parts = gather(&[], true, None, false, &mut e).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].source, InputSource::Clipboard);
+        assert_eq!(parts[0].text(), Some("clip"));
+    }
+
+    #[test]
+    fn instruction_only_run_proceeds_with_a_closed_empty_stdin() {
+        // `aido ask -p "hi" < /dev/null`: no data, no clipboard need —
+        // the instruction alone drives the run.
+        let mut e = env(b"");
+        let parts = gather(&[], false, None, false, &mut e).unwrap();
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn probe_true_but_eof_read_is_still_an_error() {
+        // The probe promised bytes, the read hit EOF: a writer closed the
+        // pipe between the snapshot and the read. The strict error stays —
+        // this really was meant to be stdin material.
+        let mut e = InputEnv {
+            stdin: Box::leak(Box::new(Cursor::new(b""))),
+            stdin_data_probe: Box::leak(Box::new(|| true)),
+            clipboard: Box::leak(Box::new(|| Ok(ClipboardContent::Text("clip".into())))),
+        };
         let err = gather(&[], true, None, false, &mut e).unwrap_err();
-        assert!(err.to_string().contains("stdin is empty"));
+        assert!(err.to_string().contains("stdin is empty"), "{err}");
     }
 
     #[test]
     fn unconsumed_pipe_with_explicit_material_is_an_error() {
-        let mut e = env(b"pipe data\n", false);
+        let mut e = env(b"pipe data\n");
         let err = gather(&[file("a.txt")], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("add `-`"));
+    }
+
+    #[test]
+    fn closed_empty_stdin_with_explicit_material_is_not_an_error() {
+        // CI runners, cron and `docker run` without `-t` attach a closed
+        // pipe or /dev/null: not a terminal, and no bytes either. The
+        // explicit material must run exactly as it would on a terminal.
+        let dir = std::env::temp_dir().join(format!("aido-input-null-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"real\n").unwrap();
+        let mut e = env(b"");
+        let parts = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap();
+        assert_eq!(parts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A data probe that says yes regardless of the cursor: stdin state
+    /// and probe answer are independent injections.
+    #[test]
+    fn probe_drives_the_pipe_guard_not_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("aido-input-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"real\n").unwrap();
+        let mut e = InputEnv {
+            stdin: Box::leak(Box::new(Cursor::new(b""))),
+            stdin_data_probe: Box::leak(Box::new(|| true)),
+            clipboard: Box::leak(Box::new(|| Ok(ClipboardContent::Text("clip".into())))),
+        };
+        let err = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap_err();
+        assert!(err.to_string().contains("add `-`"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -541,7 +753,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         std::fs::write(&a, b"from file\n").unwrap();
-        let mut e = env(b"pipe\n", false);
+        let mut e = env(b"pipe\n");
         let parts = gather(
             &[SourceSpec::File(a.clone()), SourceSpec::Stdin],
             true,
@@ -558,7 +770,7 @@ mod tests {
 
     #[test]
     fn terminal_stdin_falls_back_to_clipboard_only_without_specs() {
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].text(), Some("clip"));
         assert_eq!(parts[0].source, InputSource::Clipboard);
@@ -566,7 +778,7 @@ mod tests {
 
     #[test]
     fn no_material_task_runs_on_instruction_alone() {
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[], false, None, false, &mut e).unwrap();
         assert!(parts.is_empty());
     }
@@ -577,7 +789,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let empty = dir.join("empty.txt");
         std::fs::write(&empty, b"").unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(
             &[SourceSpec::File(empty.clone())],
             true,
@@ -589,7 +801,7 @@ mod tests {
         assert!(err.to_string().contains("empty"), "{err}");
         let real = dir.join("real.txt");
         std::fs::write(&real, b"real\n").unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::File(real.clone())], true, None, false, &mut e).unwrap();
         assert_eq!(parts.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -609,7 +821,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shot.jpg");
         std::fs::write(&path, &jpg).unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::File(path)], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].kind, MediaKind::Image);
         assert_eq!(parts[0].mime, "image/jpeg");
@@ -619,7 +831,7 @@ mod tests {
 
     #[test]
     fn duplicate_stdin_and_paste_rejected() {
-        let mut e = env(b"x", false);
+        let mut e = env(b"x");
         let err = gather(
             &[SourceSpec::Stdin, SourceSpec::Stdin],
             true,
@@ -628,7 +840,7 @@ mod tests {
             &mut e,
         );
         assert!(err.is_err());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(
             &[SourceSpec::Paste, SourceSpec::Paste],
             true,
@@ -642,7 +854,7 @@ mod tests {
     #[test]
     fn paste_is_material_and_consumes_the_pipe_check() {
         // paste + piped stdin without `-` is still "unconsumed pipe"
-        let mut e = env(b"pipe\n", false);
+        let mut e = env(b"pipe\n");
         let err = gather(&[SourceSpec::Paste], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("add `-`"));
     }
@@ -653,7 +865,7 @@ mod tests {
         // plan checkable without desktop clipboard state.
         let mut e = InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(b""))),
-            stdin_is_terminal: true,
+            stdin_data_probe: Box::leak(Box::new(|| false)),
             clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
         };
         let parts = gather(&[SourceSpec::Paste], true, None, true, &mut e).unwrap();
@@ -663,7 +875,7 @@ mod tests {
 
         let mut e = InputEnv {
             stdin: Box::leak(Box::new(Cursor::new(b""))),
-            stdin_is_terminal: true,
+            stdin_data_probe: Box::leak(Box::new(|| false)),
             clipboard: Box::leak(Box::new(|| panic!("clipboard read under --dry-run"))),
         };
         let parts = gather(&[], true, None, true, &mut e).unwrap();
@@ -690,7 +902,7 @@ mod tests {
         let dir = write_dir("glob-sorted", &[("b.txt", b"b\n"), ("a.txt", b"a\n")]);
         std::fs::write(dir.join("c.md"), b"md\n").unwrap();
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(
             &[
                 SourceSpec::Glob(pattern),
@@ -712,7 +924,7 @@ mod tests {
     fn glob_without_matches_is_an_error() {
         let dir = write_dir("glob-none", &[("a.txt", b"a\n")]);
         let pattern = format!("{}/*.png", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("no files match"), "{err}");
     }
@@ -729,11 +941,11 @@ mod tests {
         );
         // `*` sees the subdirectory but must not descend into it.
         let pattern = format!("{}/*", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("is a directory"), "{err}");
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap();
         let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["top.txt"]);
@@ -743,7 +955,14 @@ mod tests {
     fn literal_file_with_metachars_wins_over_pattern() {
         let dir = write_dir("glob-literal", &[("note[1].txt", b"literal\n")]);
         let pattern = dir.join("note[1].txt").display().to_string();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
+        let parts = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap();
+        assert_eq!(parts[0].text(), Some("literal\n"));
+        // Even a name that is not a valid glob at all (unclosed `[`) takes
+        // the literal exit before parsing ever runs.
+        let dir = write_dir("glob-literal-raw", &[("shot[1.png", b"literal\n")]);
+        let pattern = dir.join("shot[1.png").display().to_string();
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap();
         assert_eq!(parts[0].text(), Some("literal\n"));
     }
@@ -758,7 +977,7 @@ mod tests {
                 (".hidden.txt", b"h\n"),
             ],
         );
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::File(dir.clone())], true, None, false, &mut e).unwrap();
         let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["a.txt", "b.txt"]);
@@ -769,7 +988,7 @@ mod tests {
     fn directory_with_subdirectory_is_an_error_with_a_glob_hint() {
         let dir = write_dir("dir-sub", &[("a.txt", b"a\n")]);
         std::fs::create_dir(dir.join("raw")).unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::File(dir)], true, None, false, &mut e).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("expands one level"), "{msg}");
@@ -779,11 +998,11 @@ mod tests {
     #[test]
     fn directory_without_usable_files_is_an_error() {
         let dir = write_dir("dir-empty", &[]);
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::File(dir.clone())], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("no input files"), "{err}");
         std::fs::write(dir.join(".dot.txt"), b"d\n").unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::File(dir)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("no input files"), "{err}");
     }
@@ -791,7 +1010,7 @@ mod tests {
     #[test]
     fn directory_and_dash_keep_argv_order() {
         let dir = write_dir("dir-dash", &[("a.txt", b"a\n"), ("b.txt", b"b\n")]);
-        let mut e = env(b"pipe\n", false);
+        let mut e = env(b"pipe\n");
         let parts = gather(
             &[SourceSpec::File(dir), SourceSpec::Stdin],
             true,
@@ -824,7 +1043,7 @@ mod tests {
     fn dry_run_still_expands_files_and_globs() {
         let dir = write_dir("dry-glob", &[("a.txt", b"a\n"), ("b.txt", b"b\n")]);
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let parts = gather(&[SourceSpec::Glob(pattern)], true, None, true, &mut e).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].text(), Some("a\n"));
@@ -832,7 +1051,7 @@ mod tests {
 
     #[test]
     fn missing_file_spec_still_errors_normally() {
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(
             &[file("definitely-missing-input.txt")],
             true,
@@ -869,17 +1088,24 @@ mod tests {
 
     #[test]
     fn invalid_patterns_error_cleanly() {
+        // The literal file had its chance above, so a pattern that cannot
+        // even parse reads as "no such file" first, syntax second — what
+        // bash would say.
         let err = expand_glob("a**b", MAX_EXPANSION).unwrap_err();
-        assert!(err.to_string().contains("invalid glob pattern"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("no files match 'a**b'"), "{msg}");
+        assert!(msg.contains("not a valid glob pattern"), "{msg}");
         let err = expand_glob("[b", MAX_EXPANSION).unwrap_err();
-        assert!(err.to_string().contains("invalid glob pattern"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("no files match '[b'"), "{msg}");
+        assert!(msg.contains("not a valid glob pattern"), "{msg}");
     }
 
     #[test]
     fn empty_file_inside_expansion_is_an_error_at_its_position() {
         let dir = write_dir("expansion-empty", &[("a.txt", b"a\n"), ("empty.txt", b"")]);
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
@@ -891,7 +1117,7 @@ mod tests {
             &[("a.txt", b"aaaa\n"), ("b.txt", b"bbbb\n")],
         );
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::Glob(pattern)], true, Some(8), false, &mut e).unwrap_err();
         assert!(err.to_string().contains("exceed the total"), "{err}");
     }
@@ -913,7 +1139,7 @@ mod tests {
             return;
         }
         let pattern = format!("{}/*.txt", dir.display());
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::Glob(pattern)], true, None, false, &mut e).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not valid UTF-8"), "{msg}");
@@ -924,7 +1150,7 @@ mod tests {
     fn symlinked_directory_inside_a_directory_arg_is_refused() {
         let dir = write_dir("dir-symlink", &[("a.txt", b"a\n")]);
         std::os::unix::fs::symlink(dir.join(".."), dir.join("up")).unwrap();
-        let mut e = env(b"", true);
+        let mut e = env(b"");
         let err = gather(&[SourceSpec::File(dir)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("expands one level"), "{err}");
     }

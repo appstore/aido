@@ -1,7 +1,10 @@
 //! Buffered media protocols. Generation options are serialized structurally,
 //! never interpolated into JSON templates.
-use super::{merged_text, plain_text, single_audio, GenerateRequest, GenerateResult};
-use crate::domain::{Artifact, MediaKind};
+use super::{
+    ensure_decode_size, image_dimensions, merged_text, plain_text, single_audio, GenerateRequest,
+    GenerateResult, RawArtifact,
+};
+use crate::domain::MediaKind;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -92,7 +95,7 @@ pub(super) fn parse_transcription(body: &str) -> Result<GenerateResult> {
     Ok(GenerateResult::complete_with_text(text))
 }
 
-pub(super) fn image(encoded: &str) -> Result<Artifact> {
+pub(super) fn image(encoded: &str) -> Result<RawArtifact> {
     image_bytes(
         base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -100,7 +103,7 @@ pub(super) fn image(encoded: &str) -> Result<Artifact> {
     )
 }
 
-pub(super) fn image_bytes(bytes: Vec<u8>) -> Result<Artifact> {
+pub(super) fn image_bytes(bytes: Vec<u8>) -> Result<RawArtifact> {
     let format = image::guess_format(&bytes).context("response is not a supported image")?;
     let (format, mime) = match format {
         image::ImageFormat::Png => ("png", "image/png"),
@@ -108,15 +111,22 @@ pub(super) fn image_bytes(bytes: Vec<u8>) -> Result<Artifact> {
         image::ImageFormat::WebP => ("webp", "image/webp"),
         _ => bail!("unsupported generated image format"),
     };
+    // The declared dimensions are read from the header alone before the
+    // validation decode: a compromised endpoint could otherwise OOM the
+    // process with a bomb-shaped reply (user material is guarded at the
+    // adapter boundary).
+    let (w, h) =
+        image_dimensions(&bytes).context("cannot read the dimensions of the generated image")?;
+    ensure_decode_size("generated image", w, h)?;
     // Validate decoded pixels before saving a success/history entry.
     image::load_from_memory(&bytes).context("invalid generated image")?;
-    Ok(Artifact {
-        id: String::new(), // assigned by the runner
+    // No id and no provenance: the runner names the artifact for the run
+    // and records which request produced it.
+    Ok(RawArtifact {
         kind: MediaKind::Image,
         mime: mime.into(),
         format: format.into(),
         bytes,
-        provenance: crate::domain::Provenance::Restored,
     })
 }
 
@@ -167,13 +177,11 @@ pub(super) fn speech(bytes: Vec<u8>, format: &str, content_type: &str) -> Result
     }
     Ok(GenerateResult {
         status: crate::domain::GenerationStatus::Complete,
-        artifacts: vec![Artifact {
-            id: String::new(),
+        artifacts: vec![RawArtifact {
             kind: MediaKind::Audio,
             mime: mime.into(),
             format: format.into(),
             bytes,
-            provenance: crate::domain::Provenance::Restored,
         }],
         ..Default::default()
     })

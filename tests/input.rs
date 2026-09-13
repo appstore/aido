@@ -64,19 +64,146 @@ fn dash_reads_stdin_at_its_position_between_files() {
 #[test]
 fn unconsumed_pipe_with_explicit_material_is_an_error() {
     let file = temp_file("a.txt", b"from file\n");
+    // The bytes are in the pipe before the binary starts, so the probe
+    // cannot lose a race against the parent's write. Windows keeps the
+    // write-after-spawn pipe: no prefill helper there.
+    #[cfg(unix)]
+    let out = run_prefilled_pipe(
+        &["summarize", file.to_str().unwrap()],
+        b"pipe\n",
+        &[],
+        empty_config(),
+    );
+    #[cfg(windows)]
     let out = run(&["summarize", file.to_str().unwrap()], b"pipe\n", &[]);
     out.assert_code(2);
     assert!(out.stderr().contains("add `-`"), "stderr: {}", out.stderr());
 }
 
 #[test]
-fn empty_piped_stdin_is_an_error_and_never_touches_the_clipboard() {
+fn closed_empty_pipe_with_explicit_material_runs() {
+    // The shape every CI runner gives a command: stdin is a pipe that was
+    // closed without a single byte. Not a terminal, but no data either —
+    // explicit material must run exactly as it would in a terminal.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run(
+        &["summarize", file.to_str().unwrap()],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[test]
+fn null_stdin_with_explicit_material_runs() {
+    // stdin redirected from the null device: same verdict, same exit 0.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run_null_stdin(
+        &["summarize", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_fd0_with_explicit_material_runs() {
+    // The same run with fd 0 closed outright (`0<&-`): no bytes to
+    // consume, so no unconsumed-pipe rejection — the file material runs
+    // exactly as it would from a terminal.
+    let server = Server::json(chat_body("ok"));
+    let file = temp_file("a.txt", b"from file\n");
+    let cfg = server_config(&server.url(), "");
+    let out = run_closed_stdin(
+        &["summarize", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
+#[test]
+fn instruction_only_task_runs_with_a_closed_empty_stdin() {
+    // `aido ask -p "hi" < /dev/null`: stdin is a pipe but carries no
+    // bytes, so the decision falls past stdin to the instruction alone.
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run(
+        &["ask", "-p", "hi"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+    let req = request_json(&server.request());
+    // The -p instruction is the whole request; no material part joins it.
+    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(req["messages"][0]["role"], "user");
+    assert_eq!(req["messages"][0]["content"], "hi");
+}
+
+#[cfg(unix)]
+#[test]
+fn instruction_only_task_runs_with_a_closed_fd0() {
+    // `aido ask -p "hi" 0<&-`: fd 0 is outright closed, so the probe's
+    // fstat fails with EBADF — a certain "no unread bytes", not the
+    // uncertainty that keeps the strict behavior. The run must proceed on
+    // the instruction alone instead of dying on a read of a closed fd.
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run_closed_stdin(
+        &["ask", "-p", "hi"],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+    let req = request_json(&server.request());
+    // The -p instruction is the whole request; no material part joins it.
+    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(req["messages"][0]["role"], "user");
+    assert_eq!(req["messages"][0]["content"], "hi");
+}
+
+// The test isolation only strips DISPLAY/WAYLAND_DISPLAY, which makes the
+// clipboard fail deterministically on headless Linux; macOS runners have a
+// working NSPasteboard, so there the fallback legitimately finds material
+// and the exact assertion below is Linux-only. The behavior itself stays
+// covered on every platform by the injected-clipboard unit tests on
+// `Input` in src/input.rs.
+#[cfg(target_os = "linux")]
+#[test]
+fn closed_empty_stdin_falls_through_to_the_clipboard() {
+    // Material task, no specs, empty pipe, no clipboard available: the
+    // decision must move past stdin to the clipboard fallback and fail
+    // there — not with the old "stdin is empty" rejection.
     let out = run(&["summarize"], b"", &[]);
     out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("clipboard"), "stderr: {err}");
+    assert!(!err.contains("stdin is empty"), "stderr: {err}");
+}
+
+#[test]
+fn null_stdin_ocr_copy_previews_the_clipboard_under_dry_run() {
+    // The README's opening shape: `aido ocr --copy < /dev/null`. No
+    // specs, /dev/null carries no bytes, requires_material + --dry-run →
+    // the placeholder clipboard part, exit 0 without touching desktop
+    // clipboard state.
+    let out = run_null_stdin(&["ocr", "--copy", "--dry-run"], &[], empty_config());
+    out.assert_code(0);
+    let stdout = out.stdout();
     assert!(
-        out.stderr().contains("stdin is empty"),
-        "stderr: {}",
-        out.stderr()
+        stdout.contains("clipboard (not read under --dry-run)"),
+        "{stdout}"
     );
 }
 
@@ -323,6 +450,38 @@ fn missing_file_fails_with_the_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unparseable_pattern_without_a_file_reports_no_file_first() {
+    // `shot[1.png` cannot parse as a glob (unclosed `[`) and no literal
+    // file exists: the error must read like the shell's — no such file —
+    // with the syntax problem only as secondary context.
+    let out = run_tty(&["ocr", "shot[1.png"], &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("no files match"), "{err}");
+    assert!(err.contains("shot[1.png"), "{err}");
+    assert!(err.contains("not a valid glob pattern"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_file_with_unclosed_bracket_expands_past_the_pattern() {
+    // The same unparseable name, but the file exists: the literal-file
+    // escape wins and the run proceeds past expansion.
+    let png = solid_png(2, 2);
+    let file = temp_file("shot[1.png", &png);
+    let server = Server::json(chat_body("ok"));
+    let cfg = server_config(&server.url(), "");
+    let out = run_tty_with(
+        &["ocr", file.to_str().unwrap()],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "ok\n");
+}
+
 #[test]
 fn ocr_requires_image_material() {
     let out = run(&["ocr"], b"only text\n", &[]);
@@ -360,9 +519,15 @@ fn dry_run_does_not_touch_the_clipboard() {
     let out = run_tty(&["ocr", "--paste", "--dry-run"], &[]);
     let err = out.stderr();
     assert!(!err.contains("clipboard:"), "{err}");
-    // the placeholder keeps the type checks honest: ocr needs an image
-    assert_eq!(out.code(), 2, "{err}");
-    assert!(err.contains("image"), "{err}");
+    // ocr requires image material, but the unread clipboard's kind is
+    // decided at runtime — the plan must preview, not fail the type check.
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("clipboard (not read under --dry-run)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unknown (decided at runtime)"), "{stdout}");
 }
 
 fn expansion_dir(name: &str) -> std::path::PathBuf {

@@ -38,6 +38,13 @@ struct Manifest {
     generation: GenerationStatus,
     #[serde(default)]
     warnings: Vec<String>,
+    /// Per-part batches only: the structured (part, error) pairs. Defaults
+    /// keep manifests written before this field parsing.
+    #[serde(default)]
+    failed_parts: Vec<(String, String)>,
+    /// Total parts of the per-part batch (0 outside one).
+    #[serde(default)]
+    parts_total: usize,
     #[serde(default)]
     deliveries: Vec<DeliveryState>,
     #[serde(default)]
@@ -52,6 +59,11 @@ struct ManifestArtifact {
     format: String,
     file: String,
     size: u64,
+    /// Which request(s) produced this artifact. Absent in records written
+    /// before 0.3.0 (the field is a 0.3.0 additive, mirroring the out-dir
+    /// manifest's provenance); older records load as Restored.
+    #[serde(default)]
+    provenance: Option<Provenance>,
 }
 
 /// A fresh run id (sortable, millisecond resolution). When the history
@@ -132,6 +144,7 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
                 format: artifact.format.clone(),
                 file,
                 size: artifact.bytes.len() as u64,
+                provenance: Some(artifact.provenance.clone()),
             });
         }
     }
@@ -143,6 +156,8 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
         summary: record.summary.clone(),
         generation: record.generation.clone(),
         warnings: record.warnings.clone(),
+        failed_parts: record.failed_parts.clone(),
+        parts_total: record.parts_total,
         deliveries: Vec::new(),
         artifacts,
     };
@@ -211,7 +226,10 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
             mime: meta.mime.clone(),
             format: meta.format.clone(),
             bytes,
-            provenance: Provenance::Restored,
+            // Records written before 0.3.0 carry no provenance: their
+            // artifacts were not produced in this process, so Restored is
+            // the honest answer.
+            provenance: meta.provenance.clone().unwrap_or(Provenance::Restored),
         });
     }
     Ok(Some(RunRecord {
@@ -222,6 +240,8 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
         generation: manifest.generation,
         artifacts,
         warnings: manifest.warnings,
+        failed_parts: manifest.failed_parts,
+        parts_total: manifest.parts_total,
         deliveries: manifest.deliveries,
     }))
 }
@@ -320,16 +340,19 @@ pub fn prune(keep: usize, budget: u64) {
     // kept: it is the run just saved, and the recovery promise ("a failed
     // clipboard write is recoverable via `aido last`") depends on it —
     // even when a single artifact exceeds the whole budget.
-    let mut total = 0u64;
-    let mut dirs: Vec<PathBuf> = ids.iter().map(|id| dir.join(id)).collect();
-    dirs.sort(); // stamp order
-    for path in &dirs {
-        total += dir_size(path);
-    }
-    while total > budget && dirs.len() > 1 {
-        let oldest = dirs.remove(0);
-        total = total.saturating_sub(dir_size(&oldest));
-        remove_run(&dir, &oldest.to_string_lossy());
+    let mut entries: Vec<(String, u64)> = ids
+        .into_iter()
+        .map(|id| {
+            let size = dir_size(&dir.join(&id));
+            (id, size)
+        })
+        .collect();
+    entries.sort(); // stamp order
+    let mut total: u64 = entries.iter().map(|(_, size)| size).sum();
+    while total > budget && entries.len() > 1 {
+        let (oldest, size) = entries.remove(0);
+        total = total.saturating_sub(size);
+        remove_run(&dir, &oldest);
     }
 }
 
@@ -447,5 +470,49 @@ mod tests {
         assert!(is_stamp("20260909-153012.123"));
         assert!(!is_stamp("notes"));
         assert!(!is_stamp("20260909-153012"));
+    }
+
+    /// The manifest round-trip is what save/load actually do: write_manifest
+    /// serializes the Manifest (its artifacts included), read_manifest parses
+    /// it back. Provenance must survive that loop, and records written
+    /// before the field existed must still parse (as None — `load` then
+    /// answers Restored).
+    #[test]
+    fn manifest_artifact_round_trips_provenance() {
+        let manifest = Manifest {
+            version: 1,
+            run_id: "20260909-153012.123".into(),
+            task: None,
+            created_at: "2026-09-09T15:30:12Z".into(),
+            summary: Default::default(),
+            generation: GenerationStatus::Complete,
+            warnings: Vec::new(),
+            failed_parts: Vec::new(),
+            parts_total: 0,
+            deliveries: Vec::new(),
+            artifacts: vec![ManifestArtifact {
+                id: "text".into(),
+                kind: MediaKind::Text,
+                mime: "text/plain".into(),
+                format: "text".into(),
+                file: "text.txt".into(),
+                size: 5,
+                provenance: Some(Provenance::Request { index: 2 }),
+            }],
+        };
+        let raw = serde_json::to_string(&manifest).unwrap();
+        let back: Manifest = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            back.artifacts[0].provenance,
+            Some(Provenance::Request { index: 2 })
+        );
+
+        // A pre-0.3.0 record: the same entry without a provenance field.
+        let old = r#"{"version":1,"run_id":"20260909-153012.123","task":null,
+            "created_at":"2026-09-09T15:30:12Z","generation":{"status":"complete"},
+            "artifacts":[{"id":"text","kind":"text","mime":"text/plain",
+            "format":"text","file":"text.txt","size":5}]}"#;
+        let old: Manifest = serde_json::from_str(old).unwrap();
+        assert_eq!(old.artifacts[0].provenance, None);
     }
 }

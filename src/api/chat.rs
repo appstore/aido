@@ -232,6 +232,7 @@ pub(super) fn parse(body: &str) -> Result<GenerateResult> {
         status: status(choice.finish_reason.as_deref()),
         warnings: Vec::new(),
         artifacts: Vec::new(),
+        request_index: 0, // the runner records which request this answers
     };
     result.note_incomplete();
     Ok(result)
@@ -301,19 +302,28 @@ mod tests {
             source: InputSource::Literal,
             name: format!("t{id}"),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
     }
 
     fn png_part(id: usize) -> InputPart {
+        // Real (tiny) PNG bytes: the adapter boundary reads the header of
+        // every image now, so placeholder bytes would be rejected.
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
         InputPart {
             id,
             source: InputSource::File("a.png".into()),
             name: "a.png".into(),
             kind: MediaKind::Image,
+            unknown_kind: false,
             mime: "image/png".into(),
-            content: InputContent::Media(vec![1, 2, 3]),
+            content: InputContent::Media(png),
         }
     }
 
@@ -388,6 +398,7 @@ mod tests {
             source: crate::domain::InputSource::File("a.mp3".into()),
             name: "a.mp3".into(),
             kind: MediaKind::Audio,
+            unknown_kind: false,
             mime: "audio/mpeg".into(),
             content: crate::domain::InputContent::Media(vec![1, 2, 3]),
         };

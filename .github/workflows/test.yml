@@ -63,6 +63,40 @@ jobs:
             echo "::notice::aws-lc-rs has left the dependency tree (upstream fixed?). Update the README build note and remove this check."
           fi
 
+  no-default-features:
+    # R06：edge-tts 现在是 aido 侧 feature（默认开启）。关掉它必须仍然可编译，
+    # 且 kothok-edge-tts 子树（连同 aws-lc-sys）整体离开依赖树。只跑 check +
+    # clippy --all-targets（编译测试，但不在无 TTS 的二进制上运行集成测试——
+    # 默认特性的 check job 已覆盖运行时行为）。
+    name: no-default-features
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-default-features
+
+      - name: Check (no default features)
+        run: cargo check --locked --no-default-features
+
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
+      - name: Assert aws-lc-rs left the tree
+        run: |
+          if cargo tree --locked -i aws-lc-rs --no-default-features >/dev/null 2>&1; then
+            echo "::error::aws-lc-rs is still in the no-default-features tree"
+            exit 1
+          else
+            echo "aws-lc-rs is out of the tree (edge-tts feature off)"
+          fi
+
   msrv:
     # 验证 Cargo.toml 声明的 rust-version 真的能编译（--locked 锁定依赖版本，防止依赖漂移掩盖问题）
     name: msrv

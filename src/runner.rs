@@ -3,11 +3,12 @@
 
 use crate::api::{Client, Connection, GenerateRequest, GenerateResult};
 use crate::domain::{
-    AppError, AppResult, Artifact, Destination, GenerationStatus, MediaKind, Provenance,
+    AppError, AppResult, Artifact, Destination, GenerationStatus, InputPart, MediaKind, Provenance,
 };
 use crate::plan::{DeliveryMode, ExecutionPlan};
-use crate::processors::chunk::ChunkGate;
+use crate::processors::chunk::{reduce_inputs, ChunkGate};
 use crate::processors::ocr::BoundaryGate;
+use crate::processors::StepRole;
 use crate::spinner::Spinner;
 use crate::tasks::ProcessorKind;
 use std::cell::RefCell;
@@ -21,12 +22,27 @@ pub struct RunOutput {
     pub warnings: Vec<String>,
     /// Live stdout already printed the text (cannot be taken back).
     pub live_stdout: bool,
+    /// Characters actually printed live across the run's sinks. Unlike
+    /// `live_stdout` (the mode) this is 0 when nothing reached the
+    /// terminal — a reduce run keeps its map replies as buffered
+    /// intermediates, so a failure there streamed nothing to take back.
+    pub live_chars: u64,
     /// Per-part batches only: the parts that failed, in input order.
     /// Surviving parts' artifacts are complete and deliverable; the run
     /// exits 6 (partial) after normal delivery.
     pub failed_parts: Vec<FailedPart>,
     /// Total parts in a per-part batch (0 outside one).
     pub parts_total: usize,
+    /// The request error that stopped a single-document run mid-way; a
+    /// batch never sets this (its failures are per-part). Whatever text
+    /// already arrived still reached `artifacts` — merged replies, or a
+    /// reduce run's map replies kept as intermediates — so the caller
+    /// records the partial run and classifies the exit code from this
+    /// error.
+    pub failure: Option<AppError>,
+    /// Steps whose replies completed, of `steps_total` planned requests.
+    pub steps_done: usize,
+    pub steps_total: usize,
 }
 
 /// One failed part of a per-part batch, named by its input file
@@ -75,6 +91,9 @@ struct DeltaSink {
     merged: String,
     live: bool,
     chars_seen: u64,
+    /// Only the text printed live: `chars_seen` also counts buffered
+    /// sinks, whose output never reached the terminal.
+    live_chars: u64,
 }
 
 impl DeltaSink {
@@ -84,14 +103,16 @@ impl DeltaSink {
         if self.live {
             print!("{text}");
             let _ = std::io::stdout().flush();
+            self.live_chars += text.chars().count() as u64;
         }
     }
 }
 
 /// Merges a multi-request run's replies into one text stream. The right
 /// join depends on the strategy: ocr-tiles re-shows overlap bands and
-/// dedups them; chunk-map-reduce carries context instead, so chunks join
-/// with a plain paragraph break.
+/// dedups them; chunk-join carries context instead, so chunks join with
+/// a plain paragraph break. A chunk-reduce group never merges — its map
+/// replies are intermediate and the reduce reply is the whole artifact.
 enum SliceMerger {
     Boundary(BoundaryGate),
     Chunk(ChunkGate),
@@ -130,6 +151,11 @@ impl SliceMerger {
 /// error or truncated reply — is dropped with a warning and the run
 /// continues with the next part; the caller reports exit 6 after
 /// delivering the survivors.
+///
+/// Outside a batch, a request error stops the run but never discards it:
+/// the output is `Ok` with status `Incomplete`, the merged text of the
+/// replies that did arrive, and the error itself in `failure` — the
+/// caller records the partial generation instead of losing it.
 pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let api_key = plan.resolved.api_key_env.as_deref().and_then(|name| {
         // The default provider also accepts the conventional OpenAI name.
@@ -182,15 +208,31 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let mut overall = GenerationStatus::Complete;
     let mut artifacts: Vec<Artifact> = Vec::new();
     let mut failed_parts: Vec<FailedPart> = Vec::new();
+    let mut failure: Option<AppError> = None;
+    let mut steps_done = 0usize;
 
     // The part currently receiving replies. Outside a batch this is one
     // unnamed group spanning every step — the exact pre-batch behavior.
     struct Group {
         id: Option<usize>,
         stem: String,
-        first_index: usize,
+        /// Every request whose reply feeds this group's artifact, in step
+        /// order. A reduce group holds only its reduce request: the map
+        /// replies are intermediate material, so the artifact names the
+        /// one request that produced it.
+        requests: Vec<usize>,
         sink: Rc<RefCell<DeltaSink>>,
         gate: Option<SliceMerger>,
+        /// A reduce group's per-map-step replies, each paired with the
+        /// index of the request that produced it: the reduce request's
+        /// future material, never delivered on their own — unless the run
+        /// fails, when history keeps them as intermediate artifacts.
+        sections: Vec<(usize, String)>,
+        /// Whether this group ends in a reduce step (chunk-reduce). The
+        /// decision is per group, not per run: in a per-part batch one
+        /// long file's reduce step must not treat a single-chunk file's
+        /// only map reply as intermediate material.
+        reduces: bool,
     }
     // Warnings and failures name the part by its input name (`b.png`),
     // not its artifact stem (`b`).
@@ -202,6 +244,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let mut group: Option<Group> = None;
     let mut skip_part: Option<usize> = None;
     let mut total_chars = 0u64;
+    let mut total_live_chars = 0u64;
 
     // Merge a finished group into an artifact. An empty part in a batch
     // is a failure, not a silent gap.
@@ -213,16 +256,23 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             }
             let merged = g.sink.borrow();
             total_chars += merged.chars_seen;
+            total_live_chars += merged.live_chars;
             if !merged.merged.is_empty() {
+                // One reply is that request's artifact; several joined
+                // replies name every request they merged, in order.
+                let provenance = match g.requests.as_slice() {
+                    [only] => Provenance::Request { index: *only },
+                    many => Provenance::Merged {
+                        requests: many.to_vec(),
+                    },
+                };
                 $artifacts.push(Artifact {
                     id: g.stem.clone(),
                     kind: MediaKind::Text,
                     mime: "text/plain".into(),
                     format: "text".into(),
                     bytes: merged.merged.clone().into_bytes(),
-                    provenance: Provenance::Request {
-                        index: g.first_index,
-                    },
+                    provenance,
                 });
             } else if g.id.is_some() {
                 let name = part_name(plan, g.id, &g.stem);
@@ -250,15 +300,28 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             }
         }
         if group.is_none() {
+            // A chunk-reduce group (map steps plus one reduce step of THIS
+            // part) holds map replies back as the reduce request's material
+            // instead of merging them for delivery; a group without a
+            // reduce step — a single-chunk file in a per-part batch, say —
+            // delivers its map replies as its own output.
+            let reduces = plan
+                .steps
+                .iter()
+                .any(|s| s.part == step.part && s.role == StepRole::Reduce);
             let sink = Rc::new(RefCell::new(DeltaSink {
                 merged: String::new(),
                 live: live_stdout && !batch,
                 chars_seen: 0,
+                live_chars: 0,
             }));
-            let gate = (group_size(step.part) > 1).then(|| {
+            // A reduce group never merges through a gate: map replies
+            // accumulate as sections (the reduce request's material) and
+            // the reduce reply is a single request's output.
+            let gate = (group_size(step.part) > 1 && !reduces).then(|| {
                 let gate_sink = sink.clone();
                 match plan.processor {
-                    ProcessorKind::ChunkMapReduce => {
+                    ProcessorKind::ChunkJoin | ProcessorKind::ChunkReduce => {
                         SliceMerger::Chunk(ChunkGate::new(move |t: &str| {
                             gate_sink.borrow_mut().emit(t)
                         }))
@@ -276,10 +339,23 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             group = Some(Group {
                 id: step.part,
                 stem: step.artifact_stem.clone().unwrap_or_else(|| "text".into()),
-                first_index: step.index,
+                requests: Vec::new(),
                 sink,
                 gate,
+                sections: Vec::new(),
+                reduces,
             });
+        }
+        // Map replies of a reduce group are intermediate: each accumulates
+        // into its own section and never reaches stdout or an artifact —
+        // only the reduce reply streams live.
+        let reduces = group.as_ref().unwrap().reduces;
+        if reduces && step.role == StepRole::Map {
+            group
+                .as_mut()
+                .unwrap()
+                .sections
+                .push((step.index, String::new()));
         }
         if !plan.quiet {
             let label = if plan.steps.len() > 1 {
@@ -295,10 +371,20 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             };
             spinner.set_message(&label);
         }
+        // A reduce step's material is its group's collected map replies —
+        // placeholders in the plan, filled in here. The task's original
+        // instruction attaches to the reduce request like any other.
+        let reduce_material;
+        let inputs: &[InputPart] = if step.role == StepRole::Reduce {
+            reduce_material = reduce_inputs(&group.as_ref().unwrap().sections);
+            &reduce_material
+        } else {
+            &step.inputs
+        };
         let request = GenerateRequest {
             instruction: (!plan.instruction.is_empty()).then_some(plan.instruction.as_str()),
             requirement: plan.requirement.as_deref(),
-            inputs: &step.inputs,
+            inputs,
             model: &plan.resolved.model,
             max_tokens: plan.resolved.max_tokens,
             temperature: plan.resolved.temperature,
@@ -309,8 +395,13 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // requests; a single request goes straight to the sink. The
         // closure's last use is inside the request call (plus the
         // buffered replay right after), so later group access is fine.
+        let collect_section = reduces && step.role == StepRole::Map;
         let mut on_delta = |delta: &str| {
             let g = group.as_mut().unwrap();
+            if collect_section {
+                g.sections.last_mut().unwrap().1.push_str(delta);
+                return;
+            }
             match g.gate.as_mut() {
                 Some(gate) => gate.push_delta(delta),
                 None => g.sink.borrow_mut().emit(delta),
@@ -322,13 +413,28 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             client.generate(&request).await
         };
         match result {
-            Ok(reply) => {
+            Ok(mut reply) => {
+                steps_done += 1;
+                // The reply learns which request it answered only here:
+                // an adapter saw one exchange, never the run.
+                reply.request_index = step.index;
                 // A buffered reply arrives whole: run it through the same
                 // path the deltas would take.
                 if !plan.transport_stream && !reply.text.is_empty() {
                     on_delta(&reply.text.clone());
                 }
+                // The reply is in, so the group records its request. A
+                // reduce group keeps only the reduce request: its artifact
+                // is the consolidation, not the map replies it consumed.
+                let g = group.as_mut().unwrap();
+                if step.role == StepRole::Reduce {
+                    g.requests.clear();
+                }
+                g.requests.push(step.index);
                 let truncated = reply.status != GenerationStatus::Complete;
+                // The status carries the batch failure message, and
+                // `absorb` consumes the reply — read it before the move.
+                let batch_failure = (truncated && batch).then(|| status_failure(&reply.status));
                 absorb(reply, &mut media_artifacts, &mut warnings, &mut overall);
                 if let Some(g) = group.as_mut() {
                     if let Some(gate) = g.gate.as_mut() {
@@ -337,9 +443,8 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 }
                 // In a batch a truncated part fails alone; outside one the
                 // run keeps the pre-batch behavior (recorded, undelivered).
-                if truncated && batch {
+                if let Some(error) = batch_failure {
                     let g = group.take().unwrap();
-                    let error = "the reply was truncated".to_string();
                     let name = part_name(plan, g.id, &g.stem);
                     warnings.push(format!("part '{name}' failed: {error}"));
                     failed_parts.push(FailedPart { name, error });
@@ -349,11 +454,65 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             Err(e) => {
                 let error = AppError::from(e);
                 if !batch {
-                    spinner.stop();
-                    return Err(error);
+                    // The remaining requests stop here, but the replies that
+                    // already arrived are real generated content: the run
+                    // ends incomplete (naming the failed request), keeps
+                    // whatever merged, and the caller records it instead of
+                    // discarding it — re-running does not have to pay for
+                    // the requests that succeeded.
+                    overall = GenerationStatus::Incomplete {
+                        reason: format!(
+                            "request {}/{} failed: {}",
+                            step.index + 1,
+                            plan.steps.len(),
+                            // One line: the reason renders inside the
+                            // `history list` status column.
+                            error.chain_inline()
+                        ),
+                    };
+                    // A reduce group has no final result without its reduce
+                    // reply: a half-streamed reduce reply is not the
+                    // consolidation, so nothing of it is kept. The map
+                    // replies are different — each is a paid, complete
+                    // reply — so every non-empty section survives as an
+                    // intermediate artifact in the run's record (never
+                    // delivered: the run is incomplete).
+                    if let Some(g) = group.as_mut() {
+                        if g.reduces {
+                            g.sink.borrow_mut().merged.clear();
+                            let name = part_name(plan, g.id, &g.stem);
+                            let mut kept = 0usize;
+                            for (i, (step_index, text)) in g.sections.iter().enumerate() {
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                kept += 1;
+                                artifacts.push(Artifact {
+                                    id: format!("{}-chunk-{}", g.stem, i + 1),
+                                    kind: MediaKind::Text,
+                                    mime: "text/plain".into(),
+                                    format: "text".into(),
+                                    bytes: text.clone().into_bytes(),
+                                    provenance: Provenance::Request { index: *step_index },
+                                });
+                            }
+                            if kept > 0 {
+                                let plural = if kept == 1 { "y" } else { "ies" };
+                                warnings.push(format!(
+                                    "kept {kept} intermediate map repl{plural} of '{name}' \
+                                     after the failure; not delivered — see aido history show"
+                                ));
+                            }
+                        }
+                    }
+                    failure = Some(error);
+                    break;
                 }
                 let g = group.take().unwrap();
-                let message = error.chain();
+                // One line per part: the message feeds the partial-exit
+                // listing and the record's `failed_parts`, both read as
+                // single lines.
+                let message = error.chain_inline();
                 let name = part_name(plan, g.id, &g.stem);
                 warnings.push(format!("part '{name}' failed: {message}"));
                 failed_parts.push(FailedPart {
@@ -374,11 +533,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     }
 
     // Media artifacts keep their global promotion: a batch task produces
-    // text per part; media stays an aggregate of the run.
+    // text per part; media stays an aggregate of the run. Provenance came
+    // with the reply (which request produced it); the run-wide id is
+    // assigned here.
     for (i, artifact) in media_artifacts.into_iter().enumerate() {
         artifacts.push(Artifact {
             id: format!("{}-{}", artifact.kind, i + 1),
-            provenance: Provenance::Request { index: 0 },
             ..artifact
         });
     }
@@ -388,9 +548,29 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         status: overall,
         warnings,
         live_stdout,
+        live_chars: total_live_chars,
         failed_parts,
         parts_total: if batch { parts_total } else { 0 },
+        failure,
+        steps_done,
+        steps_total: plan.steps.len(),
     })
+}
+
+/// The failure message a non-Complete reply earns in a per-part batch:
+/// the status's own reason when it carries one, the variant named in
+/// plain words otherwise. "Truncated" is never guessed here — only a
+/// status that says so itself may report it.
+fn status_failure(status: &GenerationStatus) -> String {
+    match status {
+        GenerationStatus::Incomplete { reason } if !reason.trim().is_empty() => reason.clone(),
+        GenerationStatus::Failed => "the reply failed".to_string(),
+        GenerationStatus::Cancelled => "the reply was cancelled".to_string(),
+        // An empty reason, or a status without one (the adapters never
+        // deliver a Running reply): only "the reply did not finish" is
+        // known.
+        _ => "the reply was incomplete".to_string(),
+    }
 }
 
 fn absorb(
@@ -404,8 +584,88 @@ fn absorb(
             warnings.push(warning);
         }
     }
-    media_artifacts.extend(reply.artifacts);
+    // The adapter's raw media becomes a domain artifact here, where the
+    // run's context exists: provenance names the request the reply
+    // answered. The id stays empty — the promotion below names the
+    // artifact for the whole run.
+    media_artifacts.extend(reply.artifacts.into_iter().map(|raw| Artifact {
+        id: String::new(),
+        kind: raw.kind,
+        mime: raw.mime,
+        format: raw.format,
+        bytes: raw.bytes,
+        provenance: Provenance::Request {
+            index: reply.request_index,
+        },
+    }));
     if reply.status != GenerationStatus::Complete && *overall == GenerationStatus::Complete {
         *overall = reply.status;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_chars_counts_only_what_was_printed_live() {
+        // The same text through a buffered and a live sink: `chars_seen`
+        // grows in both, `live_chars` only where the terminal saw it.
+        let mut buffered = DeltaSink {
+            merged: String::new(),
+            live: false,
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        buffered.emit("一二三");
+        assert_eq!(buffered.chars_seen, 3);
+        assert_eq!(buffered.live_chars, 0);
+
+        // The live sink prints; the test's captured stdout swallows it.
+        let mut live = DeltaSink {
+            merged: String::new(),
+            live: true,
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        live.emit("一二三");
+        live.emit("四");
+        assert_eq!(live.chars_seen, 4);
+        assert_eq!(live.live_chars, 4);
+    }
+
+    #[test]
+    fn batch_failure_carries_the_status_own_reason() {
+        assert_eq!(
+            status_failure(&GenerationStatus::Incomplete {
+                reason: "length".into()
+            }),
+            "length"
+        );
+    }
+
+    #[test]
+    fn batch_failure_names_the_variant_not_a_guess() {
+        // Failed and Cancelled are the status's own words — never a
+        // mislabeled "truncated".
+        assert_eq!(
+            status_failure(&GenerationStatus::Failed),
+            "the reply failed"
+        );
+        assert_eq!(
+            status_failure(&GenerationStatus::Cancelled),
+            "the reply was cancelled"
+        );
+        assert!(
+            !status_failure(&GenerationStatus::Failed).contains("truncated")
+                && !status_failure(&GenerationStatus::Cancelled).contains("truncated")
+        );
+        // A status with no usable reason degrades to the generic wording.
+        assert_eq!(
+            status_failure(&GenerationStatus::Incomplete {
+                reason: String::new()
+            }),
+            "the reply was incomplete"
+        );
     }
 }

@@ -236,6 +236,7 @@ mod tests {
             source: InputSource::Literal,
             name: "--text".into(),
             kind: MediaKind::Text,
+            unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
         }
