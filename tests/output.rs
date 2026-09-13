@@ -538,6 +538,77 @@ fn json_error_report_covers_truncated_generation_exit_four() {
 }
 
 #[test]
+fn json_report_still_prints_when_a_late_refusal_fails_delivery() {
+    // F10 made late refusals exit 5, and F11's fail() skips the Delivery
+    // kind because the delivery path prints its own report — so the
+    // refusal must reach that report. With --json, stdout still carries
+    // exactly one JSON document: the two artifacts, the stdout delivery
+    // (this report), the refused file destination, and the error.
+    let encoded = encode_png();
+    let body = serde_json::json!({"data":[{"b64_json":encoded},{"b64_json":encoded}]}).to_string();
+    let server = Server::json(&body);
+    let dir = temp_dir("json-refusal");
+    let file = dir.join("one.png");
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "-o",
+            file.to_str().unwrap(),
+            "--json",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(5);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
+    assert_eq!(report["version"], 1, "report: {report}");
+    assert_eq!(report["error"]["kind"], "delivery", "report: {report}");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("one file"),
+        "report: {report}"
+    );
+    assert_eq!(report["artifacts"].as_array().unwrap().len(), 2);
+    let deliveries = report["deliveries"].as_array().unwrap();
+    // stdout (this very report) and the refused file
+    assert_eq!(deliveries.len(), 2, "deliveries: {deliveries:?}");
+    assert!(
+        deliveries
+            .iter()
+            .any(|d| d["destination"] == "stdout" && d["status"] == "succeeded"),
+        "deliveries: {deliveries:?}"
+    );
+    assert!(
+        deliveries.iter().any(|d| d["destination"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("one.png")
+            && d["status"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("failed")),
+        "deliveries: {deliveries:?}"
+    );
+    assert!(
+        !file.exists(),
+        "the refused target must not have been written"
+    );
+    assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
+}
+
+#[test]
 fn several_artifacts_cannot_share_bare_stdout() {
     // produce two kinds and pipe stdout: the late check catches it — as a
     // delivery failure (exit 5), since the generation already ran.

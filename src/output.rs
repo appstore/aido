@@ -6,7 +6,9 @@
 //! fails the run with exit code 5; the result itself stays recoverable in
 //! history. The late re-validation refusals count as delivery failures
 //! too: delivery only runs after the generation succeeded, so exit 2
-//! (usage) would claim nothing happened when the model already ran.
+//! (usage) would claim nothing happened when the model already ran —
+//! and a refusal still reaches the JSON report epilogue, so `--json`
+//! keeps one report on every exit code.
 
 use crate::clipboard;
 use crate::domain::{
@@ -88,6 +90,72 @@ fn deliver_inner(
         .iter()
         .filter(|a| args.produce.contains(&a.kind))
         .collect();
+    // Late re-validation: what came back must fit the destinations. A
+    // refusal delivers nothing, but it is not an early return — it still
+    // falls through to the JSON epilogue below, so `--json` keeps its
+    // one-report contract on exit 5 too.
+    if let Some(err) = late_refusal(args, &delivered, states) {
+        *failed = failed.take().or(Some(err));
+    } else {
+        deliver_to_destinations(args, &delivered, states, saved, failed);
+    }
+
+    // --- the JSON report replaces the body on stdout
+    if args.json {
+        // The report itself is the stdout delivery; `-o -` plus --json
+        // must not list stdout twice. Recorded before the report is
+        // built so the report lists it.
+        let report_state = DeliveryState {
+            destination: Destination::Stdout,
+            status: DeliveryStatus::Succeeded,
+        };
+        match states
+            .iter()
+            .position(|s| s.destination == Destination::Stdout)
+        {
+            Some(i) => states[i] = report_state,
+            None => states.insert(0, report_state),
+        }
+        let report = json_report(args, &delivered, states, saved, failed.as_ref());
+        let mut out = std::io::stdout().lock();
+        let print = (|| {
+            serde_json::to_writer_pretty(&mut out, &report)
+                .map_err(|e| AppError::delivery(e.to_string()))?;
+            out.write_all(b"\n")
+                .map_err(|e| AppError::delivery(e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = print {
+            *failed = failed.take().or(Some(e));
+            if let Some(i) = states
+                .iter()
+                .position(|s| s.destination == Destination::Stdout)
+            {
+                states[i] = DeliveryState {
+                    destination: Destination::Stdout,
+                    status: DeliveryStatus::Failed {
+                        error: "json report write failed".into(),
+                    },
+                };
+            }
+        }
+    }
+    if let Some(e) = failed.take() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Late re-validation: what came back must fit the destinations. The
+/// generation already ran, so every refusal below is a delivery failure
+/// (exit 5) with the refused destination recorded — never a usage error,
+/// which would read as "wrong command, nothing happened". Returns the
+/// refusal, or `None` when the artifacts fit and delivery may run.
+fn late_refusal(
+    args: &DeliverArgs<'_>,
+    delivered: &[&Artifact],
+    states: &mut Vec<DeliveryState>,
+) -> Option<AppError> {
     if delivered.is_empty() {
         // Post-generation: the run could not have reached delivery without
         // artifacts in hand, so this is a delivery refusal, not a usage
@@ -101,16 +169,11 @@ fn deliver_inner(
                 },
             });
         }
-        return Err(AppError::delivery(message));
+        return Some(AppError::delivery(message));
     }
-
-    // Late re-validation: what came back must fit the destinations. The
-    // generation already ran, so every refusal below is a delivery
-    // failure (exit 5) with the refused destination recorded — never a
-    // usage error, which would read as "wrong command, nothing happened".
     let has_stdout = args.destinations.contains(&Destination::Stdout);
     if has_stdout && !args.json && delivered.len() > 1 {
-        return Err(refuse_delivery(
+        return Some(refuse_delivery(
             Destination::Stdout,
             "several artifacts cannot share bare stdout; use --out-dir",
             states,
@@ -122,7 +185,7 @@ fn deliver_inner(
     });
     if let Some(path) = &file_dest {
         if delivered.len() != 1 {
-            return Err(refuse_delivery(
+            return Some(refuse_delivery(
                 Destination::File { path: path.clone() },
                 format!(
                     "{} artifacts cannot go to one file ({}); use --out-dir",
@@ -132,39 +195,56 @@ fn deliver_inner(
                 states,
             ));
         }
-        let artifact = delivered[0];
-        if let Err(e) = check_extension(artifact, path) {
-            return Err(refuse_delivery(
+        if let Err(e) = check_extension(delivered[0], path) {
+            return Some(refuse_delivery(
                 Destination::File { path: path.clone() },
                 e,
                 states,
             ));
         }
     }
-    let dir_dest = args.destinations.iter().find_map(|d| match d {
-        Destination::Directory { path } => Some(path.clone()),
-        _ => None,
-    });
     if args.destinations.contains(&Destination::Clipboard) {
         if delivered.len() != 1 {
-            return Err(refuse_delivery(
+            return Some(refuse_delivery(
                 Destination::Clipboard,
                 "the clipboard takes exactly one artifact; use --out-dir",
                 states,
             ));
         }
         if delivered[0].kind == MediaKind::Audio {
-            return Err(refuse_delivery(
+            return Some(refuse_delivery(
                 Destination::Clipboard,
                 "audio cannot go to the clipboard; use -o FILE",
                 states,
             ));
         }
     }
+    None
+}
+
+/// The destination writes: stdout body, single file, directory, then the
+/// clipboard. Every outcome — success or failure — is recorded in
+/// `states`; a failure keeps earlier successes and sets `failed`.
+fn deliver_to_destinations(
+    args: &DeliverArgs<'_>,
+    delivered: &[&Artifact],
+    states: &mut Vec<DeliveryState>,
+    saved: &mut BTreeMap<String, PathBuf>,
+    failed: &mut Option<AppError>,
+) {
+    let has_stdout = args.destinations.contains(&Destination::Stdout);
+    let file_dest = args.destinations.iter().find_map(|d| match d {
+        Destination::File { path } => Some(path.clone()),
+        _ => None,
+    });
+    let dir_dest = args.destinations.iter().find_map(|d| match d {
+        Destination::Directory { path } => Some(path.clone()),
+        _ => None,
+    });
 
     // --- stdout (the body; the JSON report prints later, after paths exist)
     if has_stdout && !args.json {
-        match stdout_body(&delivered, args.live_stdout) {
+        match stdout_body(delivered, args.live_stdout) {
             Ok(()) => states.push(DeliveryState {
                 destination: Destination::Stdout,
                 status: DeliveryStatus::Succeeded,
@@ -211,13 +291,7 @@ fn deliver_inner(
 
     // --- directory with manifest
     if let Some(dir) = &dir_dest {
-        match write_directory(
-            delivered.as_slice(),
-            dir,
-            args.run_id,
-            args.overwrite,
-            args.quiet,
-        ) {
+        match write_directory(delivered, dir, args.run_id, args.overwrite, args.quiet) {
             Ok(paths) => {
                 for (id, path) in paths {
                     saved.insert(id, path);
@@ -271,48 +345,6 @@ fn deliver_inner(
             }
         }
     }
-
-    // --- the JSON report replaces the body on stdout
-    if args.json {
-        // The report itself is the stdout delivery; `-o -` plus --json
-        // must not list stdout twice. Recorded before the report is
-        // built so the report lists it.
-        let report_state = DeliveryState {
-            destination: Destination::Stdout,
-            status: DeliveryStatus::Succeeded,
-        };
-        match states
-            .iter()
-            .position(|s| s.destination == Destination::Stdout)
-        {
-            Some(i) => states[i] = report_state,
-            None => states.insert(0, report_state),
-        }
-        let report = json_report(args, &delivered, states, saved, failed.as_ref());
-        let mut out = std::io::stdout().lock();
-        let print = (|| {
-            serde_json::to_writer_pretty(&mut out, &report)
-                .map_err(|e| AppError::delivery(e.to_string()))?;
-            out.write_all(b"\n")
-                .map_err(|e| AppError::delivery(e.to_string()))?;
-            Ok(())
-        })();
-        if let Err(e) = print {
-            *failed = failed.take().or(Some(e));
-            if let Some(i) = states
-                .iter()
-                .position(|s| s.destination == Destination::Stdout)
-            {
-                states[i] = DeliveryState {
-                    destination: Destination::Stdout,
-                    status: DeliveryStatus::Failed {
-                        error: "json report write failed".into(),
-                    },
-                };
-            }
-        }
-    }
-    Ok(())
 }
 
 /// A refused delivery attempt, recorded and classified. `deliver_inner`
