@@ -465,7 +465,9 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                             "request {}/{} failed: {}",
                             step.index + 1,
                             plan.steps.len(),
-                            error.chain()
+                            // One line: the reason renders inside the
+                            // `history list` status column.
+                            error.chain_inline()
                         ),
                     };
                     // A reduce group has no final result without its reduce
@@ -507,7 +509,10 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                     break;
                 }
                 let g = group.take().unwrap();
-                let message = error.chain();
+                // One line per part: the message feeds the partial-exit
+                // listing and the record's `failed_parts`, both read as
+                // single lines.
+                let message = error.chain_inline();
                 let name = part_name(plan, g.id, &g.stem);
                 warnings.push(format!("part '{name}' failed: {message}"));
                 failed_parts.push(FailedPart {

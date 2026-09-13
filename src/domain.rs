@@ -381,19 +381,40 @@ impl AppError {
     }
 
     /// The message plus every underlying cause, one per line, following
-    /// `source()` to the end of the chain.
+    /// `source()` to the end of the chain. A cause that repeats the text of
+    /// the line before it is skipped, so a `From` conversion that stores one
+    /// error's text as both message and source (as `From<io::Error>` does)
+    /// does not print it twice.
     pub fn chain(&self) -> String {
-        let mut out = self.message.clone();
+        self.chain_lines().join("\n")
+    }
+
+    /// The same walk as [`chain`](Self::chain), joined with `"; "` instead
+    /// of newlines, for contexts that render a single line: history list
+    /// labels and batch part failure listings. The same duplicate-cause
+    /// skip applies.
+    pub fn chain_inline(&self) -> String {
+        self.chain_lines().join("; ")
+    }
+
+    /// The message and every distinct cause text, in chain order. A cause
+    /// whose `to_string()` equals the segment appended just before it is
+    /// dropped: it carries no new information — `From<io::Error>` attaches
+    /// the wrapped error itself, whose text already became the message.
+    fn chain_lines(&self) -> Vec<String> {
+        let mut lines = vec![self.message.clone()];
         let mut cause: Option<&dyn std::error::Error> = match &self.source {
             Some(err) => Some(err.as_ref()),
             None => None,
         };
         while let Some(err) = cause {
-            out.push('\n');
-            out.push_str(&err.to_string());
+            let line = err.to_string();
+            if Some(&line) != lines.last() {
+                lines.push(line);
+            }
             cause = err.source();
         }
-        out
+        lines
     }
 }
 
@@ -516,6 +537,82 @@ mod tests {
         let err = AppError::from(io_err);
         assert!(err.chain().contains("gone"));
         assert_eq!(err.kind.exit_code(), 3);
+    }
+
+    #[test]
+    fn app_error_from_io_error_prints_the_message_once() {
+        // `From<io::Error>` stores the same text as message and source; the
+        // chain walk must not print it twice.
+        let err = AppError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert_eq!(err.chain(), "gone");
+        assert_eq!(err.chain_inline(), "gone");
+    }
+
+    /// A cause layer with fixed text and an optional deeper cause, so tests
+    /// build chains without one struct per layer.
+    #[derive(Debug)]
+    struct Cause {
+        text: &'static str,
+        deeper: Option<Box<Cause>>,
+    }
+
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Cause {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.deeper
+                .as_deref()
+                .map(|c| c as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn app_error_chain_skips_a_repeated_layer_and_keeps_distinct_ones() {
+        // A cause repeating the text of the layer above it carries no new
+        // information and is skipped; the distinct deeper cause still
+        // renders, one line per layer.
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "outer".into(),
+            source: Some(Box::new(Cause {
+                text: "outer",
+                deeper: Some(Box::new(Cause {
+                    text: "deep cause",
+                    deeper: None,
+                })),
+            })),
+        };
+        let chain = err.chain();
+        let lines: Vec<&str> = chain.lines().collect();
+        assert_eq!(lines, ["outer", "deep cause"]);
+    }
+
+    #[test]
+    fn app_error_chain_inline_joins_one_line_and_dedups() {
+        // Same walk as chain(), but "; "-joined and with the same duplicate
+        // skip: single-line contexts (history list labels, batch part
+        // failure listings) get every distinct layer on their one row.
+        let err = AppError {
+            kind: ErrorKind::Service,
+            message: "top message".into(),
+            source: Some(Box::new(Cause {
+                text: "top message",
+                deeper: Some(Box::new(Cause {
+                    text: "mid cause",
+                    deeper: Some(Box::new(Cause {
+                        text: "leaf cause",
+                        deeper: None,
+                    })),
+                })),
+            })),
+        };
+        let inline = err.chain_inline();
+        assert_eq!(inline, "top message; mid cause; leaf cause");
+        assert!(!inline.contains('\n'));
     }
 
     #[test]

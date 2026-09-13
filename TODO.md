@@ -429,7 +429,7 @@
   - out-dir manifest 会写 `{"type":"restored"}`（tests/provenance.rs:293 直接断言了这一点）；历史 `ManifestArtifact` 不存 provenance，恢复链路丢「哪个请求产出什么」。
   - 方案：`ManifestArtifact` 加 `#[serde(default)] provenance: Option<Provenance>`，save 写入 / load 读回（缺省退 `Restored`，老记录可读）；修正 domain.rs 注释；更新 provenance.rs 测试 + 老记录兼容测试。
 
-- [ ] **R11 · 低 · `src/domain.rs:419` · `From<io::Error>` 双写导致 `chain()` 打印两遍；多行 chain 进单行上下文**
+- [x] **R11 · 低 · `src/domain.rs:419` · `From<io::Error>` 双写导致 `chain()` 打印两遍；多行 chain 进单行上下文**
   - 同一错误进 `message` 和 `source`；`generation_label()` 的 `incomplete ({reason})` 是 `history list` 的单行表格。
   - 方案：`chain()` 跳过与 message 完全相同的首层 cause；新增 `chain_inline()`（换行 → `"; "`）；runner.rs:436/:452 改用 inline。
 
