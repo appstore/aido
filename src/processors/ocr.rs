@@ -430,9 +430,9 @@ mod tests {
         png
     }
 
-    fn image_part(png: Vec<u8>) -> InputPart {
+    fn image_part(id: usize, png: Vec<u8>) -> InputPart {
         InputPart {
-            id: 0,
+            id,
             source: InputSource::File("long.png".into()),
             name: "long.png".into(),
             kind: MediaKind::Image,
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn short_images_pass_through_untouched() {
-        let steps = plan_steps(&[image_part(solid_png(100, 500))], true).unwrap();
+        let steps = plan_steps(&[image_part(0, solid_png(100, 500))], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].inputs.len(), 1);
         assert_eq!(steps[0].label, "all material");
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn tall_image_produces_sequential_slices_that_tile_it() {
-        let steps = plan_steps(&[image_part(solid_png(100, 3200))], true).unwrap();
+        let steps = plan_steps(&[image_part(0, solid_png(100, 3200))], true).unwrap();
         assert_eq!(steps.len(), 2);
         assert!(steps[0].label.contains("slice 1/2"));
         let (w1, h1) = dims(match &steps[0].inputs[0].content {
@@ -563,8 +563,8 @@ mod tests {
     #[test]
     fn unsliced_material_travels_with_every_slice_in_order() {
         let inputs = vec![
-            image_part(solid_png(100, 500)),
-            image_part(striped_png(100, 3200)),
+            image_part(0, solid_png(100, 500)),
+            image_part(1, striped_png(100, 3200)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert_eq!(steps.len(), 2);
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn text_material_rides_with_every_slice_until_over_budget() {
         let small = vec![
-            image_part(striped_png(100, 3200)),
+            image_part(0, striped_png(100, 3200)),
             text_part("see headers only"),
         ];
         let steps = plan_steps(&small, true).unwrap();
@@ -597,7 +597,7 @@ mod tests {
         }
         // Over the carry budget: the text rides with the first request only.
         let big = "词".repeat(super::super::MAX_CARRY_CHARS + 1);
-        let over = vec![text_part(&big), image_part(striped_png(100, 3200))];
+        let over = vec![text_part(&big), image_part(0, striped_png(100, 3200))];
         let steps = plan_steps(&over, true).unwrap();
         assert!(steps[0].inputs.iter().any(|p| p.name == "notes"));
         assert!(!steps[1].inputs.iter().any(|p| p.name == "notes"));
@@ -708,7 +708,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let steps = plan_steps(&[image_part(png)], true).unwrap();
+        let steps = plan_steps(&[image_part(0, png)], true).unwrap();
         assert_eq!(steps.len(), 3, "two cuts expected");
         assert!(!steps[0].hard_cut_end, "quiet boundary must not gate");
         assert!(steps[1].hard_cut_end, "hard boundary must gate");
@@ -717,10 +717,10 @@ mod tests {
 
     #[test]
     fn slice_labels_name_their_own_image() {
-        let small = image_part(solid_png(100, 500));
+        let small = image_part(0, solid_png(100, 500));
         let tall = InputPart {
             name: "other.png".into(),
-            ..image_part(striped_png(100, 3200))
+            ..image_part(1, striped_png(100, 3200))
         };
         let steps = plan_steps(&[small, tall], true).unwrap();
         let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();

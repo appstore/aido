@@ -484,9 +484,9 @@ mod tests {
     use super::*;
     use crate::domain::InputSource;
 
-    fn text_part(name: &str, text: &str) -> InputPart {
+    fn text_part(id: usize, name: &str, text: &str) -> InputPart {
         InputPart {
-            id: 0,
+            id,
             source: InputSource::File(name.into()),
             name: name.into(),
             kind: MediaKind::Text,
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn short_text_passes_through_unsplit() {
-        let steps = plan_steps(&[text_part("a.txt", "hello")], true).unwrap();
+        let steps = plan_steps(&[text_part(0, "a.txt", "hello")], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].label, "all material");
         assert_eq!(steps[0].inputs.len(), 1);
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn long_text_produces_ordered_labeled_chunks() {
         let text = para(600); // ~17k chars
-        let steps = plan_steps(&[text_part("book.txt", &text)], true).unwrap();
+        let steps = plan_steps(&[text_part(0, "book.txt", &text)], true).unwrap();
         assert!(
             steps.len() >= 3,
             "expected several chunks, got {}",
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn context_excerpt_comes_from_the_previous_chunk_tail() {
         let text = para(600);
-        let steps = plan_steps(&[text_part("book.txt", &text)], true).unwrap();
+        let steps = plan_steps(&[text_part(0, "book.txt", &text)], true).unwrap();
         let first = steps[0].inputs.last().unwrap().text().unwrap();
         let context = steps[1].inputs[1].text().unwrap();
         let tail = context_tail(first);
@@ -625,8 +625,8 @@ mod tests {
     #[test]
     fn unsliced_material_travels_with_every_chunk_in_order() {
         let inputs = vec![
-            text_part("small.txt", "hello"),
-            text_part("book.txt", &para(600)),
+            text_part(0, "small.txt", "hello"),
+            text_part(1, "book.txt", &para(600)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert!(steps.len() >= 3);
@@ -649,8 +649,8 @@ mod tests {
         // The long document listed first: its chunk keeps the front spot in
         // every request, the glossary rides behind it.
         let inputs = vec![
-            text_part("book.txt", &para(600)),
-            text_part("gloss.txt", "terms"),
+            text_part(0, "book.txt", &para(600)),
+            text_part(1, "gloss.txt", "terms"),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         for (i, step) in steps.iter().enumerate() {
@@ -671,8 +671,8 @@ mod tests {
         let glossary = "词".repeat(super::super::MAX_CARRY_CHARS + 1);
         assert!(char_len(&glossary) < TARGET_CHUNK_CHARS);
         let inputs = vec![
-            text_part("gloss.txt", &glossary),
-            text_part("book.txt", &para(600)),
+            text_part(0, "gloss.txt", &glossary),
+            text_part(1, "book.txt", &para(600)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         assert!(steps.len() >= 3);
@@ -688,9 +688,9 @@ mod tests {
     #[test]
     fn a_second_chunked_part_travels_in_its_own_steps_only() {
         let inputs = vec![
-            text_part("a.txt", &para(600)),
-            text_part("shared.txt", "hello"),
-            text_part("b.txt", &para(600)),
+            text_part(0, "a.txt", &para(600)),
+            text_part(1, "shared.txt", "hello"),
+            text_part(2, "b.txt", &para(600)),
         ];
         let steps = plan_steps(&inputs, true).unwrap();
         let mut seen_b = false;
@@ -764,7 +764,7 @@ mod tests {
         // No paragraphs at all: chunking would stage a run with zero
         // requests, so the text must fall back to the single-request path.
         let text = " \n ".repeat(2000);
-        let steps = plan_steps(&[text_part("pad.txt", &text)], true).unwrap();
+        let steps = plan_steps(&[text_part(0, "pad.txt", &text)], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].label, "all material");
         assert_eq!(steps[0].inputs.len(), 1);
@@ -775,14 +775,14 @@ mod tests {
         // Just over target with no cut points: the tail fold leaves a
         // single chunk, which is the single-request path with extra steps.
         let text = "x".repeat(TARGET_CHUNK_CHARS + 2);
-        let steps = plan_steps(&[text_part("one.txt", &text)], true).unwrap();
+        let steps = plan_steps(&[text_part(0, "one.txt", &text)], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].label, "all material");
     }
 
     #[test]
     fn reduce_plan_appends_one_reduce_step_after_the_maps() {
-        let input = [text_part("book.txt", &para(600))];
+        let input = [text_part(0, "book.txt", &para(600))];
         let steps = plan_steps_reduce(&input, true).unwrap();
         let maps = plan_steps(&input, true).unwrap();
         assert_eq!(steps.len(), maps.len() + 1);
@@ -803,7 +803,7 @@ mod tests {
     fn reduce_plan_skips_the_reduce_step_for_a_single_chunk() {
         // One chunk is the whole document; consolidating it with itself
         // would be an extra request for nothing.
-        let steps = plan_steps_reduce(&[text_part("a.txt", "hello")], true).unwrap();
+        let steps = plan_steps_reduce(&[text_part(0, "a.txt", "hello")], true).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].role, StepRole::Map);
         assert_eq!(steps[0].label, "all material");

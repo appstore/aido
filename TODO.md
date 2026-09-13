@@ -436,7 +436,7 @@
 - [x] **R12 · 低 · `src/output.rs:471` · `current_umask()` 每产物调一次，进程级窗口**
   - 方案：缓存 `OnceLock<u32>`。
 
-- [ ] **R13 · 低 · `src/processors/mod.rs:144` · `step_material` 用 `ptr::eq` 判断源 part，失配静默**
+- [x] **R13 · 低 · `src/processors/mod.rs:144` · `step_material` 用 `ptr::eq` 判断源 part，失配静默**
   - 方案：改按 `InputPart.id` 比较；循环后 `debug_assert!(piece.is_none())`。
 
 - [ ] **R14 · 低 · `src/input.rs:113` · fd 0 已关闭时探测返回 true**

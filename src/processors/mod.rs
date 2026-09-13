@@ -130,7 +130,11 @@ pub(crate) fn text_chars(parts: &[InputPart]) -> usize {
 /// a slice the tall image), the other split parts' pieces stay out — each
 /// travels in its own steps — and unsliced material rides along unless
 /// `carry` is false, the budget fallback that leaves it on the first
-/// request.
+/// request. The source part and the split parts are matched by `id`
+/// (unique within a run: parts are numbered at gather time), not by
+/// pointer, so a cloned `InputPart` still matches — a pointer comparison
+/// would silently drop the piece if a `.clone()` ever slipped between
+/// slicing and calling.
 pub(crate) fn step_material(
     inputs: &[InputPart],
     source: &InputPart,
@@ -141,13 +145,21 @@ pub(crate) fn step_material(
     let mut piece = Some(piece);
     let mut out = Vec::with_capacity(inputs.len());
     for input in inputs {
-        if std::ptr::eq(input, source) {
-            // `source` is one of `inputs`, so its piece slots in exactly once.
+        if input.id == source.id {
+            // The source's id is unique among `inputs`, so its piece slots
+            // in exactly once.
             out.push(piece.take().unwrap());
-        } else if carry && !split.iter().any(|p| std::ptr::eq(*p, input)) {
+        } else if carry && !split.iter().any(|p| p.id == input.id) {
             out.push(input.clone());
         }
     }
+    // The id contract violated (a source id absent from `inputs`) would
+    // silently drop the piece from the request; make it loud in debug.
+    debug_assert!(
+        piece.is_none(),
+        "step_material: the source part ({}) was not found in inputs",
+        source.id
+    );
     out
 }
 
@@ -191,6 +203,26 @@ mod tests {
         let split = vec![&inputs[1], &inputs[2]];
         let material = step_material(&inputs, &inputs[1], piece, &split, true);
         assert_eq!(names(&material), vec!["glossary", "a [chunk 1/2]"]);
+    }
+
+    #[test]
+    fn cloned_source_and_split_parts_still_match_by_id() {
+        // Matching is by part id, not pointer: a caller that clones the
+        // source or the split parts before calling (pointer equality would
+        // then never fire) still sees the piece slot in at the source's
+        // position and the split parts stay out under carry.
+        let inputs = [part(0, "glossary"), part(1, "book"), part(2, "notes")];
+        let source = inputs[1].clone();
+        let split_owned = [inputs[1].clone(), inputs[2].clone()];
+        let split: Vec<&InputPart> = split_owned.iter().collect();
+        let piece = part(1, "book [chunk 1/2]");
+        let material = step_material(&inputs, &source, piece, &split, true);
+        assert_eq!(
+            names(&material),
+            vec!["glossary", "book [chunk 1/2]"],
+            "the piece replaces the cloned source's position; cloned split \
+             parts are still excluded"
+        );
     }
 
     #[test]
