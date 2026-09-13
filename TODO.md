@@ -17,6 +17,7 @@
 | 4    | 契约一致性                 | F10 F11 F14 F15 F16 F19     | 让 README 里写的退出码契约和 `--json` 契约真正成立，并清掉两处会误导后续维护者的结构。                                                                     |
 | 5    | 死代码、依赖与文档         | F18 F20 F21 F22 F23 F24 F25 | 清理三处死代码、补齐 dry-run 的参数来源、消除硬编码、修正文档与行为。均为低风险独立改动，可并行。                                                          |
 | 6    | 追加审阅（af6f9c5 合并后） | F27 F28 F29 F30 F31 F32 F33 | 2 中 5 低；F29–F33 均为小改动，可并行。                                                                                                                    |
+| 7    | 第四批次复审残留           | F34 F35 F36                 | 1 中 2 低；均为批次间交互/边界（F34×F11、F35×F10 精神、F36×F11 范围外），F34 与 F35 同在 `deliver_inner`。                                                    |
 
 ---
 
@@ -346,6 +347,30 @@
   - 问题：runner 以「`g.id != step.part` 即边界」来 close group，要求同一 part 的 steps 必须连续。当前 `perpart::plan_steps` 按 part 顺序 append，保证成立；但 `RequestStep.part` 是公开字段，未来任何 processor 或对 steps 的重排/过滤一旦交错 part，行为不是报错而是静默错误：同 part 被拆成多个 group、同 stem 产出两个同名 artifact，在 `write_directory` 里互相冲突。
   - 方案：建议在 plan 构建后加一条顺序断言（part id 非降序），把违约变成显式 usage 错误。
   - 测试（※补全）：构造交错 steps（单测）→ 报错。
+
+---
+
+# 第三部分 · 第四批次复审（2026-09-13）
+
+## 背景与结论
+
+- 对第四批次（F10 F11 F14 F15 F16 F19）的六条修复做统一 review：实现与测试全部符合本文件方案；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（352 通过、0 失败、1 忽略）全绿。
+- 复审发现三个残留（1 中 2 低），均为批次间/边界交互，不在原 33 条的字面范围内。实测证据：两图 + `--json -o one.png` → 退出 5、stdout 0 字节；同参数换 `--out-dir`（预检失败）→ 退出 5、stdout 971 字节完整报告。
+
+- [ ] **F34 · 中 · `src/output.rs` · 退出码 5 内部不一致：交付期拒绝在 `--json` 下不输出任何报告（F10×F11 交互）**
+  - 问题：F10 把交付期拒绝从退出 2 改为退出 5，但 `refuse_delivery` 从 `deliver_inner` 提前 `return Err`，跳过函数尾部 `if args.json` 的报告块；F11 又在 `fail()` 里把 Delivery 类排除在 `error_report` 之外（避免与交付路径的完整报告重复——对写文件/目录/剪贴板失败是对的，它们走 push-状态-继续）。两个决定各自正确，组合结果：同为退出 5，写文件/写目录失败有 JSON 报告，拒绝路径（`N artifacts cannot go to one file`、扩展名不符、`nothing to deliver`）stdout 为空。README 的「`--json`：stdout 输出版本化运行报告」在退出 5 上只对了一半，脚本无法统一解析。
+  - 方案：把全部拒绝判定收进 `late_refusal()`（记录状态、返回错误）；`deliver_inner` 拒绝时跳过实际交付、但仍落到尾部 JSON 尾声（`--json` 下报告即 stdout 的交付，被拒目标在 `deliveries` 里标 failed）；结尾统一按 `failed` 返回 Err。`fail()` 的排除保持不变——交付路径至此必已打印报告。
+  - 测试：两图 + `--json -o one.png` → 退出 5、stdout 恰一份合法 JSON、`error.kind = delivery`、`artifacts` 为 2、`deliveries` 含 failed 的 file 与 succeeded 的 stdout（报告本身）。
+
+- [ ] **F35 · 低 · `src/output.rs:148` · 剪贴板两条交付拒绝不记录 DeliveryState（F10 精神残留）**
+  - 问题：「the clipboard takes exactly one artifact」「audio cannot go to the clipboard」两条早退分类正确（退出 5）但不 push 状态就返回，`record.deliveries` 为空——正是 F10 批评的「历史里看不出交付尝试过」，只是这两条在 F10 之前就是 delivery 分类，不在原 finding 点名的三处 usage 之内，非回归。
+  - 方案：改走 `refuse_delivery`，记录后再返回。
+  - 测试：`image --count 2 --copy --out-dir` → 退出 5、manifest `deliveries` 记录 clipboard failed、目录未写任何文件、`last --out-dir` 可恢复两图。
+
+- [ ] **F36 · 低 · `src/app.rs:59` · clap 解析错误的 `--json` 无报告（F11 范围外残留）**
+  - 问题：未知旗标等错误由 `Cli::try_parse_from` 的 Err 分支直接退出 2，不经过 `fail()`；argv 里有 `--json` 时 stdout 仍为空。F11 只覆盖了 normalize 失败与 `fail()` 两条路径。
+  - 方案：该分支里 `e.use_stderr()` 为真且朴素扫描命中 `--json` 时，先把 `error_report(Usage, …)` 打到 stdout，再 `e.print()` 到 stderr；help/version（退出 0）不受影响。`--json=true` 这类畸形写法朴素扫描不命中，维持现状（可接受，与 normalize 路径同一取舍）。
+  - 测试：`--json --bogus-flag` → 退出 2、stdout 一份合法 JSON、`error.kind = usage`、stderr 仍含 clap 的报错。
 
 ---
 
