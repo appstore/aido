@@ -8,7 +8,7 @@
 //! lines the overlap bands genuinely duplicated.
 
 use super::{carry_guard, step_material, synthetic_text, RequestStep, StepRole};
-use crate::api::{ensure_decode_size, image_as_png, image_dimensions};
+use crate::api::{ensure_decode_size, image_dimensions};
 use crate::domain::{InputPart, MediaKind};
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -126,9 +126,10 @@ fn slice_if_tall(part: &InputPart, quiet: bool) -> Result<Option<(Vec<InputPart>
         return Ok(None);
     }
 
-    let png = image_as_png(part)?;
-    let img =
-        image::load_from_memory(&png).with_context(|| "failed to decode tall image for slicing")?;
+    // Decode the original bytes once — the intermediate PNG the adapter
+    // boundary needs would cost a second full decode plus a re-encode.
+    let img = image::load_from_memory(bytes)
+        .with_context(|| format!("failed to decode tall image '{}'", part.name))?;
     let rgba = img.to_rgba8();
     let gray = image::imageops::grayscale(&rgba);
     let energies = row_energies(&gray);
@@ -498,6 +499,20 @@ mod tests {
         }
     }
 
+    /// A real tall JPEG (unlike [`jpeg_declaring`], the pixels match the
+    /// header), so the slicing path actually decodes it.
+    fn tall_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = image::GrayImage::from_pixel(w, h, image::Luma([128]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        jpg
+    }
+
     #[test]
     fn decompression_bomb_jpegs_are_refused_before_any_decode() {
         // Square (would not even be split) and tall (would be sliced):
@@ -521,6 +536,27 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].label, "all material");
         assert_eq!(steps[0].inputs[0].content, InputContent::Media(jpg));
+    }
+
+    #[test]
+    fn tall_jpeg_slices_reach_the_adapter_boundary_as_png() {
+        // The tiler decodes the original JPEG directly, but what it emits
+        // must still be PNG — the only encoding the chat/responses routes
+        // send.
+        let steps = plan_steps(&[jpeg_part(tall_jpeg(100, 3200))], true).unwrap();
+        assert_eq!(steps.len(), 2);
+        for step in &steps {
+            let slice = step
+                .inputs
+                .iter()
+                .find(|p| p.name.contains("[slice "))
+                .expect("every step carries a slice");
+            assert_eq!(slice.mime, "image/png");
+            match &slice.content {
+                InputContent::Media(b) => assert!(b.starts_with(b"\x89PNG")),
+                _ => panic!("slice is not media"),
+            }
+        }
     }
 
     #[test]
