@@ -10,7 +10,8 @@ use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
 use crate::domain::{
-    extension_matches_format, AppError, AppResult, Destination, InputPart, MediaKind, RunSummary,
+    extension_matches_format, first_line, AppError, AppResult, Destination, InputPart, MediaKind,
+    RunSummary,
 };
 use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
@@ -793,10 +794,16 @@ pub fn describe(plan: &ExecutionPlan) -> String {
     }
     out.push_str(&format!("model:       {}\n", r.model));
     if !plan.instruction.is_empty() {
-        out.push_str(&format!("instruction: {}\n", first_line(&plan.instruction)));
+        out.push_str(&format!(
+            "instruction: {}\n",
+            first_line(&plan.instruction, DRY_RUN_LINE_MAX)
+        ));
     }
     if let Some(req) = &plan.requirement {
-        out.push_str(&format!("requirement: {}\n", first_line(req)));
+        out.push_str(&format!(
+            "requirement: {}\n",
+            first_line(req, DRY_RUN_LINE_MAX)
+        ));
     }
     out.push_str("material:\n");
     if plan.inputs.is_empty() {
@@ -941,18 +948,9 @@ pub fn describe(plan: &ExecutionPlan) -> String {
     out
 }
 
-fn first_line(s: &str) -> String {
-    let line = s
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if line.chars().count() > 72 {
-        format!("{}...", line.chars().take(72).collect::<String>())
-    } else {
-        line.to_string()
-    }
-}
+/// How many chars of the instruction/requirement the dry-run report shows:
+/// a conventional full terminal line's worth of text, elided past that.
+const DRY_RUN_LINE_MAX: usize = 72;
 
 /// Whether the run would actually carry a key — by the shared judgment
 /// (`config::effective_key_env`) the runner's send-time resolution also

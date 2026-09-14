@@ -4,7 +4,8 @@
 use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
 use crate::config;
 use crate::domain::{
-    AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind, RunRecord, RunSummary,
+    first_line, AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind,
+    RunRecord, RunSummary,
 };
 use crate::history::{self, civil_from_days};
 use crate::input::InputEnv;
@@ -670,6 +671,11 @@ fn generation_label(status: &GenerationStatus) -> String {
 // Management commands
 // ---------------------------------------------------------------------------
 
+/// How many chars of the instruction column `tasks list` shows: narrower
+/// than a full report line (see plan::DRY_RUN_LINE_MAX) because the row
+/// also carries the task name, operation and output types.
+const TASKS_LIST_INSTRUCTION_MAX: usize = 64;
+
 fn manage_tasks(cmd: &TasksCmd) -> AppResult<()> {
     match cmd {
         TasksCmd::List => {
@@ -677,7 +683,7 @@ fn manage_tasks(cmd: &TasksCmd) -> AppResult<()> {
             for (name, task) in &all {
                 println!(
                     "{name:<14} {} [{}, {}]",
-                    first_line(&task.instruction),
+                    first_line(&task.instruction, TASKS_LIST_INSTRUCTION_MAX),
                     task.operation,
                     task.output_types
                         .iter()
@@ -766,19 +772,6 @@ fn processor_name(kind: crate::tasks::ProcessorKind) -> &'static str {
         crate::tasks::ProcessorKind::OcrTiles => "ocr-tiles",
         crate::tasks::ProcessorKind::ChunkJoin => "chunk-join",
         crate::tasks::ProcessorKind::ChunkReduce => "chunk-reduce",
-    }
-}
-
-fn first_line(s: &str) -> String {
-    let line = s
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if line.chars().count() > 64 {
-        format!("{}...", line.chars().take(64).collect::<String>())
-    } else {
-        line.to_string()
     }
 }
 
