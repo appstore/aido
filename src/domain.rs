@@ -20,6 +20,24 @@ pub(crate) fn extension_matches_format(extension: &str, format: &str) -> bool {
         || (extension == "ogg" && format == "opus")
 }
 
+/// The first non-empty line of `text`, elided on char boundaries once it
+/// exceeds `max_chars` chars (a trailing `...` marks the cut). One-liners
+/// for human-facing summaries: how wide a line may get is the caller's
+/// layout decision (a report line and a table column differ), so the
+/// width is a parameter rather than a constant hidden in here.
+pub(crate) fn first_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() > max_chars {
+        format!("{}...", line.chars().take(max_chars).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 /// The three content kinds aido understands on either side of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -509,6 +527,36 @@ mod tests {
         assert!(!extension_matches_format("png", "mp3"));
         assert!(!extension_matches_format("jpeg", "jpg"));
         assert!(!extension_matches_format("JPG", "jpeg"));
+    }
+
+    #[test]
+    fn first_line_takes_the_first_non_empty_line() {
+        // Leading blank and indented lines are skipped; the survivor is
+        // trimmed, and a text with no content at all yields "".
+        assert_eq!(first_line("\n  \nsecond line\nthird", 64), "second line");
+        assert_eq!(first_line("  padded  ", 64), "padded");
+        assert_eq!(first_line("", 64), "");
+        assert_eq!(first_line("\n \n", 64), "");
+    }
+
+    #[test]
+    fn first_line_elides_only_past_the_limit() {
+        // At exactly max chars the line is kept whole; one char more and
+        // it is cut to max chars plus the `...` marker.
+        let exact: String = "x".repeat(8);
+        assert_eq!(first_line(&exact, 8), exact);
+        let over = format!("{exact}y");
+        let expected = format!("{exact}...");
+        assert_eq!(first_line(&over, 8), expected);
+    }
+
+    #[test]
+    fn first_line_counts_chars_not_bytes_so_cjk_survives_the_cut() {
+        // 8 CJK chars are 24 bytes; eliding at 5 chars must keep whole
+        // characters, not slice through a multi-byte sequence.
+        assert_eq!(first_line("一二三四五六七八", 8), "一二三四五六七八");
+        assert_eq!(first_line("一二三四五六七八", 5), "一二三四五...");
+        assert_eq!(first_line("一二三四五六七八", 2), "一二...");
     }
 
     #[test]

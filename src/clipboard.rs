@@ -52,7 +52,7 @@ pub fn write_text(text: &str, hold_secs: u64) -> Result<()> {
             .map_err(|e| anyhow!("failed to write clipboard: {e}"))?;
     }
     #[cfg(target_os = "linux")]
-    spawn_holder(text, hold_secs);
+    spawn_holder(text.as_bytes(), hold_secs, false);
     #[cfg(not(target_os = "linux"))]
     let _ = hold_secs;
     Ok(())
@@ -61,31 +61,57 @@ pub fn write_text(text: &str, hold_secs: u64) -> Result<()> {
 /// On X11 (and Wayland data-control, which serves pastes lazily too) the
 /// clipboard dies with the process that wrote it. A detached child re-owns
 /// the clipboard and holds it for a few seconds, mirroring what `xclip` /
-/// `wl-copy` do internally. The child inherits stderr so a failed hold is
-/// reported instead of silently dropping the contents.
+/// `wl-copy` do internally. The child inherits stderr, and a hold that
+/// fails on this side is reported too — as a warning, never a delivery
+/// error: the clipboard write has already succeeded, so the delivery stays
+/// a success and only the contents' lifetime past this process is at risk.
 #[cfg(target_os = "linux")]
-fn spawn_holder(text: &str, hold_secs: u64) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
+fn spawn_holder(payload: &[u8], hold_secs: u64, image: bool) {
     if hold_secs == 0 {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
+    let held = match std::env::current_exe() {
+        Ok(exe) => hold_via(&exe, payload, hold_secs, image),
+        Err(e) => Err(anyhow::Error::new(e).context("cannot locate the aido binary")),
     };
-    let Ok(mut child) = Command::new(exe)
-        .arg("__hold")
-        .arg(hold_secs.to_string())
+    if let Err(e) = held {
+        eprintln!("{}", hold_warning(&e));
+    }
+}
+
+/// Spawn `<exe> __hold SECS [--image]`, hand it `payload` on stdin, and
+/// drop the pipe so the child can take over the clipboard. The binary path
+/// is a parameter rather than always `current_exe()` so tests can drive
+/// the failure path with a path that cannot be spawned.
+#[cfg(target_os = "linux")]
+fn hold_via(exe: &std::path::Path, payload: &[u8], hold_secs: u64, image: bool) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("__hold").arg(hold_secs.to_string());
+    if image {
+        cmd.arg("--image");
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-    else {
-        return;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-    }
+        .context("cannot start the holder child")?;
+    child
+        .stdin
+        .take()
+        .context("holder child has no stdin")?
+        .write_all(payload)
+        .context("the holder child did not receive the contents")?;
+    Ok(())
+}
+
+/// The stderr line a failed hold produces. Kept as its own function so the
+/// exact wording the user sees is assertable in tests.
+#[cfg(target_os = "linux")]
+fn hold_warning(err: &anyhow::Error) -> String {
+    format!("warning: clipboard contents may not outlive this process (hold failed: {err:#})")
 }
 
 /// Decode clipboard-bound image bytes to RGBA. The declared dimensions
@@ -116,24 +142,7 @@ pub fn write_image(bytes: &[u8], hold_secs: u64) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("cannot access the clipboard")?;
     set_image(&mut cb, bytes)?;
     #[cfg(target_os = "linux")]
-    {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        if hold_secs > 0 {
-            let mut child = Command::new(std::env::current_exe()?)
-                .arg("__hold")
-                .arg(hold_secs.to_string())
-                .arg("--image")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()?;
-            child
-                .stdin
-                .take()
-                .context("clipboard holder stdin unavailable")?
-                .write_all(bytes)?;
-        }
-    }
+    spawn_holder(bytes, hold_secs, true);
     #[cfg(not(target_os = "linux"))]
     let _ = hold_secs;
     Ok(())
@@ -183,5 +192,55 @@ mod tests {
     fn clipboard_decode_returns_rgba_for_small_images() {
         let rgba = decode_for_clipboard(&tiny_jpeg()).unwrap();
         assert_eq!(rgba.dimensions(), (2, 2));
+    }
+
+    /// A path that can never be spawned — the same class of failure
+    /// `spawn_holder` hits in production when the aido binary was deleted
+    /// or swapped mid-run, or the environment forbids forking.
+    #[cfg(target_os = "linux")]
+    fn unspawnable_exe() -> std::path::PathBuf {
+        std::path::PathBuf::from("/nonexistent/aido-holder")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn holder_spawn_failure_is_a_warning_not_an_error() {
+        // The failure path must come back as an error the caller turns into
+        // the stderr warning — never a panic, never a propagation that
+        // would fail the (already successful) clipboard delivery.
+        let err = hold_via(&unspawnable_exe(), b"payload", 5, false).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("cannot start the holder child"), "{chain}");
+        let warning = hold_warning(&err);
+        assert!(warning.starts_with("warning: "), "{warning}");
+        assert!(
+            warning.contains("clipboard contents may not outlive this process"),
+            "{warning}"
+        );
+        assert!(warning.contains("hold failed"), "{warning}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_holder_takes_the_same_warning_path() {
+        let err = hold_via(&unspawnable_exe(), b"png-bytes", 5, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot start the holder child"),
+            "{err:#}"
+        );
+        let warning = hold_warning(&err);
+        assert!(
+            warning.contains("clipboard contents may not outlive this process"),
+            "{warning}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_hold_secs_never_spawns_the_holder() {
+        // hold_secs == 0 short-circuits before any spawn machinery runs,
+        // so there is no failure mode to report and no child to leave.
+        spawn_holder(b"payload", 0, false);
+        spawn_holder(b"payload", 0, true);
     }
 }

@@ -158,14 +158,11 @@ impl SliceMerger {
 /// replies that did arrive, and the error itself in `failure` — the
 /// caller records the partial generation instead of losing it.
 pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
-    let api_key = plan.resolved.api_key_env.as_deref().and_then(|name| {
-        // The default provider also accepts the conventional OpenAI name.
-        env_key(name).or_else(|| {
-            (name == "AIDO_API_KEY")
-                .then(|| env_key("OPENAI_API_KEY"))
-                .flatten()
-        })
-    });
+    // The same shared judgment the dry-run's credential line uses: the
+    // provider's variable, or the conventional OpenAI name when the
+    // default provider's key falls back to it.
+    let api_key =
+        crate::config::effective_key_env(plan.resolved.api_key_env.as_deref()).and_then(env_key);
     let conn = Connection {
         base_url: plan.resolved.base_url.clone(),
         api_key,

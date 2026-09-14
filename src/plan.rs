@@ -10,7 +10,8 @@ use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
 use crate::domain::{
-    extension_matches_format, AppError, AppResult, Destination, InputPart, MediaKind, RunSummary,
+    extension_matches_format, first_line, AppError, AppResult, Destination, InputPart, MediaKind,
+    RunSummary,
 };
 use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
@@ -247,15 +248,18 @@ pub fn build(
 
     // Credential reference only: never the value. Adapters that own their
     // endpoint (edge-tts) take no credentials, so their plans report
-    // "none required" instead of pointing at a key that is never sent.
+    // "none required" instead of pointing at a key that is never sent —
+    // and so does a provider that names no env var at all. Anything else
+    // gets the same judgment the runner's send-time resolution uses,
+    // fallback included, so the dry-run cannot prophesy a failure the
+    // real run would not have.
     let credentials_available = if resolved.adapter == crate::api::Adapter::EdgeTts {
         None
     } else {
-        resolved.api_key_env.as_ref().map(|name| {
-            std::env::var(name)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-        })
+        resolved
+            .api_key_env
+            .is_some()
+            .then(|| crate::config::effective_key_env(resolved.api_key_env.as_deref()).is_some())
     };
 
     let param_sources = describe_param_sources(cli, task, &resolved);
@@ -673,9 +677,15 @@ fn resolve_destinations(
             .iter()
             .all(|d| matches!(d, Destination::Stdout))
     {
-        return Err(AppError::usage(
-            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe",
-        ));
+        // With --json the sole Stdout destination is the report itself,
+        // which carries no artifact bytes: say so instead of the generic
+        // binary-needs-a-home advice, which reads like a missing flag.
+        return Err(AppError::usage(if cli.json {
+            "the --json report carries no artifact bytes; add -o FILE or \
+             --out-dir so the generated artifact lands somewhere (or pipe stdout)"
+        } else {
+            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe"
+        }));
     }
     Ok(destinations)
 }
@@ -784,10 +794,16 @@ pub fn describe(plan: &ExecutionPlan) -> String {
     }
     out.push_str(&format!("model:       {}\n", r.model));
     if !plan.instruction.is_empty() {
-        out.push_str(&format!("instruction: {}\n", first_line(&plan.instruction)));
+        out.push_str(&format!(
+            "instruction: {}\n",
+            first_line(&plan.instruction, DRY_RUN_LINE_MAX)
+        ));
     }
     if let Some(req) = &plan.requirement {
-        out.push_str(&format!("requirement: {}\n", first_line(req)));
+        out.push_str(&format!(
+            "requirement: {}\n",
+            first_line(req, DRY_RUN_LINE_MAX)
+        ));
     }
     out.push_str("material:\n");
     if plan.inputs.is_empty() {
@@ -904,46 +920,44 @@ pub fn describe(plan: &ExecutionPlan) -> String {
     for d in &plan.destinations {
         out.push_str(&format!("  - {d}\n"));
     }
-    match plan.credentials_available {
-        Some(true) => out.push_str(&format!(
-            "credentials: {} is set\n",
-            r.api_key_env.as_deref().unwrap_or("AIDO_API_KEY")
-        )),
-        Some(false) => out.push_str(&format!(
-            "credentials: {} is NOT set — the request would fail\n",
-            r.api_key_env.as_deref().unwrap_or("AIDO_API_KEY")
-        )),
-        None => out.push_str("credentials: none required\n"),
+    // Credential reference only, never the value. The plan's stored
+    // judgment says whether credentials are expected at all; the name
+    // shown is resolved the very same way that judgment was (moments
+    // earlier, in this same process), so the variable that satisfied it
+    // is the one named — with the fallback marked as such.
+    if plan.credentials_available.is_none() {
+        out.push_str("credentials: none required\n");
+    } else {
+        match crate::config::effective_key_env(r.api_key_env.as_deref()) {
+            Some(name) => {
+                let via_fallback = r.api_key_env.as_deref() != Some(name);
+                out.push_str(&format!(
+                    "credentials: {name}{} is set\n",
+                    if via_fallback { " (fallback)" } else { "" }
+                ));
+            }
+            None => out.push_str(&format!(
+                "credentials: {} is NOT set — the request would fail\n",
+                r.api_key_env
+                    .as_deref()
+                    .unwrap_or(crate::config::DEFAULT_KEY_ENV)
+            )),
+        }
     }
     out.push_str("history:     no request is sent, nothing is recorded\n");
     out
 }
 
-fn first_line(s: &str) -> String {
-    let line = s
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if line.chars().count() > 72 {
-        format!("{}...", line.chars().take(72).collect::<String>())
-    } else {
-        line.to_string()
-    }
-}
+/// How many chars of the instruction/requirement the dry-run report shows:
+/// a conventional full terminal line's worth of text, elided past that.
+const DRY_RUN_LINE_MAX: usize = 72;
 
-/// Whether the run would actually carry a key: the provider's env var is
-/// set and non-empty, with the conventional OpenAI name as a fallback for
-/// the default provider — the same resolution the client's caller uses.
+/// Whether the run would actually carry a key — by the shared judgment
+/// (`config::effective_key_env`) the runner's send-time resolution also
+/// uses, so the cleartext warning fires under exactly the conditions a
+/// real request would see a key.
 fn api_key_present(resolved: &Resolved) -> bool {
-    fn env_nonempty(name: &str) -> bool {
-        std::env::var(name)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-    }
-    resolved.api_key_env.as_deref().is_some_and(|name| {
-        env_nonempty(name) || (name == "AIDO_API_KEY" && env_nonempty("OPENAI_API_KEY"))
-    })
+    crate::config::effective_key_env(resolved.api_key_env.as_deref()).is_some()
 }
 
 fn human_bytes(n: u64) -> String {

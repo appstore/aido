@@ -894,17 +894,34 @@ fn unsatisfied_generation_is_recorded_with_its_artifacts() {
 #[cfg(unix)]
 #[test]
 fn ctrl_c_records_a_cancelled_run_and_exits_130() {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
     // A server that accepts and never answers: the request hangs until
-    // the interrupt arrives.
+    // the interrupt arrives. The holder reads the connection until aido
+    // dies and drops it (EOF or reset) instead of sleeping a fixed 30s,
+    // so the join below returns as soon as aido has exited; the accept
+    // deadline and read timeout bound pathological runs so the suite
+    // cannot hang.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let holder = std::thread::spawn(move || {
-        let _stream = listener.accept();
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut stream = accept(&listener, deadline);
+        stream.set_nonblocking(false).unwrap();
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let mut buf = [0u8; 8192];
+        // Ok(0) is the orderly EOF of aido exiting; an Err covers the
+        // reset from the killed process and the read timeout. Either
+        // way the holder is done.
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     });
     let dir = temp_dir("hist-cancel");
     let cfg = settings_config(&format!(

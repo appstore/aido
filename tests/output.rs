@@ -182,6 +182,113 @@ fn image_without_any_destination_in_a_terminal_is_still_refused() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn json_binary_task_in_a_terminal_names_the_json_cause() {
+    // --json alone in a terminal trips the binary precheck, but the sole
+    // stdout destination is the report itself: the error must say so, not
+    // the generic "binary output needs ..." advice that reads like a
+    // missing -o. The --json error contract holds on a terminal too: the
+    // pty drain (stdout here) carries one report with the same message.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run_full_tty(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--json",
+            "--dry-run",
+        ],
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        cfg.clone(),
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("--json"), "stderr: {err}");
+    assert!(err.contains("carries no artifact bytes"), "stderr: {err}");
+    let stdout = out.stdout();
+    let report: serde_json::Value = serde_json::from_str(stdout.replace('\r', "").as_str())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{stdout}"));
+    assert_eq!(report["error"]["kind"], "usage", "report: {report}");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--json"),
+        "report: {report}"
+    );
+}
+
+#[test]
+fn json_binary_task_over_a_stdout_pipe_still_plans() {
+    // The same command over a pipe passes the precheck unchanged: the
+    // dry-run keeps listing stdout as the destination, no regression.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--json",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let plan = out.stdout();
+    assert!(plan.contains("destinations:"), "{plan}");
+    assert!(plan.contains("stdout"), "{plan}");
+}
+
+#[test]
+fn json_with_an_output_file_still_delivers_the_image() {
+    // -o gives the binary artifact its home, so --json composes fine: the
+    // file gets the real bytes while stdout carries the report.
+    let encoded = encode_png();
+    let body = serde_json::json!({"data":[{"b64_json":encoded}]}).to_string();
+    let server = Server::json(&body);
+    let dir = temp_dir("out-json-image");
+    let file = dir.join("dog.png");
+    let cfg = settings_config(&format!(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\noperations = [\"image\"]\n\
+         [providers.srv]\nbase_url = \"{}\"",
+        server.url()
+    ));
+    let out = run(
+        &[
+            "image",
+            "--profile",
+            "test",
+            "--text",
+            "dog",
+            "--json",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert_eq!(std::fs::read(&file).unwrap(), solid_png(2, 2));
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
+    assert_eq!(report["artifacts"][0]["kind"], "image", "report: {report}");
+    assert!(report["error"].is_null(), "report: {report}");
+    assert!(out.stderr().contains("saved"), "stderr: {}", out.stderr());
+}
+
 #[test]
 fn directory_delivery_writes_artifacts_then_manifest() {
     let png = solid_png(2, 2);

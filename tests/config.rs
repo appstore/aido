@@ -687,6 +687,123 @@ fn dry_run_spares_loopback_http_and_https_from_the_cleartext_warning() {
 }
 
 #[test]
+fn dry_run_reports_the_openai_fallback_as_the_effective_key() {
+    // F46: the default provider reads AIDO_API_KEY with OPENAI_API_KEY
+    // as a fallback, and the dry-run must judge credentials the way the
+    // real send does — otherwise it prophesies a failure the run would
+    // not have. With only the fallback set, the line names the variable
+    // that would actually be read, marked as the fallback.
+    let out = run(
+        &["ask", "-p", "hi", "--dry-run"],
+        b"",
+        &[("OPENAI_API_KEY", "sk-fallback")],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("credentials: OPENAI_API_KEY (fallback) is set"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("would fail"), "{stdout}");
+}
+
+#[test]
+fn dry_run_still_predicts_failure_without_any_key_variable() {
+    // The other side of the fallback rule: with neither AIDO_API_KEY nor
+    // OPENAI_API_KEY in the environment, the honest verdict is still the
+    // failure prediction, naming the configured variable.
+    let out = run(&["ask", "-p", "hi", "--dry-run"], b"", &[]);
+    out.assert_code(0);
+    assert!(
+        out.stdout()
+            .contains("credentials: AIDO_API_KEY is NOT set — the request would fail"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn the_openai_fallback_belongs_to_the_default_provider_only() {
+    // A provider naming its own variable (CUSTOM_KEY) must not inherit
+    // the OPENAI_API_KEY fallback: that convenience exists so the
+    // zero-config default provider reuses an existing OpenAI key, not
+    // so every provider silently shares it.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"\napi_key_env = \"CUSTOM_KEY\"",
+    );
+    let out = run(
+        &["ask", "-p", "hi", "--profile", "test", "--dry-run"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("OPENAI_API_KEY", "sk-elsewhere"),
+        ],
+    );
+    out.assert_code(0);
+    assert!(
+        out.stdout()
+            .contains("credentials: CUSTOM_KEY is NOT set — the request would fail"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn the_cleartext_warning_fires_for_a_fallback_key_over_plain_http() {
+    // The cleartext judgment shares the fallback: a key that arrives via
+    // OPENAI_API_KEY is as exposed over plain http as a directly set
+    // one, and the credential line agrees with the warning about it.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://gw.internal:8080/v1\"\napi_key_env = \"AIDO_API_KEY\"",
+    );
+    let out = run(
+        &["ask", "-p", "hi", "--profile", "test", "--dry-run"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("OPENAI_API_KEY", "sk-fallback"),
+        ],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout.contains("credentials will be sent in cleartext to gw.internal"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("credentials: OPENAI_API_KEY (fallback) is set"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_real_run_sends_the_openai_fallback_key() {
+    // The send-side of the F46 contract: with only OPENAI_API_KEY set
+    // and AIDO_API_KEY named, the request carries the fallback key —
+    // exactly what the dry-run now reports, since both go through the
+    // same shared judgment.
+    let server = Server::json(chat_body("ok"));
+    let cfg = settings_config(&format!(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"{}\"\napi_key_env = \"AIDO_API_KEY\"",
+        server.url()
+    ));
+    let out = run(
+        &["summarize", "--profile", "test"],
+        b"hello\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("OPENAI_API_KEY", "sk-fallback"),
+        ],
+    );
+    out.assert_code(0);
+    let raw = String::from_utf8_lossy(&server.request()).to_lowercase();
+    assert!(raw.contains("authorization: bearer sk-fallback"), "{raw}");
+}
+
+#[test]
 fn config_check_flags_route_keys_that_are_not_operations() {
     // A typo'd route key (`speach`) would silently fall back to the
     // conventional adapter; `config check` must name it.

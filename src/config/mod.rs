@@ -148,6 +148,32 @@ fn parse_config(path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
+/// The built-in default provider's credential variable, and the
+/// conventional OpenAI name it also accepts: an existing
+/// OPENAI_API_KEY keeps zero-config usage working without any
+/// aido-specific setup.
+pub(crate) const DEFAULT_KEY_ENV: &str = "AIDO_API_KEY";
+pub(crate) const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// The env var a run would actually read the key from: the provider's
+/// `api_key_env` — or, when that names the default provider's key, the
+/// conventional OpenAI name as a fallback. Returns the effective name
+/// when that variable is set and non-empty; None when it (and any
+/// fallback) is unset, or the provider names no variable at all. The
+/// dry-run's credential line, its cleartext warning and the runner's
+/// send-time resolution all share this judgment, so the three cannot
+/// disagree about whether a request would carry a key.
+pub(crate) fn effective_key_env(api_key_env: Option<&str>) -> Option<&str> {
+    let set = |name: &str| std::env::var(name).is_ok_and(|v| !v.trim().is_empty());
+    let name = api_key_env?;
+    if set(name) {
+        return Some(name);
+    }
+    // Only the default provider's key falls back to the conventional
+    // OpenAI name; a custom variable is the provider's only credential.
+    (name == DEFAULT_KEY_ENV && set(OPENAI_KEY_ENV)).then_some(OPENAI_KEY_ENV)
+}
+
 /// A config with the built-in default provider: official OpenAI, key from
 /// AIDO_API_KEY / OPENAI_API_KEY. Keeps zero-config usage working. With the
 /// edge-tts feature (the default build) speech routes to the keyless Edge
@@ -167,7 +193,7 @@ pub fn default_config() -> Config {
         "openai".into(),
         Provider {
             base_url: Some("https://api.openai.com/v1".into()),
-            api_key_env: Some("AIDO_API_KEY".into()),
+            api_key_env: Some(DEFAULT_KEY_ENV.into()),
             routes,
         },
     );
