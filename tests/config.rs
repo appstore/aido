@@ -296,6 +296,27 @@ fn tasks_list_and_show_cover_the_builtins() {
 }
 
 #[test]
+fn management_commands_refuse_material_flags() {
+    // F42: --text/--paste on a management command must be refused, not
+    // silently dropped (the input module drops nothing by design).
+    let out = run(&["tasks", "list", "--text", "x"], b"", &[]);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no effect on management commands"),
+        "stderr: {}",
+        out.stderr()
+    );
+
+    let out = run(&["config", "check", "--paste"], b"", &[]);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("no effect on management commands"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
 fn custom_tasks_load_from_the_config_dir() {
     let dir = temp_dir("tasks-custom");
     std::fs::write(

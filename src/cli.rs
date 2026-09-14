@@ -372,16 +372,26 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
 
     // Management commands go to clap as subcommands: the words themselves
     // must stay in the argv (flags may precede them, which clap accepts).
+    // Explicit material is never silently dropped — the same rule the
+    // `last` branch applies; positional/file arguments are clap's to
+    // reject (at `usize::MAX` only `--text`/`--paste` survive into specs).
     if let Some(word) = first {
         if matches!(word, "tasks" | "profiles" | "config" | "history") {
             if prompt_seen {
                 bail!("`-p` has no effect on management commands; pass the instruction to a task run instead");
             }
+            let specs = specs_from(slots, usize::MAX);
+            if !specs.is_empty() {
+                bail!(
+                    "material flags (--text, --paste) have no effect on management \
+                     commands; pass material to a task run instead"
+                );
+            }
             rest.extend(free_pre.clone());
             rest.extend(post_separator);
             return Ok(Normalized {
                 task: None,
-                specs: specs_from(slots, usize::MAX),
+                specs,
                 argv: rest,
             });
         }
@@ -1137,6 +1147,40 @@ mod tests {
     fn prompt_has_no_effect_on_management_commands() {
         let err = normalize(os(&["-p", "hi", "tasks", "list"])).unwrap_err();
         assert!(err.to_string().contains("no effect"), "{err}");
+    }
+
+    #[test]
+    fn material_flags_have_no_effect_on_management_commands() {
+        // Every management word, both material flags, both spellings of
+        // --text: the material must be refused, not silently dropped.
+        for args in [
+            &["tasks", "list", "--text", "x"][..],
+            &["profiles", "--paste"][..],
+            &["config", "check", "--text", "x"][..],
+            &["history", "show", "1", "--paste"][..],
+            &["tasks", "list", "--text=x"][..],
+        ] {
+            let err = normalize(os(args)).unwrap_err();
+            assert!(
+                err.to_string().contains("no effect on management commands"),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn management_passthrough_without_material() {
+        // No material, no refusal: the words reach clap untouched.
+        for args in [&["tasks", "list"][..], &["history", "show", "1"][..]] {
+            let n = normalize(os(args)).unwrap();
+            assert!(n.task.is_none(), "{args:?}");
+            assert!(n.specs.is_empty(), "{args:?}");
+            assert!(
+                n.argv.contains(&OsString::from(args[0])),
+                "{args:?}: {:?}",
+                n.argv
+            );
+        }
     }
 
     #[test]
