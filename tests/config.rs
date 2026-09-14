@@ -492,6 +492,84 @@ fn dry_run_reports_typed_param_sources_flag_vs_task_default() {
 }
 
 #[test]
+fn typed_param_option_mismatch_is_a_usage_error_not_a_service_error() {
+    // A typed param maps to an adapter option; when the resolved adapter
+    // rejects it, the plan was never sent — exit 2, like the resolve-path
+    // [options] validation below, not a service error (3).
+    let tasks = temp_dir("param-option-mismatch");
+    std::fs::write(
+        tasks.join("mytask.toml"),
+        "operation = \"generate\"\n\
+         output_types = [\"text\"]\n\
+         params = [\"voice\"]\n",
+    )
+    .unwrap();
+    // The port-1 base_url is never contacted: validation must fail first.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "mytask",
+            "--profile",
+            "test",
+            "--voice",
+            "alloy",
+            "--text",
+            "hi",
+            "--dry-run",
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.starts_with("error:"), "{err}");
+    assert!(err.contains("does not support option 'voice'"), "{err}");
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
+fn task_options_rejected_by_the_adapter_stay_a_usage_error() {
+    // The same validation reached through the task's [options] table
+    // (resolve()) has always classified as usage; locked in beside the
+    // typed-param path so the two call sites cannot drift apart.
+    let tasks = temp_dir("task-options-mismatch");
+    std::fs::write(
+        tasks.join("opttask.toml"),
+        "operation = \"generate\"\n\
+         output_types = [\"text\"]\n\
+         \n\
+         [options]\n\
+         voice = \"alloy\"\n",
+    )
+    .unwrap();
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &["opttask", "--profile", "test", "--text", "hi", "--dry-run"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("does not support option 'voice'"),
+        "{}",
+        out.stderr()
+    );
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
 fn dry_run_hides_credentials_embedded_in_the_base_url() {
     let file = temp_file("notes.md", b"material\n");
     let cfg = settings_config(
