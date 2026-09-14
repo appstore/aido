@@ -274,16 +274,30 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                             };
                             slots.push(Slot::Text(value));
                         } else if let Some((long, value)) = attached {
-                            rest.push(OsString::from(long));
-                            rest.push(OsString::from(value));
+                            // A separated leading-dash value would parse as
+                            // a flag to clap; the combined form keeps it a
+                            // value — the same rule as the generic branch.
+                            if value.starts_with('-') && value != "-" {
+                                rest.push(OsString::from(format!("{long}={value}")));
+                            } else {
+                                rest.push(OsString::from(long));
+                                rest.push(OsString::from(value));
+                            }
                         } else if t == "--prompt" || t.starts_with("--prompt=") {
                             let value = match t.strip_prefix("--prompt=") {
                                 Some(v) => v.to_string(),
                                 None => take_value(&mut iter)
                                     .ok_or_else(|| anyhow::anyhow!("--prompt requires a value"))?,
                             };
-                            rest.push(OsString::from("--prompt"));
-                            rest.push(OsString::from(value));
+                            // Same rule as the generic branch: a separated
+                            // leading-dash value would parse as a flag, so
+                            // it stays attached.
+                            if value.starts_with('-') && value != "-" {
+                                rest.push(OsString::from(format!("--prompt={value}")));
+                            } else {
+                                rest.push(OsString::from("--prompt"));
+                                rest.push(OsString::from(value));
+                            }
                         } else {
                             // `--flag=value` carries its own value; only the
                             // separated form consumes the next token.
@@ -1051,6 +1065,56 @@ mod tests {
             "{:?}",
             n.argv
         );
+    }
+
+    /// Normalize + clap, exactly what app.rs does with real argv: the
+    /// strongest assertion a spelling works is that the real parser
+    /// accepts it and keeps the value.
+    fn parse_cli(args: &[&str]) -> Cli {
+        let n = normalize(os(args)).unwrap();
+        Cli::try_parse_from(std::iter::once(OsString::from("aido")).chain(n.argv.clone()))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}; argv: {:?}", n.argv))
+    }
+
+    #[test]
+    fn leading_dash_prompt_values_parse_end_to_end() {
+        // Every spelling of a prompt that starts with '-' must reach clap
+        // with the value still attached, or clap rejects it as a flag.
+        for args in [
+            &["ask", "--prompt", "-x"][..],
+            &["ask", "--prompt=-x"][..],
+            &["ask", "-p", "-x"][..],
+            &["ask", "-p-x"][..],
+            &["ask", "-p=-x"][..],
+        ] {
+            let cli = parse_cli(args);
+            assert_eq!(cli.prompt.as_deref(), Some("-x"), "{args:?}");
+            assert_eq!(cli.task.as_deref(), Some("ask"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn leading_dash_attached_short_values_parse_end_to_end() {
+        // -m-x / -o-out.txt keep the dash inside the combined long form.
+        let cli = parse_cli(&["ask", "-m-x", "-p", "hi"]);
+        assert_eq!(cli.model.as_deref(), Some("-x"));
+        let cli = parse_cli(&["ask", "-o-out.txt", "-p", "hi"]);
+        assert_eq!(cli.output, Some(PathBuf::from("-out.txt")));
+    }
+
+    #[test]
+    fn non_dash_and_lone_dash_values_stay_separated() {
+        // Without a leading dash the two-token form is unchanged; the
+        // lone `-` is a value (stdin elsewhere), never a flag.
+        for args in [&["ask", "-phi"][..], &["ask", "--prompt", "hi"][..]] {
+            let n = normalize(os(args)).unwrap();
+            let i = n.argv.iter().position(|a| a == "--prompt").unwrap();
+            assert_eq!(n.argv[i + 1], OsString::from("hi"), "{args:?}");
+        }
+        for args in [&["ask", "--prompt", "-"][..], &["ask", "--prompt=-"][..]] {
+            let cli = parse_cli(args);
+            assert_eq!(cli.prompt.as_deref(), Some("-"), "{args:?}");
+        }
     }
 
     #[test]

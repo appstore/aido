@@ -378,6 +378,29 @@ fn ask_without_prompt_is_a_usage_error() {
     assert!(out.stderr().contains("-p"), "stderr: {}", out.stderr());
 }
 
+#[test]
+fn prompt_starting_with_a_dash_dry_runs_in_every_spelling() {
+    // `--prompt "-0.5度是什么意思"` and `-p "-0.5度是什么意思"` are the
+    // same request; the spellings the normalizer re-emits as separate
+    // flag+value tokens used to lose the value to clap's flag detection.
+    // The plan must carry the whole prompt as the requirement.
+    for args in [
+        &["ask", "--prompt", "-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "--prompt=-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "-p", "-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "-p-0.5度是什么意思", "--dry-run"][..],
+    ] {
+        let out = run(args, b"", &[]);
+        out.assert_code(0);
+        let stdout = out.stdout();
+        assert!(
+            stdout.contains("requirement: -0.5度是什么意思"),
+            "{args:?}: {stdout}"
+        );
+        assert!(out.stderr().is_empty(), "{args:?}: {}", out.stderr());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn separator_makes_leading_dashes_files() {
