@@ -469,7 +469,7 @@
 
 - 对整个代码库（全部实现 + 测试 + 任务 TOML + CI）做了一次独立 review；实测基线：`cargo test --locked` 379 通过 / 0 失败 / 1 忽略，`cargo fmt --check` 与 clippy 全绿，F01–F36 与 R01–R16 的修复确认落地。
 - 新增 9 条 finding（1 高 / 3 中 / 5 低），全部建为 issue：**F37–F45 = #42–#50**。问题集中在两处「无任何测试覆盖的代码路径」（`__hold` 子命令、内置回退规则）与契约边角（负值旗标、退出码分类）。
-- **状态（2026-09-14）**：F37–F40（#42–#45）已修复，分支 `fix/review-f37-f40`（每条一个独立 subagent：改码 + 补测 + fmt/clippy/test 全绿 + 自 review + 独立 commit）；F41–F45（#46–#50）为开放 issue。修复后实测 **389 通过、0 失败、1 忽略**。
+- **状态（2026-09-14）**：F37–F40（#42–#45）修复于分支 `fix/review-f37-f40`（PR #58）；F41–F45（#46–#50）修复于叠加分支 `fix/review-f41-f45`。两批均为每条一个独立 subagent（改码 + 补测 + fmt/clippy/test 全绿 + 自 review + 独立 commit）。F37–F40 批后实测 389 通过；F41–F45 批后实测 **400 通过、0 失败、1 忽略**。
 
 ## 逐条
 
@@ -477,13 +477,13 @@
 - [x] **F38 · 中 · #43 · `src/config/resolve.rs` / `src/config/mod.rs` · 内置回退规则不一致** — 内置 `default` profile 只在 `providers.is_empty()` 时存在（providers-only 配置全线失败，与 README「定义即覆盖」矛盾）；`check()` 不认运行时的 openai 内置 provider 回退（同一配置两个答案）。修复：统一为「用户未定义任何 profile 时 default 可用；未定义名为 openai 的 provider 时走内置回退」，resolve 与 check 共用同一规则，反向测试 `config_check_requires_the_default_profile_to_exist_with_providers` 按新契约重写。（`d936f9e`）
 - [x] **F39 · 中 · #44 · `src/cli.rs` · `--prompt` 等分支丢失负值附着** — 凡拆 token 重发为「旗标+值」两段的分支（`--prompt` 专用分支、`short_attached` 分支）都让 `-` 开头的值被 clap 当旗标拒绝；实测七种拼写矩阵见 issue #44 勘误评论（原 issue 中「`--prompt=v` 正常」为未实测的错误假设，实际也失败，且 `-m-x`/`-o-x` 同样受累）。修复：两分支对负值改推组合形式 `--flag=value`。（`601bc1a`）
 - [x] **F40 · 中 · #45 · `src/plan.rs` · typed 参数校验误分类退出码 3** — `apply_param_options` 用 `From<anyhow::Error>`（默认 Service）包装 `validate_options` 错误，而 resolve 路径的同一条校验为 usage（退出码 2）。修复：统一 usage；补齐 resolve 路径此前缺失的同类断言测试。（`24006d9`）
-- [ ] **F41 · 低 · #46 · `--total-timeout` 只对 edge-tts 生效** — HTTP 多请求链路无整跑上限，与帮助文案不符（开放 issue）。
-- [ ] **F42 · 低 · #47 · 管理命令静默丢弃 `--text` / `--paste` 材料** — 违背 input.rs「never silently dropped」原则（开放 issue）。
-- [ ] **F43 · 低 · #48 · `history list` 为一行标签加载全部产物字节**（开放 issue）。
-- [ ] **F44 · 低 · #49 · 零配置 `config check` 报错退出 2，空配置文件却 ok**（开放 issue；F38 修复刻意未动此行为）。
-- [ ] **F45 · 低 · #50 · manifest version / 扩展名兼容表 / civil_from_days 三处重复**（开放 issue）。
+- [x] **F41 · 低 · #46 · `--total-timeout` 只对 edge-tts 生效** — 修复：`runner.rs::execute` 对每个请求计算剩余预算并以 `tokio::time::timeout` 包裹（预算耗尽不发请求）；错误走既有路径（非批处理：Incomplete + 保留已流出内容 + 退出 3；批处理：该 part 失败、幸存者照常交付 + 退出 6）；edge-tts 内部预算不变（其报错文案优先）。新增 `DelayServer` 测试设施与三条集成测试（chunk 超时保留首块、批处理超时交付幸存者、无预算时不影响）。（`9708857`）
+- [x] **F42 · 低 · #47 · 管理命令静默丢弃 `--text` / `--paste` 材料** — 修复：管理命令分支复用 `specs_from(slots, usize::MAX)` 的结果，非空即报 "material flags … have no effect on management commands"（与 `-p` 拒绝同族；文件参数仍由 clap 拒绝，post-separator 字面量不受影响）。（`8bfa07b`）
+- [x] **F43 · 低 · #48 · `history list` 为一行标签加载全部产物字节** — 修复：history.rs 新增 `RunMeta` + `load_meta()`（只读 manifest），List 分支改用之；顺带行为改进：产物文件损坏但 manifest 完好的记录可正常列出（此前显示 "(error: …)"）。`resolve_run`/`last`/`show` 维持全量加载不变。（`277e52a`）
+- [x] **F44 · 低 · #49 · 零配置 `config check` 报错退出 2，空配置文件却 ok** — 修复（issue 方案 2）："no model set" 从 issue 降级为 stderr 提示（运行时本就以 adapter 默认模型正常工作，check 不应失败它）；`YOUR_MODEL` 占位与空串仍为硬 issue（F23 边界由同夹具测试锁定）。零配置与空配置文件结论一致：均 ok。（`1870c79`）
+- [x] **F45 · 低 · #50 · manifest version / 扩展名兼容表 / civil_from_days 三处重复** — 收敛为 `domain::JSON_ENVELOPE_VERSION`（output.rs 三处 + history.rs 一处）、`domain::extension_matches_format`（plan.rs + output.rs 两个调用点）、`history::civil_from_days` 单实现（app.rs 删除副本改引用）。纯重构，无行为变化；新增 alias 表单测。执行方式：subagent 在配额截断前完成 domain/history/output/app 四处，plan.rs 调用点与导入合并由主线补完（同 R14 的先例纪律）。（`8df4318`）
 
 ## 完成标准（第五部分适用）
 
 - F37–F40 已落地：`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` 全绿（**389 通过、0 失败、1 忽略**，忽略项为既有的 live Edge 端点用例）；四个 issue 的原始复现命令逐一验证通过。
-- F41–F45 修复时逐条勾选并引用对应 issue。
+- F41–F45 已落地（同上三项全绿，**400 通过、0 失败、1 忽略**；F42/F44 人工复现通过，F41/F43/F45 由新增集成测试锁定）；第五部分全部勾选。
