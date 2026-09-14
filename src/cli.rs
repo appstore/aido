@@ -216,6 +216,17 @@ fn value_attached(t: &str) -> bool {
 
 /// Rewrite argv into its normalized form.
 pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
+    // The clipboard holder child is spawned as `aido __hold SECS [--image]`:
+    // already clap-shaped, and never a task run — pass it straight through so
+    // the normalizer's task discovery cannot reject it (RESERVED_WORDS lists
+    // it precisely so it can never be a task name).
+    if argv.first().and_then(|t| t.to_str()) == Some("__hold") {
+        return Ok(Normalized {
+            task: None,
+            specs: Vec::new(),
+            argv,
+        });
+    }
     let mut slots: Vec<Slot> = Vec::new();
     let mut rest: Vec<OsString> = Vec::new();
     let mut prompt_seen = false;
@@ -954,6 +965,18 @@ mod tests {
         assert_eq!(n.argv[0], OsString::from("config"));
         let n = normalize(os(&["profiles"])).unwrap();
         assert_eq!(n.argv[0], OsString::from("profiles"));
+    }
+
+    #[test]
+    fn hold_passes_through_untouched() {
+        // The clipboard holder child is spawned as `aido __hold SECS
+        // [--image]` with the word always first; task discovery would
+        // reject it ("unknown task '__hold'"), so argv must reach clap
+        // exactly as spawned.
+        let n = normalize(os(&["__hold", "5", "--image"])).unwrap();
+        assert_eq!(n.task, None);
+        assert!(n.specs.is_empty());
+        assert_eq!(n.argv, os(&["__hold", "5", "--image"]));
     }
 
     #[test]

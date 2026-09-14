@@ -207,6 +207,19 @@ fn null_stdin_ocr_copy_previews_the_clipboard_under_dry_run() {
     );
 }
 
+#[test]
+fn holder_child_argv_reaches_clap_not_task_discovery() {
+    // The Linux clipboard holder spawns `aido __hold SECS [--image]`; an
+    // invalid SECS must be clap's usage error (the normalizer passed the
+    // argv through), never "unknown task '__hold'". A valid hold is not
+    // exercised: it would open the real desktop clipboard and sleep.
+    let out = run(&["__hold", "notanumber"], b"hello", &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("invalid value"), "stderr: {err}");
+    assert!(!err.contains("unknown task"), "stderr: {err}");
+}
+
 #[cfg(unix)]
 #[test]
 fn text_files_keep_their_order_and_get_labels() {
