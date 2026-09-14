@@ -269,8 +269,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                         if t == "--text" || t.starts_with("--text=") {
                             let value = match t.split_once('=') {
                                 Some((_, v)) => v.to_string(),
-                                None => take_value(&mut iter)
-                                    .ok_or_else(|| anyhow::anyhow!("--text requires a value"))?,
+                                None => take_value("--text", &mut iter)?,
                             };
                             slots.push(Slot::Text(value));
                         } else if let Some((long, value)) = attached {
@@ -286,8 +285,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                         } else if t == "--prompt" || t.starts_with("--prompt=") {
                             let value = match t.strip_prefix("--prompt=") {
                                 Some(v) => v.to_string(),
-                                None => take_value(&mut iter)
-                                    .ok_or_else(|| anyhow::anyhow!("--prompt requires a value"))?,
+                                None => take_value("--prompt", &mut iter)?,
                             };
                             // Same rule as the generic branch: a separated
                             // leading-dash value would parse as a flag, so
@@ -305,6 +303,14 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                                 let Some(value) = iter.next() else {
                                     bail!("{} requires a value", t);
                                 };
+                                // `-p VALUE` is the prompt's short spelling:
+                                // the same UTF-8 rule as `--prompt`, with the
+                                // flag named (clap would reject the raw bytes,
+                                // but as a bare "invalid UTF-8" that names
+                                // nothing).
+                                if t == "-p" {
+                                    text_value("-p/--prompt", &value)?;
+                                }
                                 // A negative number would look like a flag
                                 // to clap; the combined form keeps it a
                                 // value.
@@ -337,7 +343,16 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                     None => {} // free token
                 }
             } else {
-                // Non-UTF-8 argv entries can only be file paths.
+                // A non-UTF-8 entry shaped like a text flag is that flag
+                // with a bad value, not a file: `--text=<bytes>`,
+                // `--prompt=<bytes>` and `-p<bytes>` must fail the way
+                // their separated spellings do instead of quietly
+                // becoming an input named after the flag (their UTF-8
+                // lookalikes are flags, never files). Every other
+                // non-UTF-8 argv entry is a file path.
+                if let Some(flag) = text_flag_shape(token.as_encoded_bytes()) {
+                    return Err(invalid_text_value(flag));
+                }
                 free_pre.push(token.clone());
                 slots.push(Slot::Free(token));
                 continue;
@@ -542,8 +557,48 @@ fn short_attached(token: &str) -> Option<(&'static str, String)> {
     None
 }
 
-fn take_value(iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>) -> Option<String> {
-    iter.next().map(|v| v.to_string_lossy().into_owned())
+/// The error every text-flag spelling raises for a non-UTF-8 value:
+/// refusing beats the lossy fallback, which would hand the model U+FFFD
+/// in place of the user's bytes with no warning. File paths never take
+/// this path — they keep their raw `OsString` end to end.
+fn invalid_text_value(flag: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{flag} requires a valid UTF-8 value (a lossy conversion would \
+         silently corrupt the text)"
+    )
+}
+
+/// Validate a text-flag value (`--text`, `--prompt`/`-p`): the words the
+/// model must see verbatim, so the bytes have to be UTF-8.
+fn text_value(flag: &str, value: &OsString) -> Result<String> {
+    value
+        .to_str()
+        .map(|v| v.to_string())
+        .ok_or_else(|| invalid_text_value(flag))
+}
+
+/// Take the next argv token as a separated text-flag value: present, and
+/// valid UTF-8 ([`text_value`]).
+fn take_value(
+    flag: &str,
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>,
+) -> Result<String> {
+    let Some(value) = iter.next() else {
+        bail!("{flag} requires a value");
+    };
+    text_value(flag, &value)
+}
+
+/// The text flag a non-UTF-8 argv entry spells, if any: `--text=<bytes>`
+/// and `--prompt=<bytes>` combined, `-p<bytes>` (and `-p=<bytes>`)
+/// attached.
+fn text_flag_shape(bytes: &[u8]) -> Option<&'static str> {
+    for (prefix, flag) in [("--text=", "--text"), ("--prompt=", "--prompt")] {
+        if bytes.starts_with(prefix.as_bytes()) && bytes.len() > prefix.len() {
+            return Some(flag);
+        }
+    }
+    (bytes.starts_with(b"-p") && bytes.len() > 2).then_some("-p/--prompt")
 }
 
 /// Turn slots into specs, skipping the first `skip` free tokens (the task
@@ -1230,5 +1285,88 @@ mod tests {
             bad,
             OsString::from("--json")
         ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_flag_values_must_be_valid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        // "你好" in GBK: real bytes a Chinese Windows shell would pass, and
+        // invalid UTF-8 — a lossy conversion would hand the model two
+        // U+FFFD instead of the words the user typed.
+        let gbk = OsString::from_vec(vec![0xc4, 0xe3, 0xba, 0xc3]);
+        // Every separated spelling refuses the bytes and names its flag.
+        for (flag, argv) in [
+            (
+                "--text",
+                vec![OsString::from("ask"), OsString::from("--text"), gbk.clone()],
+            ),
+            (
+                "--prompt",
+                vec![
+                    OsString::from("ask"),
+                    OsString::from("--prompt"),
+                    gbk.clone(),
+                ],
+            ),
+            (
+                "-p/--prompt",
+                vec![OsString::from("ask"), OsString::from("-p"), gbk.clone()],
+            ),
+        ] {
+            let err = normalize(argv).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(flag), "{flag}: {msg}");
+            assert!(msg.contains("valid UTF-8"), "{flag}: {msg}");
+        }
+        // Combined spellings embed the bytes in the token itself; the same
+        // refusal fires instead of the token quietly becoming a file named
+        // after the flag.
+        for (flag, token) in [
+            ("--text", concat_bytes(b"--text=", &gbk)),
+            ("--prompt", concat_bytes(b"--prompt=", &gbk)),
+            ("-p/--prompt", concat_bytes(b"-p", &gbk)),
+            ("-p/--prompt", concat_bytes(b"-p=", &gbk)),
+        ] {
+            let err = normalize(vec![OsString::from("ask"), token]).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(flag), "{flag}: {msg}");
+            assert!(msg.contains("valid UTF-8"), "{flag}: {msg}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn concat_bytes(prefix: &[u8], value: &std::ffi::OsStr) -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(value.as_encoded_bytes());
+        OsString::from_vec(bytes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_survive_but_never_become_text() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad_name = OsString::from_vec(vec![0xff, 0xfe, 0x2e, 0x70, 0x6e, 0x67]);
+        // A non-UTF-8 token that is not flag-shaped keeps its raw bytes as
+        // a file path — the exact contrast that makes refusing the text
+        // spellings right.
+        let n = normalize(vec![
+            OsString::from("ask"),
+            OsString::from("-p"),
+            OsString::from("hi"),
+            bad_name.clone(),
+        ])
+        .unwrap();
+        assert_eq!(n.specs[0], SourceSpec::File(PathBuf::from(&bad_name)));
+        // After `--` even a flag-shaped token is a literal file.
+        let token = concat_bytes(b"--text=", &OsString::from_vec(vec![0xc4, 0xe3]));
+        let n = normalize(vec![
+            OsString::from("ocr"),
+            OsString::from("--"),
+            token.clone(),
+        ])
+        .unwrap();
+        assert_eq!(n.specs[0], SourceSpec::File(PathBuf::from(&token)));
     }
 }
