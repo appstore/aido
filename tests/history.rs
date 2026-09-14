@@ -207,6 +207,42 @@ fn history_list_and_show_work_on_recorded_runs() {
     assert_eq!(out.stdout(), "one\n");
 }
 
+#[test]
+fn history_list_reads_the_manifest_not_the_artifacts() {
+    // The list only labels runs, so it must not read artifact bytes back:
+    // a run whose artifact file is gone still lists normally (its manifest
+    // is the record of what happened) instead of degrading to an error row.
+    let server = Server::json(chat_body("GONE"));
+    let dir = temp_dir("hist-list-meta");
+    let cfg = chat_cfg(&server.url());
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+    let runs = run_dirs(&dir);
+    assert_eq!(runs.len(), 1);
+    let artifact = runs[0].join("text.txt");
+    assert!(artifact.exists(), "the run saved its text artifact");
+    std::fs::remove_file(&artifact).unwrap();
+
+    let out = run(
+        &["history", "list"],
+        b"",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("summarize"), "{stdout}");
+    assert!(stdout.contains("complete"), "{stdout}");
+    assert!(!stdout.contains("(error"), "{stdout}");
+}
+
 /// A hand-written complete run record, for cases the live pipeline cannot
 /// produce on demand (fixed ids, a chosen prefix shape).
 fn fake_complete_run(dir: &std::path::Path, id: &str, text: &str) {

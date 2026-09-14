@@ -500,19 +500,21 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
             // takes as its operand.
             for (n, id) in ids.iter().rev().enumerate() {
                 let n = n + 1;
-                match history::load(id) {
-                    Ok(Some(record)) => {
-                        let mut label = generation_label(&record.generation);
-                        if !record.failed_parts.is_empty() {
+                // Manifest-only: the list labels runs without reading
+                // their artifact bytes back.
+                match history::load_meta(id) {
+                    Ok(Some(meta)) => {
+                        let mut label = generation_label(&meta.generation);
+                        if meta.failed_parts > 0 {
                             label.push_str(&format!(
                                 "; {}/{} input part(s) failed",
-                                record.failed_parts.len(),
-                                record.parts_total.max(record.failed_parts.len())
+                                meta.failed_parts,
+                                meta.parts_total.max(meta.failed_parts)
                             ));
                         }
                         println!(
                             "{n:>width$}  {id}  {:<12} {label}",
-                            record.task.as_deref().unwrap_or("-")
+                            meta.task.as_deref().unwrap_or("-")
                         );
                     }
                     Ok(None) => println!("{n:>width$}  {id}  (unreadable)"),
