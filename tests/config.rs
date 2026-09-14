@@ -920,6 +920,135 @@ fn config_check_accepts_a_base_url_free_edge_only_provider() {
     assert!(out.stdout().contains("config ok"), "{}", out.stdout());
 }
 
+/// Run aido with no config file at all: no AIDO_CONFIG, and the default
+/// config path (dirs::config_dir(), i.e. $XDG_CONFIG_HOME or $HOME/...)
+/// pointing into a nonexistent tree — so `load()` yields the built-in
+/// default config. The true zero-config state, which the `run` helpers
+/// cannot express (they always point AIDO_CONFIG at a file). The rest of
+/// the environment follows `base_command`: isolated tasks/history dirs
+/// and no developer credentials leaking in.
+fn run_zero_config(args: &[&str]) -> RunOutcome {
+    let mut cmd = std::process::Command::new(EXE);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("AIDO_TASKS_DIR", "/nonexistent/aido-test-tasks")
+        .env("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history")
+        .env("HOME", "/nonexistent/aido-test-home")
+        .env("XDG_CONFIG_HOME", "/nonexistent/aido-test-config");
+    for var in [
+        "AIDO_CONFIG",
+        "AIDO_PROFILE",
+        "AIDO_MODEL",
+        "AIDO_BASE_URL",
+        "AIDO_ADAPTER",
+        "OPENAI_API_KEY",
+        "AIDO_API_KEY",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+    ] {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd.spawn().unwrap();
+    // Close stdin (empty piped input) like `run(..., b"", ...)` does.
+    drop(child.stdin.take());
+    RunOutcome {
+        output: child.wait_with_output().unwrap(),
+    }
+}
+
+#[test]
+fn zero_config_check_is_ok_with_a_default_model_note() {
+    // F44: zero-config is a first-class state (the README quick start runs
+    // `aido tts` with no config), and load() then materializes the built-in
+    // default profile with model = None — which runs fine on the adapter's
+    // default model. check must bless it: the note belongs on stderr, and
+    // stdout stays the success line, not an issue list.
+    let out = run_zero_config(&["config", "check"]);
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("config ok"), "stdout: {stdout}");
+    assert!(!stdout.contains("issue"), "stdout: {stdout}");
+    let err = out.stderr();
+    assert!(
+        err.contains("profile 'default' has no model set"),
+        "stderr: {err}"
+    );
+    assert!(
+        err.contains("the adapter default will be used"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn modelless_user_profile_check_is_ok_the_placeholder_stays_an_issue() {
+    // F44: a user profile without a model runs on the adapter's default
+    // model (resolve()'s fallback), so check must not fail it either — the
+    // note goes to stderr. The contrast on the same fixture: the `config
+    // init` placeholder must keep failing check (F23), since it would
+    // never be what the user wants.
+    let cfg = settings_config(
+        "default_profile = \"local\"\n[settings]\nhistory_keep = 0\n\
+         [profiles.local]\nprovider = \"srv\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("config ok"), "{}", out.stdout());
+    let err = out.stderr();
+    assert!(
+        err.contains("profile 'local' has no model set"),
+        "stderr: {err}"
+    );
+    assert!(
+        err.contains("the adapter default will be used"),
+        "stderr: {err}"
+    );
+
+    let cfg = settings_config(
+        "default_profile = \"local\"\n[settings]\nhistory_keep = 0\n\
+         [profiles.local]\nprovider = \"srv\"\nmodel = \"YOUR_MODEL\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let stdout = out.stdout();
+    assert!(stdout.contains("no model configured"), "stdout: {stdout}");
+    assert!(stdout.contains("YOUR_MODEL"), "stdout: {stdout}");
+}
+
+#[test]
+fn zero_config_check_agrees_with_a_real_run() {
+    // F44 consistency, F38 style (the F38 tests pair a check verdict with
+    // a run on the same config): the zero-config state must pass both
+    // `config check` and a run — check's note promises the adapter default
+    // model, and the run's dry-run report confirms it would use exactly
+    // that, so the two can never disagree about this state.
+    let out = run_zero_config(&["config", "check"]);
+    out.assert_code(0);
+    assert!(out.stdout().contains("config ok"), "{}", out.stdout());
+
+    let out = run_zero_config(&["ask", "-p", "hi", "--dry-run"]);
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("  model = ") && l.ends_with("(default)")),
+        "stdout: {stdout}"
+    );
+}
+
 #[test]
 fn zero_config_text_tasks_still_default_to_openai() {
     // Only speech gets the keyless default; text tasks still point at the
