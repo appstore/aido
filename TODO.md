@@ -487,3 +487,27 @@
 
 - F37–F40 已落地：`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` 全绿（**389 通过、0 失败、1 忽略**，忽略项为既有的 live Edge 端点用例）；四个 issue 的原始复现命令逐一验证通过。
 - F41–F45 已落地（同上三项全绿，**400 通过、0 失败、1 忽略**；F42/F44 人工复现通过，F41/F43/F45 由新增集成测试锁定）；第五部分全部勾选。
+
+---
+
+# 第六部分 · 全库复审第二轮（2026-09-14，基线 `d64c22b`）
+
+## 背景与结论
+
+- 对代码库的第二轮独立 review（问题均实测复现）；新增 7 条 finding（1 中 / 6 低），全部建为 issue：**F46–F52 = #51–#57**。
+- 与前两轮同源的家族延续：F46（=F38 家族，API key 环境变量回退）、F50（=F42 家族，静默篡改输入）、F51（=F45 家族，重复实现收敛）；其余为报错文案/文档（F47）、静默降级（F48）、性能（F49、F52）。
+- **状态（2026-09-14，进行中）**：修复于分支 `fix/review-f46-f52`（基于 `2fe0f9b`）。工作方式不变：每条一个独立 subagent，**先核实 issue 是否属实，再决定修复**（改码 + 补测 + fmt/clippy/test 全绿 + 自 review + 独立 commit）。
+
+## 逐条
+
+- [ ] **F46 · 中 · #51 · `src/plan.rs` / `src/runner.rs` · dry-run 凭据判定漏掉 `OPENAI_API_KEY` 回退** — 实际发送时默认 provider 的 key 解析带 `OPENAI_API_KEY` 回退（runner.rs），但 dry-run 的 `credentials_available` 只检查 `api_key_env` 本身，`api_key_present` 却有完整回退——同模块两个判定分叉。后果：`api_key_env = "AIDO_API_KEY"` 且只设 `OPENAI_API_KEY` 时，dry-run 报 "the request would fail" 而真实运行照常出网，失败预言与实际相反。修复：回退收敛为共享判定 `effective_key_env`，三处（plan 的两个判定 + runner 发送前解析）共用；dry-run 显示实际生效的变量（含 fallback 标注）。
+- [ ] **F47 · 低 · #52 · `src/plan.rs` · tty 下 `--json` + 二进制任务被通用预检拒绝** — 终端上 `aido image --text ... --json`（无 -o/--out-dir/--copy）被 "binary output needs -o FILE or --out-dir, or a stdout pipe" 拒绝，但报错完全没提 `--json` 的特殊原因（报告不含产物字节）；README 也未记载该组合限制。修复：该预检分支对 `cli.json` 给专门文案；README「输出（去向）」节补一行说明（终端上须另给 `-o`/`--out-dir`，管道下可用 `run_id` + `history show` 恢复）。
+- [ ] **F48 · 低 · #53 · `src/clipboard.rs` · hold 子进程 spawn/stdin 失败静默，与自身注释矛盾** — `spawn_holder` 文档注释承诺 "a failed hold is reported"，实际 spawn 失败与写 stdin 失败均静默 `return`/`let _`；X11 下 hold 进程正是进程退出后替 aido 持有剪贴板的机制，失败即 `--copy` 报成功但内容随退出消失、无线索。前提 F37（`__hold` 直通）已修。修复：失败路径全部落到 stderr warning（不阻断主流程）；`write_image` 与 `spawn_holder` 的重复 spawn 逻辑合并为单个 helper。
+- [ ] **F49 · 低 · #54 · `src/processors/ocr.rs` · 长图切片把原图完整解码两次并多付一次 PNG 重编码** — `slice_if_tall` 先 `image_as_png(part)`（解码+PNG 编码）再 `image::load_from_memory(&png)`（二次解码），而切片需要的只是像素。修复：直接 `image::load_from_memory(bytes)` 一次解码；像素上限守卫顺序、切片产物仍为 PNG、`image_as_png` 本身（适配器边界在用）均不变。补一条断言：切 JPEG 长图后各 slice 的 mime 仍为 `image/png`。
+- [ ] **F50 · 低 · #55 · `src/cli.rs` · `--text` / `-p` 的非 UTF-8 值被 `to_string_lossy` 静默替换成 U+FFFD** — `take_value` 对 flag 值做 lossy 转换，非 UTF-8 字节（GBK 中文、截断的多字节序列）被悄悄改写，模型收到坏数据；同 argv 的文件路径却保留原始 `OsString`。与模块文档 "Nothing is ever silently dropped or re-sourced" 相悖。修复：`take_value` 检测损失并显式报 usage 错误（退出 2）。
+- [ ] **F51 · 低 · #56 · `src/plan.rs` / `src/app.rs` · `first_line` 双实现且截断宽度不一致（72 / 64）** — 两份逐行同构的实现，唯一实质差异是截断宽度（plan 72 / app 64），意图只藏在调用处。修复：收敛为参数化单实现 `first_line(text, max_chars)`（放 domain.rs 或共享 util），两处各传各的宽度，现有输出逐字节不变。补单测：多行取首行、CJK 按 char 截断、恰好等于 max 不加 `...`。
+- [ ] **F52 · 低 · #57 · `tests/history.rs` · Ctrl+C 集成测试固定多等 30 秒** — 假服务器 accept 后 `sleep(30s)` 只为让请求挂着，但 SIGINT 1 秒后即发、aido 随即退出，测试尾部 `holder.join()` 干等满 30 秒——history 套件每次 `cargo test` 耗时 30.01s 的全部来源，CI 与 release job 各付一次。修复：holder 改为读连接直到 EOF（aido 被杀时连接断开，读循环随即返回）；断言零改动；验收：`cargo test --test history` 从 ~30s 降到 ~1s。
+
+## 完成标准（第六部分适用）
+
+- 本部分全部勾选；`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` 全绿；各 issue 的原始复现/验证命令逐一验证通过。
