@@ -492,6 +492,84 @@ fn dry_run_reports_typed_param_sources_flag_vs_task_default() {
 }
 
 #[test]
+fn typed_param_option_mismatch_is_a_usage_error_not_a_service_error() {
+    // A typed param maps to an adapter option; when the resolved adapter
+    // rejects it, the plan was never sent — exit 2, like the resolve-path
+    // [options] validation below, not a service error (3).
+    let tasks = temp_dir("param-option-mismatch");
+    std::fs::write(
+        tasks.join("mytask.toml"),
+        "operation = \"generate\"\n\
+         output_types = [\"text\"]\n\
+         params = [\"voice\"]\n",
+    )
+    .unwrap();
+    // The port-1 base_url is never contacted: validation must fail first.
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &[
+            "mytask",
+            "--profile",
+            "test",
+            "--voice",
+            "alloy",
+            "--text",
+            "hi",
+            "--dry-run",
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.starts_with("error:"), "{err}");
+    assert!(err.contains("does not support option 'voice'"), "{err}");
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
+fn task_options_rejected_by_the_adapter_stay_a_usage_error() {
+    // The same validation reached through the task's [options] table
+    // (resolve()) has always classified as usage; locked in beside the
+    // typed-param path so the two call sites cannot drift apart.
+    let tasks = temp_dir("task-options-mismatch");
+    std::fs::write(
+        tasks.join("opttask.toml"),
+        "operation = \"generate\"\n\
+         output_types = [\"text\"]\n\
+         \n\
+         [options]\n\
+         voice = \"alloy\"\n",
+    )
+    .unwrap();
+    let cfg = settings_config(
+        "[profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
+    );
+    let out = run(
+        &["opttask", "--profile", "test", "--text", "hi", "--dry-run"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+        ],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("does not support option 'voice'"),
+        "{}",
+        out.stderr()
+    );
+    std::fs::remove_dir_all(&tasks).ok();
+}
+
+#[test]
 fn dry_run_hides_credentials_embedded_in_the_base_url() {
     let file = temp_file("notes.md", b"material\n");
     let cfg = settings_config(
@@ -612,11 +690,45 @@ fn config_check_flags_route_keys_that_are_not_operations() {
 }
 
 #[test]
-fn config_check_requires_the_default_profile_to_exist_with_providers() {
-    // The built-in `default` profile only exists when no providers are
-    // configured; check and a real run must agree about that.
+fn providers_only_config_keeps_the_builtin_default_profile() {
+    // F38: the built-in `default` profile exists exactly when the user
+    // defined no profiles at all. A providers-only config is the
+    // documented way to override the built-in openai provider wholesale
+    // (README, Edge TTS), so it must keep working: check blesses it, and a
+    // run serves the builtin default profile with the USER's provider —
+    // the distinctive base_url proves it is not the builtin one.
     let cfg = settings_config(
         "[settings]\nhistory_keep = 0\n\
+         [providers.openai]\nbase_url = \"http://127.0.0.1:9/v1\"\napi_key_env = \"AIDO_API_KEY\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("config ok"), "{}", out.stdout());
+
+    let out = run(
+        &["ask", "-p", "hi", "--dry-run"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("http://127.0.0.1:9/v1"), "{stdout}");
+}
+
+#[test]
+fn config_check_flags_a_missing_default_profile_when_any_profile_exists() {
+    // The other side of the F38 rule: the built-in default profile exists
+    // only while the user has defined no profiles, so a config that adds
+    // [profiles.fast] without a [profiles.default] (and no
+    // default_profile) must keep failing check — and a default run must
+    // refuse the same way, so check and the runtime agree.
+    let cfg = settings_config(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.fast]\nprovider = \"srv\"\nmodel = \"m\"\n\
          [providers.srv]\nbase_url = \"http://127.0.0.1:1\"",
     );
     let out = run(
@@ -627,6 +739,69 @@ fn config_check_requires_the_default_profile_to_exist_with_providers() {
     out.assert_code(2);
     assert!(
         out.stdout().contains("default profile 'default'"),
+        "{}",
+        out.stdout()
+    );
+
+    let out = run(
+        &["ask", "-p", "hi", "--dry-run"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("profile 'default' not found"),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn config_check_agrees_with_the_builtin_openai_provider_fallback() {
+    // F38 symptom 2: a profile referencing `openai` without the user
+    // defining such a provider used to make `config check` report
+    // "unknown provider" and exit 2 while the same run succeeded — check
+    // lacked the runtime's builtin-openai fallback. The literal issue
+    // config (only [profiles.fast]) still fails check, but for the honest
+    // reason above (no default profile once any profile exists), never
+    // with the unknown-provider message; with default_profile pointing at
+    // the profile, check and the run must both succeed.
+    let literal = settings_config(
+        "[settings]\nhistory_keep = 0\n\
+         [profiles.fast]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", literal.to_str().unwrap())],
+    );
+    out.assert_code(2);
+    let stdout = out.stdout();
+    assert!(!stdout.contains("unknown provider"), "{stdout}");
+    assert!(stdout.contains("default profile 'default'"), "{stdout}");
+
+    let cfg = settings_config(
+        "default_profile = \"fast\"\n[settings]\nhistory_keep = 0\n\
+         [profiles.fast]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"",
+    );
+    let out = run(
+        &["config", "check"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("config ok"), "{}", out.stdout());
+
+    // the run falls back to the built-in openai provider (official
+    // endpoint), the same provider check just blessed.
+    let out = run(
+        &["ask", "-p", "hi", "--profile", "fast", "--dry-run"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+    );
+    out.assert_code(0);
+    assert!(
+        out.stdout().contains("https://api.openai.com/v1"),
         "{}",
         out.stdout()
     );

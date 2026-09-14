@@ -207,6 +207,19 @@ fn null_stdin_ocr_copy_previews_the_clipboard_under_dry_run() {
     );
 }
 
+#[test]
+fn holder_child_argv_reaches_clap_not_task_discovery() {
+    // The Linux clipboard holder spawns `aido __hold SECS [--image]`; an
+    // invalid SECS must be clap's usage error (the normalizer passed the
+    // argv through), never "unknown task '__hold'". A valid hold is not
+    // exercised: it would open the real desktop clipboard and sleep.
+    let out = run(&["__hold", "notanumber"], b"hello", &[]);
+    out.assert_code(2);
+    let err = out.stderr();
+    assert!(err.contains("invalid value"), "stderr: {err}");
+    assert!(!err.contains("unknown task"), "stderr: {err}");
+}
+
 #[cfg(unix)]
 #[test]
 fn text_files_keep_their_order_and_get_labels() {
@@ -363,6 +376,29 @@ fn ask_without_prompt_is_a_usage_error() {
     let out = run(&["ask", "-"], b"hi\n", &[]);
     out.assert_code(2);
     assert!(out.stderr().contains("-p"), "stderr: {}", out.stderr());
+}
+
+#[test]
+fn prompt_starting_with_a_dash_dry_runs_in_every_spelling() {
+    // `--prompt "-0.5度是什么意思"` and `-p "-0.5度是什么意思"` are the
+    // same request; the spellings the normalizer re-emits as separate
+    // flag+value tokens used to lose the value to clap's flag detection.
+    // The plan must carry the whole prompt as the requirement.
+    for args in [
+        &["ask", "--prompt", "-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "--prompt=-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "-p", "-0.5度是什么意思", "--dry-run"][..],
+        &["ask", "-p-0.5度是什么意思", "--dry-run"][..],
+    ] {
+        let out = run(args, b"", &[]);
+        out.assert_code(0);
+        let stdout = out.stdout();
+        assert!(
+            stdout.contains("requirement: -0.5度是什么意思"),
+            "{args:?}: {stdout}"
+        );
+        assert!(out.stderr().is_empty(), "{args:?}: {}", out.stderr());
+    }
 }
 
 #[cfg(unix)]

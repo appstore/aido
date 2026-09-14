@@ -460,3 +460,30 @@
 - 本部分全部勾选；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo check --locked --no-default-features` 全绿。
 - CI test.yml 增设 no-default-features job（含 aws-lc-rs 不在树断言）。
 - **状态（2026-09-14 收尾）**：R01–R16 + 2 项补测全部落地，15 个提交（e7a5700..cc47119）。实测 **205 单元 + 174 集成 = 379 通过、0 失败、1 忽略**（忽略项为既有的 live Edge 端点用例）；`--no-default-features` 下 clippy/check 全绿且 `cargo tree -i aws-lc-rs` 确认不在树。执行方式：R01–R13 与补测由逐条 subagent 完成；R14 的测试在 subagent 被配额截断前写就、生产修复由主线完成，R15/R16 由主线直接完成（同每条独立 commit 的纪律）。
+
+---
+
+# 第五部分 · 全库复审（2026-09-14，对 `d64c22b`）
+
+## 背景与结论
+
+- 对整个代码库（全部实现 + 测试 + 任务 TOML + CI）做了一次独立 review；实测基线：`cargo test --locked` 379 通过 / 0 失败 / 1 忽略，`cargo fmt --check` 与 clippy 全绿，F01–F36 与 R01–R16 的修复确认落地。
+- 新增 9 条 finding（1 高 / 3 中 / 5 低），全部建为 issue：**F37–F45 = #42–#50**。问题集中在两处「无任何测试覆盖的代码路径」（`__hold` 子命令、内置回退规则）与契约边角（负值旗标、退出码分类）。
+- **状态（2026-09-14）**：F37–F40（#42–#45）已修复，分支 `fix/review-f37-f40`（每条一个独立 subagent：改码 + 补测 + fmt/clippy/test 全绿 + 自 review + 独立 commit）；F41–F45（#46–#50）为开放 issue。修复后实测 **389 通过、0 失败、1 忽略**。
+
+## 逐条
+
+- [x] **F37 · 高 · #42 · `src/cli.rs` · `__hold` 子命令不可达** — 归一化器只给管理命令 / `last` / `run` 开了直通，`__hold` 落入未知任务分支：Linux `--copy` 派生的剪贴板保持子进程立即 exit 2，剪贴板内容随主进程退出失效（`23d9f8f` 任务化重构回归，初始提交可直达）。修复：`normalize()` 入口对首 token `__hold` 直通。（`f3664f8`）
+- [x] **F38 · 中 · #43 · `src/config/resolve.rs` / `src/config/mod.rs` · 内置回退规则不一致** — 内置 `default` profile 只在 `providers.is_empty()` 时存在（providers-only 配置全线失败，与 README「定义即覆盖」矛盾）；`check()` 不认运行时的 openai 内置 provider 回退（同一配置两个答案）。修复：统一为「用户未定义任何 profile 时 default 可用；未定义名为 openai 的 provider 时走内置回退」，resolve 与 check 共用同一规则，反向测试 `config_check_requires_the_default_profile_to_exist_with_providers` 按新契约重写。（`d936f9e`）
+- [x] **F39 · 中 · #44 · `src/cli.rs` · `--prompt` 等分支丢失负值附着** — 凡拆 token 重发为「旗标+值」两段的分支（`--prompt` 专用分支、`short_attached` 分支）都让 `-` 开头的值被 clap 当旗标拒绝；实测七种拼写矩阵见 issue #44 勘误评论（原 issue 中「`--prompt=v` 正常」为未实测的错误假设，实际也失败，且 `-m-x`/`-o-x` 同样受累）。修复：两分支对负值改推组合形式 `--flag=value`。（`601bc1a`）
+- [x] **F40 · 中 · #45 · `src/plan.rs` · typed 参数校验误分类退出码 3** — `apply_param_options` 用 `From<anyhow::Error>`（默认 Service）包装 `validate_options` 错误，而 resolve 路径的同一条校验为 usage（退出码 2）。修复：统一 usage；补齐 resolve 路径此前缺失的同类断言测试。（`24006d9`）
+- [ ] **F41 · 低 · #46 · `--total-timeout` 只对 edge-tts 生效** — HTTP 多请求链路无整跑上限，与帮助文案不符（开放 issue）。
+- [ ] **F42 · 低 · #47 · 管理命令静默丢弃 `--text` / `--paste` 材料** — 违背 input.rs「never silently dropped」原则（开放 issue）。
+- [ ] **F43 · 低 · #48 · `history list` 为一行标签加载全部产物字节**（开放 issue）。
+- [ ] **F44 · 低 · #49 · 零配置 `config check` 报错退出 2，空配置文件却 ok**（开放 issue；F38 修复刻意未动此行为）。
+- [ ] **F45 · 低 · #50 · manifest version / 扩展名兼容表 / civil_from_days 三处重复**（开放 issue）。
+
+## 完成标准（第五部分适用）
+
+- F37–F40 已落地：`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` 全绿（**389 通过、0 失败、1 忽略**，忽略项为既有的 live Edge 端点用例）；四个 issue 的原始复现命令逐一验证通过。
+- F41–F45 修复时逐条勾选并引用对应 issue。

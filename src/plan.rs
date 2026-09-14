@@ -383,10 +383,12 @@ fn apply_param_options(cli: &Cli, task: &Task, resolved: &mut Resolved) -> AppRe
         };
         resolved.options.insert(key.to_string(), value);
     }
+    // Pure preflight: classify like the resolve()-path validation (usage,
+    // exit 2), not as a service error — nothing was ever sent.
     resolved
         .adapter
         .validate_options(&resolved.options)
-        .map_err(AppError::from)?;
+        .map_err(|e| AppError::usage(format!("{e:#}")))?;
     Ok(())
 }
 
