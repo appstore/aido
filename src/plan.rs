@@ -676,9 +676,15 @@ fn resolve_destinations(
             .iter()
             .all(|d| matches!(d, Destination::Stdout))
     {
-        return Err(AppError::usage(
-            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe",
-        ));
+        // With --json the sole Stdout destination is the report itself,
+        // which carries no artifact bytes: say so instead of the generic
+        // binary-needs-a-home advice, which reads like a missing flag.
+        return Err(AppError::usage(if cli.json {
+            "the --json report carries no artifact bytes; add -o FILE or \
+             --out-dir so the generated artifact lands somewhere (or pipe stdout)"
+        } else {
+            "binary output needs -o FILE or --out-dir, --copy, or a stdout pipe"
+        }));
     }
     Ok(destinations)
 }
