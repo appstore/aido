@@ -97,6 +97,34 @@ jobs:
             echo "aws-lc-rs is out of the tree (edge-tts feature off)"
           fi
 
+  musl:
+    # x86_64-unknown-linux-musl 是 release 产物目标（全静态 Linux 二进制）。
+    # PR 阶段跑 check（会执行 build script、编译 aws-lc-sys 的 C 代码，真实走
+    # musl 工具链），避免 musl 兼容性破坏拖到发版才暴露。
+    name: musl check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-check
+
+      - name: Check (musl)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo check --locked --target x86_64-unknown-linux-musl
+
   msrv:
     # 验证 Cargo.toml 声明的 rust-version 真的能编译（--locked 锁定依赖版本，防止依赖漂移掩盖问题）
     name: msrv

@@ -14,7 +14,7 @@ aido tts --text "你好" -o hello.mp3
 
 ## 安装
 
-从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。
+从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。Linux 另提供 musl 全静态产物（`x86_64-unknown-linux-musl`），不依赖 glibc，任意 x86_64 Linux 环境（含极简容器）可直接运行。
 
 或从源码构建（需要 Rust 1.88+）：
 
@@ -309,7 +309,7 @@ X11（以及多数 Wayland 合成器）的剪贴板内容依附于写入它的�
 
 ## 发布流程
 
-push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workflows/release.yml)：跑测试，构建 Linux / macOS（Intel + Apple Silicon）/ Windows 二进制，打 `v<version>` 标签并发布到 [Releases](https://github.com/appstore/aido/releases)。
+push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workflows/release.yml)：跑测试，构建 Linux（gnu + musl 全静态）/ macOS（Intel + Apple Silicon）/ Windows 二进制，打 `v<version>` 标签并发布到 [Releases](https://github.com/appstore/aido/releases)。
 
 1. 在 `Cargo.toml` 中更新 `version`
 2. 把代码合入 `release` 分支并 push
