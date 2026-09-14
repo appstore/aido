@@ -12,7 +12,8 @@
 
 use crate::clipboard;
 use crate::domain::{
-    AppError, AppResult, Artifact, DeliveryState, DeliveryStatus, Destination, ErrorKind, MediaKind,
+    extension_matches_format, AppError, AppResult, Artifact, DeliveryState, DeliveryStatus,
+    Destination, ErrorKind, MediaKind, JSON_ENVELOPE_VERSION,
 };
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -430,9 +431,7 @@ fn check_extension(artifact: &Artifact, path: &Path) -> Result<(), String> {
     }
     let extension = extension.to_ascii_lowercase();
     let format = &artifact.format;
-    let ok = extension == format.as_str()
-        || (extension == "jpg" && format == "jpeg")
-        || (extension == "ogg" && format == "opus");
+    let ok = extension_matches_format(&extension, format);
     if !ok {
         return Err(format!(
             "output format is '{format}', but the file is named '.{extension}'; \
@@ -649,7 +648,7 @@ fn write_directory(
         saved.push((artifact.id.clone(), absolute(&path)));
     }
     let manifest = serde_json::json!({
-        "version": 1,
+        "version": JSON_ENVELOPE_VERSION,
         "run_id": run_id,
         "artifacts": names,
     });
@@ -765,7 +764,7 @@ fn json_report(
         .map(|(name, error)| serde_json::json!({"part": name, "error": error}))
         .collect();
     serde_json::json!({
-        "version": 1,
+        "version": JSON_ENVELOPE_VERSION,
         "run_id": args.run_id,
         "task": args.task,
         "artifacts": artifacts,
@@ -788,7 +787,7 @@ pub fn error_report(
     task: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "version": 1,
+        "version": JSON_ENVELOPE_VERSION,
         "run_id": run_id,
         "task": task,
         "artifacts": [],

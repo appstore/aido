@@ -11,6 +11,7 @@ use crate::processors::ocr::BoundaryGate;
 use crate::processors::StepRole;
 use crate::spinner::Spinner;
 use crate::tasks::ProcessorKind;
+use anyhow::anyhow;
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::rc::Rc;
@@ -173,6 +174,11 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         adapter: plan.resolved.adapter,
     };
     let client = Client::new(&conn).map_err(AppError::from)?;
+
+    // `--total-timeout` caps the whole run, not any single request: one
+    // deadline fixed before the first request goes out, and every request
+    // of the run must fit inside whatever remains of the budget.
+    let deadline = plan.total_timeout.map(|t| tokio::time::Instant::now() + t);
 
     let live_stdout = plan.delivery == DeliveryMode::Live
         && plan.destinations.contains(&Destination::Stdout)
@@ -407,10 +413,46 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 None => g.sink.borrow_mut().emit(delta),
             }
         };
-        let result = if plan.transport_stream {
-            client.generate_stream(&request, &mut on_delta).await
-        } else {
-            client.generate(&request).await
+        // One request future for either transport, so the budget below
+        // bounds exactly what runs: the HTTP exchange plus the media
+        // downloads inside generate() (image URL fetches). The block
+        // scope ends with this statement, dropping the future (and its
+        // `on_delta` borrow) before the reply handling below.
+        let result = {
+            let send = async {
+                if plan.transport_stream {
+                    client.generate_stream(&request, &mut on_delta).await
+                } else {
+                    client.generate(&request).await
+                }
+            };
+            // The budget is enforced inside the edge-tts adapter as well
+            // (it receives total_timeout through Connection); for edge
+            // runs the adapter's more specific error may surface instead
+            // of this wrap's — the wrap is what extends the cap to every
+            // adapter without its own.
+            match deadline {
+                // No budget: each request is bounded only by its own
+                // per-request timeout, exactly as before.
+                None => send.await,
+                Some(d) => {
+                    // A deadline exists only when a budget does, so the
+                    // plan's seconds are always the cap actually set.
+                    let secs = plan.total_timeout.map(|t| t.as_secs()).unwrap_or_default();
+                    let spent = || anyhow!("the run exceeded its total time budget ({secs}s)");
+                    let remaining = d.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        // The budget was spent before this request could
+                        // start: nothing is sent, and the error flows
+                        // down the same path as any request error.
+                        Err(spent())
+                    } else {
+                        tokio::time::timeout(remaining, send)
+                            .await
+                            .unwrap_or_else(|_| Err(spent()))
+                    }
+                }
+            }
         };
         match result {
             Ok(mut reply) => {

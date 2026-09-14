@@ -9,7 +9,9 @@
 use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
-use crate::domain::{AppError, AppResult, Destination, InputPart, MediaKind, RunSummary};
+use crate::domain::{
+    extension_matches_format, AppError, AppResult, Destination, InputPart, MediaKind, RunSummary,
+};
 use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
 use crate::processors::{self, RequestStep};
@@ -586,9 +588,7 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
                         MediaKind::Audio => "mp3".to_string(),
                         _ => "png".to_string(),
                     });
-                let compatible = extension == requested
-                    || (extension == "jpg" && requested == "jpeg")
-                    || (extension == "ogg" && requested == "opus");
+                let compatible = extension_matches_format(&extension, &requested);
                 if !compatible {
                     return Err(AppError::usage(format!(
                         "output encoding is '{requested}', but the file is named '.{extension}'; \

@@ -582,3 +582,86 @@ fn map_failure_keeps_the_replies_that_arrived() {
         "the run stops at the failed map request"
     );
 }
+
+// --- --total-timeout caps the whole run, not each request (F41) -----------
+
+#[test]
+fn total_timeout_stops_the_second_chunk_and_keeps_the_first_reply() {
+    // Two chunks; the second reply is delayed far past the 3s whole-run
+    // budget, which the 120s per-request timeout would happily wait out.
+    // The budget kills the second request, the run exits 3, and the
+    // record keeps the first chunk's paid reply.
+    let file = temp_file("book.txt", long_text().as_bytes());
+    let server = DelayServer::start(
+        &[chat_body("第一块的结果"), chat_body("第二块的结果")],
+        std::time::Duration::from_secs(10),
+    );
+    let dir = temp_dir("chunk-budget");
+    let cfg = chunk_hist_cfg(&server.url());
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--total-timeout",
+            "3",
+            file.to_str().unwrap(),
+        ],
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.clone(),
+    );
+    out.assert_code(3);
+    let err = out.stderr();
+    assert!(err.contains("request 2/2 failed"), "{err}");
+    assert!(
+        err.contains("the run exceeded its total time budget (3s)"),
+        "{err}"
+    );
+
+    // The run is recorded incomplete, and its kept artifact file holds
+    // exactly the reply that did arrive.
+    let (run, manifest) = recorded_manifest(&dir);
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    assert!(
+        manifest["generation"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("total time budget"),
+        "{manifest}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run.join("text.txt")).unwrap(),
+        "第一块的结果",
+        "the first chunk's reply is kept verbatim"
+    );
+}
+
+#[test]
+fn without_a_total_timeout_a_delayed_second_reply_still_completes() {
+    // The same two-request shape with no --total-timeout: the budget wrap
+    // must be a no-op, so a 1s delay — far under the per-request timeout
+    // — still delivers both chunks normally.
+    let file = temp_file("book.txt", long_text().as_bytes());
+    let server = DelayServer::start(
+        &[chat_body("第一块的结果"), chat_body("第二块的结果")],
+        std::time::Duration::from_secs(1),
+    );
+    let out = run_tty_with(
+        &[
+            "translate",
+            "--profile",
+            "test",
+            "--no-stream",
+            file.to_str().unwrap(),
+        ],
+        &[],
+        chunk_cfg(&server.url()),
+    );
+    out.assert_code(0);
+    assert_eq!(out.stdout(), "第一块的结果\n\n第二块的结果\n");
+    assert_eq!(server.requests().len(), 2);
+}

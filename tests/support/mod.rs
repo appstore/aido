@@ -96,6 +96,59 @@ impl MultiServer {
     }
 }
 
+/// Serves one canned reply per request for `bodies.len()` sequential
+/// requests, sleeping `delay` before every reply after the first (the
+/// first answers immediately), recording every raw request. A delayed
+/// reply usually lands after a `--total-timeout` run has already hung
+/// up mid-request, so unlike the other servers the response write
+/// tolerates failure — the client leaving is the point of the test, not
+/// a server bug. Tests whose client gives up during the delay should
+/// drop the server instead of calling [`Self::requests`], which waits
+/// out the sleep.
+pub struct DelayServer {
+    pub port: u16,
+    handle: JoinHandle<Vec<Vec<u8>>>,
+}
+
+impl DelayServer {
+    pub fn start(bodies: &[&str], delay: std::time::Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Vec<String> = bodies.iter().map(|b| b.to_string()).collect();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut requests = Vec::new();
+            for (i, body) in bodies.iter().enumerate() {
+                let mut stream = accept(&listener, deadline);
+                stream.set_nonblocking(false).unwrap();
+                requests.push(read_request(&mut stream));
+                if i > 0 {
+                    std::thread::sleep(delay);
+                }
+                // write_response's wire format, but a failed write (the
+                // client hung up during the delay) must not kill the
+                // server thread.
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            requests
+        });
+        Self { port, handle }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub fn requests(self) -> Vec<Vec<u8>> {
+        self.handle.join().unwrap()
+    }
+}
+
 /// Accept one connection before `deadline`, polling instead of blocking so
 /// a regression that makes aido exit before requesting fails the test
 /// instead of hanging it.

@@ -8,6 +8,7 @@
 
 use crate::domain::{
     Artifact, DeliveryState, GenerationStatus, MediaKind, Provenance, RunRecord, RunSummary,
+    JSON_ENVELOPE_VERSION,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -149,7 +150,7 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
         }
     }
     let manifest = Manifest {
-        version: 1,
+        version: JSON_ENVELOPE_VERSION,
         run_id: record.run_id.clone(),
         task: record.task.clone(),
         created_at: record.created_at.clone(),
@@ -205,8 +206,10 @@ fn read_manifest(run_dir: &Path) -> Result<Manifest> {
         .with_context(|| format!("invalid run manifest in {}", run_dir.display()))
 }
 
-/// Load one run, artifact bytes included.
-pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
+/// The run's directory and manifest, when the run exists: the shared front
+/// half of [`load`] and [`load_meta`]. `Ok(None)` when there is no history
+/// dir or the run dir has no manifest (unfinished or in-flight).
+fn open_manifest(run_id: &str) -> Result<Option<(PathBuf, Manifest)>> {
     let Some(dir) = history_dir() else {
         return Ok(None);
     };
@@ -215,6 +218,14 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
         return Ok(None);
     }
     let manifest = read_manifest(&run_dir)?;
+    Ok(Some((run_dir, manifest)))
+}
+
+/// Load one run, artifact bytes included.
+pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
+    let Some((run_dir, manifest)) = open_manifest(run_id)? else {
+        return Ok(None);
+    };
     let mut artifacts = Vec::new();
     for meta in &manifest.artifacts {
         let path = run_dir.join(&meta.file);
@@ -243,6 +254,31 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
         failed_parts: manifest.failed_parts,
         parts_total: manifest.parts_total,
         deliveries: manifest.deliveries,
+    }))
+}
+
+/// The manifest-only view of one run: what `history list` labels need,
+/// with no artifact bytes read. A run whose artifacts are damaged still
+/// lists normally — its manifest is the record of what happened.
+pub struct RunMeta {
+    pub task: Option<String>,
+    pub generation: GenerationStatus,
+    pub failed_parts: usize,
+    pub parts_total: usize,
+}
+
+/// One run's metadata without its artifact bytes. Same existence and
+/// error semantics as [`load`]: `Ok(None)` when the run dir has no
+/// manifest, `Err` when it cannot be read or parsed.
+pub fn load_meta(run_id: &str) -> Result<Option<RunMeta>> {
+    let Some((_, manifest)) = open_manifest(run_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(RunMeta {
+        failed_parts: manifest.failed_parts.len(),
+        parts_total: manifest.parts_total,
+        task: manifest.task,
+        generation: manifest.generation,
     }))
 }
 
@@ -429,7 +465,7 @@ fn stamp(elapsed: Duration) -> String {
 }
 
 /// Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

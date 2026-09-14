@@ -113,6 +113,49 @@ fn a_failing_part_does_not_sink_the_batch() {
 }
 
 #[test]
+fn total_timeout_fails_the_slow_part_and_delivers_the_survivor() {
+    // The second part's reply is delayed far past the 3s whole-run
+    // budget, which the per-request timeout would happily wait out: the
+    // budget (not the transport) fails part b, the survivor still
+    // delivers, and the run exits 6 after delivery.
+    let (a, b) = two_images("perpart-budget");
+    let out_dir = temp_dir("perpart-budget-out");
+    let server = DelayServer::start(
+        &[chat_body("text of A"), chat_body("text of B")],
+        std::time::Duration::from_secs(10),
+    );
+    let cfg = batch_cfg(&server.url());
+    let out = run_ocr(
+        &cfg,
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--total-timeout",
+            "3",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    out.assert_code(6);
+    assert_eq!(
+        std::fs::read_to_string(out_dir.join("a.txt")).unwrap(),
+        "text of A"
+    );
+    assert!(!out_dir.join("b.txt").exists());
+    let err = out.stderr();
+    assert!(err.contains("part 'b.png' failed"), "{err}");
+    assert!(
+        err.contains("the run exceeded its total time budget (3s)"),
+        "{err}"
+    );
+    assert!(err.contains("1/2 input part(s) failed"), "{err}");
+}
+
+#[test]
 fn all_parts_failing_exits_four_without_delivery() {
     let (a, b) = two_images("perpart-allfail");
     let out_dir = temp_dir("perpart-allfail-out");

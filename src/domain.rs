@@ -6,6 +6,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The envelope version of every JSON document aido writes: run reports
+/// (`--json`), delivery manifests and history manifests. All writers share
+/// this one value; a future format change bumps it exactly once.
+pub(crate) const JSON_ENVELOPE_VERSION: u32 = 1;
+
+/// Whether a (lowercased) file extension names the same encoding as
+/// `format`: equal names, plus the two conventional aliases (jpg↔jpeg,
+/// ogg↔opus).
+pub(crate) fn extension_matches_format(extension: &str, format: &str) -> bool {
+    extension == format
+        || (extension == "jpg" && format == "jpeg")
+        || (extension == "ogg" && format == "opus")
+}
+
 /// The three content kinds aido understands on either side of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -480,6 +494,21 @@ mod tests {
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
         }
+    }
+
+    #[test]
+    fn extension_matches_format_accepts_aliases_not_case_variants() {
+        // Exact names and the two conventional aliases match.
+        assert!(extension_matches_format("png", "png"));
+        assert!(extension_matches_format("jpg", "jpeg"));
+        assert!(extension_matches_format("ogg", "opus"));
+        // Anything else does not — including the alias read backwards (a
+        // `.jpeg` file with `--format jpg`) and uppercase letters:
+        // callers lowercase the extension before asking, so this fn
+        // compares strings exactly.
+        assert!(!extension_matches_format("png", "mp3"));
+        assert!(!extension_matches_format("jpeg", "jpg"));
+        assert!(!extension_matches_format("JPG", "jpeg"));
     }
 
     #[test]

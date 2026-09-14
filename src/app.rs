@@ -6,7 +6,7 @@ use crate::config;
 use crate::domain::{
     AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind, RunRecord, RunSummary,
 };
-use crate::history;
+use crate::history::{self, civil_from_days};
 use crate::input::InputEnv;
 use crate::output::{self, DeliverArgs};
 use crate::plan::{self, TerminalInfo};
@@ -429,19 +429,6 @@ fn now_iso() -> String {
     )
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 fn print_help() {
     let mut cmd = <Cli as clap::CommandFactory>::command();
     cmd.print_help().ok();
@@ -500,19 +487,21 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
             // takes as its operand.
             for (n, id) in ids.iter().rev().enumerate() {
                 let n = n + 1;
-                match history::load(id) {
-                    Ok(Some(record)) => {
-                        let mut label = generation_label(&record.generation);
-                        if !record.failed_parts.is_empty() {
+                // Manifest-only: the list labels runs without reading
+                // their artifact bytes back.
+                match history::load_meta(id) {
+                    Ok(Some(meta)) => {
+                        let mut label = generation_label(&meta.generation);
+                        if meta.failed_parts > 0 {
                             label.push_str(&format!(
                                 "; {}/{} input part(s) failed",
-                                record.failed_parts.len(),
-                                record.parts_total.max(record.failed_parts.len())
+                                meta.failed_parts,
+                                meta.parts_total.max(meta.failed_parts)
                             ));
                         }
                         println!(
                             "{n:>width$}  {id}  {:<12} {label}",
-                            record.task.as_deref().unwrap_or("-")
+                            meta.task.as_deref().unwrap_or("-")
                         );
                     }
                     Ok(None) => println!("{n:>width$}  {id}  (unreadable)"),

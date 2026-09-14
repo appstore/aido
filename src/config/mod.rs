@@ -242,13 +242,15 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 }
             }
         }
-        // `config init` writes the placeholder model; a profile still
-        // carrying it (or an empty model) fails at run time, so check
-        // must flag it instead of reporting ok.
+        // A model-less profile runs on the adapter's default model
+        // (resolve() falls back to it), so check must not fail it — a
+        // stderr note says as much. Only the placeholder/empty model is a
+        // real issue: `config init` writes it and it would never be what
+        // the user wants.
         match profile.model.as_deref().map(str::trim) {
-            None => issues.push(format!(
-                "profile '{name}': no model set; the adapter default would be used"
-            )),
+            None => eprintln!(
+                "note: profile '{name}' has no model set; the adapter default will be used"
+            ),
             Some(m) if m.is_empty() || m == MODEL_PLACEHOLDER => issues.push(format!(
                 "profile '{name}': no model configured; set model in the config \
                  ('{MODEL_PLACEHOLDER}' is the config init placeholder)"
