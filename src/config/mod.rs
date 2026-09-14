@@ -184,12 +184,22 @@ pub fn default_config() -> Config {
 /// Validate a whole config: used by `aido config check`.
 pub fn check(cfg: &Config) -> Vec<String> {
     let mut issues = Vec::new();
+    // The built-in providers, for the same `openai` fallback resolve()
+    // applies at run time: a profile naming `openai` runs against the
+    // built-in provider when the user defined no such provider, so check
+    // cannot disagree with a real run about it.
+    let effective = default_config();
     for (name, profile) in &cfg.profiles {
         let Some(provider_name) = &profile.provider else {
             issues.push(format!("profile '{name}': missing provider"));
             continue;
         };
-        match cfg.providers.get(provider_name) {
+        let provider = cfg.providers.get(provider_name).or_else(|| {
+            (provider_name == "openai")
+                .then(|| effective.providers.get("openai"))
+                .flatten()
+        });
+        match provider {
             None => issues.push(format!(
                 "profile '{name}' references unknown provider '{provider_name}'"
             )),
@@ -248,15 +258,15 @@ pub fn check(cfg: &Config) -> Vec<String> {
     }
     // The profile resolution will actually use: an explicit
     // default_profile, else the implicit "default". The built-in default
-    // profile exists only when no providers are configured at all — the
-    // same rule resolution applies at run time, so `config check` and a
-    // real run never disagree.
+    // profile exists exactly when the user defined no profiles at all —
+    // the same rule resolution applies at run time, so `config check` and
+    // a real run never disagree.
     let default_name = cfg
         .default_profile
         .clone()
         .unwrap_or_else(|| "default".to_string());
     let resolvable = cfg.profiles.contains_key(&default_name)
-        || (default_name == "default" && cfg.providers.is_empty());
+        || (default_name == "default" && cfg.profiles.is_empty());
     if !resolvable {
         issues.push(format!(
             "default profile '{default_name}' is not defined in [profiles]; \

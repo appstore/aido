@@ -97,10 +97,14 @@ pub(super) fn effective_adapter(operation: Operation, provider: &Provider) -> Ad
 pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     let profile_name = select_profile_name(cli, task, cfg)?;
     let effective = super::default_config();
-    // A config that predates schema 2 may carry no providers at all: the
-    // built-in defaults still let `--help`-level usage work.
+    // The built-in `default` profile exists exactly when the user defined
+    // no profiles at all. A providers-only config — the documented way to
+    // override the built-in openai provider wholesale — therefore keeps
+    // the built-in profile; the first [profiles.*] the user defines takes
+    // over, and the guard keeps a `--profile foo` request from ever being
+    // served by the built-in default.
     let profile = cfg.profiles.get(&profile_name).or_else(|| {
-        if profile_name == "default" && cfg.providers.is_empty() {
+        if profile_name == "default" && cfg.profiles.is_empty() {
             effective.profiles.get("default")
         } else {
             None
@@ -117,7 +121,8 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
             )
             .collect();
         bail!(
-            "profile '{profile_name}' not found; available: {} (see `aido profiles list`)",
+            "profile '{profile_name}' not found; available: {} (see `aido profiles list`); \
+             add [profiles.{profile_name}] or set default_profile",
             if available.is_empty() {
                 "(none defined)".to_string()
             } else {
