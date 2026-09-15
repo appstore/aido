@@ -6,9 +6,12 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 pub const EXE: &str = env!("CARGO_BIN_EXE_aido");
 
@@ -275,11 +278,65 @@ static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Names below temp_dir that belong to this suite's tests. Extend when a
+/// new prefix appears; legacy flat entries age out via the sweep either way.
+const OUR_PREFIXES: [&str; 4] = ["aido-test-", "aido-input-", "aido-out-", "aido-it-"];
+
+/// Root for this process's temp artifacts (`{temp_dir}/aido-test-run-{pid}`).
+/// Every helper-created path lives under it, so a run's leftovers die
+/// together. A test can panic and a run can be killed before any
+/// end-of-test cleanup fires, so instead of deleting at each test's end,
+/// every new run sweeps leftovers that have gone stale. Integration
+/// helpers may re-root their own paths onto it too.
+pub fn run_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let base = std::env::temp_dir();
+        let root = base.join(format!("aido-test-run-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        sweep_stale_leftovers(&base, &root);
+        root
+    })
+}
+
+/// Best-effort removal of this suite's leftovers under `base` that have
+/// been untouched for over a day: old run roots plus pre-root flat
+/// entries. Fresh entries stay: another concurrent run may still be using
+/// them.
+fn sweep_stale_leftovers(base: &Path, keep: &Path) {
+    const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let ours = OUR_PREFIXES.iter().any(|p| name.starts_with(p));
+        if !ours || entry.path() == keep {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        // An unknown age (clock skew) counts as fresh: removal is best-effort.
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= STALE_AFTER);
+        if !stale {
+            continue;
+        }
+        if meta.is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// A valid config with history off, so ordinary runs never write anywhere.
 pub fn empty_config() -> std::path::PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("aido-test-empty-{}-{n}.toml", std::process::id()));
+    let path = run_root().join(format!("aido-test-empty-{}-{n}.toml", std::process::id()));
     std::fs::write(&path, "[settings]\nhistory_keep = 0\n").unwrap();
     path
 }
@@ -287,7 +344,7 @@ pub fn empty_config() -> std::path::PathBuf {
 /// A config with custom settings content.
 pub fn settings_config(content: &str) -> std::path::PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = run_root().join(format!(
         "aido-test-settings-{}-{n}.toml",
         std::process::id()
     ));
@@ -298,16 +355,17 @@ pub fn settings_config(content: &str) -> std::path::PathBuf {
 /// A temp input file with a unique name, so parallel tests never collide.
 pub fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let n = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("aido-test-file-{}-{n}-{name}", std::process::id()));
+    let path = run_root().join(format!("aido-test-file-{}-{n}-{name}", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     path
 }
 
-/// A fresh unique directory.
+/// A fresh unique directory. The same-pid pre-clean guards against a
+/// reused pid picking up a pre-sweep (<24h) run root's leftovers.
 pub fn temp_dir(tag: &str) -> std::path::PathBuf {
     let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("aido-test-{tag}-{}-{n}", std::process::id()));
+    let path = run_root().join(format!("aido-test-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }

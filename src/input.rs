@@ -726,6 +726,7 @@ fn audio_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 mod tests {
     use super::*;
     use crate::clipboard::ClipboardContent;
+    use crate::test_support::run_root;
     use std::io::Cursor;
 
     fn env(stdin_data: &'static [u8]) -> InputEnv<'static> {
@@ -800,7 +801,7 @@ mod tests {
         // CI runners, cron and `docker run` without `-t` attach a closed
         // pipe or /dev/null: not a terminal, and no bytes either. The
         // explicit material must run exactly as it would on a terminal.
-        let dir = std::env::temp_dir().join(format!("aido-input-null-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-null-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.txt");
         std::fs::write(&real, b"real\n").unwrap();
@@ -814,7 +815,7 @@ mod tests {
     /// and probe answer are independent injections.
     #[test]
     fn probe_drives_the_pipe_guard_not_the_cursor() {
-        let dir = std::env::temp_dir().join(format!("aido-input-probe-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-probe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.txt");
         std::fs::write(&real, b"real\n").unwrap();
@@ -830,7 +831,7 @@ mod tests {
 
     #[test]
     fn dash_reads_stdin_at_its_position() {
-        let dir = std::env::temp_dir().join(format!("aido-input-dash-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-dash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         std::fs::write(&a, b"from file\n").unwrap();
@@ -866,7 +867,7 @@ mod tests {
 
     #[test]
     fn empty_file_is_an_error_not_a_skip() {
-        let dir = std::env::temp_dir().join(format!("aido-input-test-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let empty = dir.join("empty.txt");
         std::fs::write(&empty, b"").unwrap();
@@ -898,7 +899,7 @@ mod tests {
                 image::ImageFormat::Jpeg,
             )
             .unwrap();
-        let dir = std::env::temp_dir().join(format!("aido-input-jpg-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-jpg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shot.jpg");
         std::fs::write(&path, &jpg).unwrap();
@@ -965,9 +966,10 @@ mod tests {
     }
 
     /// A fresh temp dir with the given relative entries (parents created
-    /// as needed); leftovers from a crashed earlier run are cleared.
+    /// as needed). The same-pid pre-clean guards against a reused pid
+    /// picking up a pre-sweep (<24h) run root's leftovers.
     fn write_dir(name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aido-input-{name}-{}", std::process::id()));
+        let dir = run_root().join(format!("aido-input-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (file, bytes) in entries {

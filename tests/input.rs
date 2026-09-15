@@ -570,7 +570,7 @@ fn dry_run_does_not_touch_the_clipboard() {
 
 #[cfg(unix)]
 fn expansion_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("aido-it-{name}-{}", std::process::id()));
+    let dir = run_root().join(format!("aido-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

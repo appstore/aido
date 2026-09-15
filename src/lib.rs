@@ -21,3 +21,6 @@ pub mod processors;
 pub mod runner;
 pub mod spinner;
 pub mod tasks;
+
+#[cfg(test)]
+mod test_support;
