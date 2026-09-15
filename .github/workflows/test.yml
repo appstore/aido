@@ -136,6 +136,8 @@ jobs:
           cd "$RUNNER_TEMP/pdfium"
           curl -sSfL -O "https://github.com/kernoeb/pdfium-static/releases/download/${PDFIUM_TAG}/libpdfium-linux-x64.a"
           echo "${PDFIUM_SHA256}  libpdfium-linux-x64.a" | sha256sum -c -
+          # build.rs 以 `-lpdfium` 链接,链接器只认 libpdfium.a 这个名字
+          mv libpdfium-linux-x64.a libpdfium.a
 
       - name: Clippy (pdfium)
         env:
