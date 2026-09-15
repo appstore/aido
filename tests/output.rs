@@ -103,6 +103,7 @@ fn existing_output_file_refuses_without_overwrite() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
 }
 
+#[cfg(unix)]
 #[test]
 fn media_extension_mismatch_fails_before_any_request() {
     let dir = temp_dir("out-ext");
@@ -289,6 +290,7 @@ fn json_with_an_output_file_still_delivers_the_image() {
     assert!(out.stderr().contains("saved"), "stderr: {}", out.stderr());
 }
 
+#[cfg(unix)]
 #[test]
 fn directory_delivery_writes_artifacts_then_manifest() {
     let png = solid_png(2, 2);
@@ -354,6 +356,7 @@ fn directory_delivery_writes_artifacts_then_manifest() {
     assert_eq!(manifest["artifacts"].as_array().unwrap().len(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn out_dir_keeps_the_previous_delivery_without_overwrite() {
     // Run 1: a plain summary lands as text.txt plus its manifest.
@@ -456,6 +459,7 @@ fn out_dir_keeps_the_previous_delivery_without_overwrite() {
     assert_eq!(files, ["a.txt", "b.txt"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn single_image_to_piped_stdout_is_exact_bytes() {
     let png = solid_png(2, 2);
@@ -760,6 +764,7 @@ fn json_report_still_prints_when_a_late_refusal_fails_delivery() {
     assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
 }
 
+#[cfg(unix)]
 #[test]
 fn several_artifacts_cannot_share_bare_stdout() {
     // produce two kinds and pipe stdout: the late check catches it — as a
@@ -797,6 +802,7 @@ fn several_artifacts_cannot_share_bare_stdout() {
     assert!(out.stdout().is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
     // The service returns two images but only `-o one.png` was given: the
@@ -954,6 +960,7 @@ fn last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_fi
     assert!(out.stderr().contains("error:"), "stderr: {}", out.stderr());
 }
 
+#[cfg(unix)]
 #[test]
 fn clipboard_refusal_records_the_failed_attempt() {
     // --count 2 --copy overflows the clipboard after the generation: a
@@ -1064,6 +1071,7 @@ pub fn encode_png() -> String {
     out
 }
 
+#[cfg(unix)]
 #[test]
 fn attached_short_o_delivers_to_the_named_file() {
     // `-ofile` (attached short value) must reach --output, never collapse

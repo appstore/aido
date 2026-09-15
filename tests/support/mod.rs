@@ -561,7 +561,8 @@ pub fn huge_jpeg(w: u32, h: u32) -> Vec<u8> {
 
 /// Run aido with a pseudo-terminal as stdin, for tests of "terminal
 /// stdin" rows of the decision table (file material without `-`).
-/// Unix-only: CI runs the suite on Linux and macOS.
+/// Unix-only: the Windows CI job compiles the whole suite, so a test
+/// reaching for these must itself carry `#[cfg(unix)]`.
 #[cfg(unix)]
 pub fn run_tty(args: &[&str], envs: &[(&str, &str)]) -> RunOutcome {
     run_tty_with(args, envs, empty_config())

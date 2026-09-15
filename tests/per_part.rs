@@ -29,11 +29,13 @@ fn batch_cfg(url: &str) -> std::path::PathBuf {
 
 /// Run aido with a terminal stdin (file material, no `-`), the test
 /// profile selected, and nothing else leaking in.
+#[cfg(unix)]
 fn run_ocr(cfg: &std::path::Path, args: &[&str]) -> RunOutcome {
     let arg = cfg.display().to_string();
     run_tty_with(args, &[("AIDO_CONFIG", arg.as_str())], cfg.to_path_buf())
 }
 
+#[cfg(unix)]
 #[test]
 fn two_images_become_two_requests_and_two_named_files() {
     let (a, b) = two_images("perpart-basic");
@@ -76,6 +78,7 @@ fn two_images_become_two_requests_and_two_named_files() {
     assert_eq!(manifest["artifacts"][1]["id"], "b");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failing_part_does_not_sink_the_batch() {
     let (a, b) = two_images("perpart-partial");
@@ -112,6 +115,7 @@ fn a_failing_part_does_not_sink_the_batch() {
     assert!(err.contains("1/2 input part(s) failed"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn total_timeout_fails_the_slow_part_and_delivers_the_survivor() {
     // The second part's reply is delayed far past the 3s whole-run
@@ -155,6 +159,7 @@ fn total_timeout_fails_the_slow_part_and_delivers_the_survivor() {
     assert!(err.contains("1/2 input part(s) failed"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn all_parts_failing_exits_four_without_delivery() {
     let (a, b) = two_images("perpart-allfail");
@@ -185,6 +190,7 @@ fn all_parts_failing_exits_four_without_delivery() {
     assert!(!out_dir.join("b.txt").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_batch_without_out_dir_is_refused_before_any_request() {
     let (a, b) = two_images("perpart-nodir");
@@ -204,6 +210,7 @@ fn a_batch_without_out_dir_is_refused_before_any_request() {
     assert!(out.stderr().contains("--out-dir"), "{}", out.stderr());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_single_file_keeps_the_legacy_delivery() {
     let (a, _b) = two_images("perpart-single");
@@ -228,6 +235,7 @@ fn a_single_file_keeps_the_legacy_delivery() {
     assert_eq!(server.requests().len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn unicode_stems_name_their_artifacts() {
     let dir = temp_dir("perpart-cjk");
@@ -256,6 +264,7 @@ fn unicode_stems_name_their_artifacts() {
     assert!(out_dir.join("a.txt").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn same_stem_in_two_directories_gets_a_suffix() {
     let png = solid_png(2, 2);
@@ -293,6 +302,7 @@ fn same_stem_in_two_directories_gets_a_suffix() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_text_rides_with_every_part() {
     let (a, b) = two_images("perpart-shared");
@@ -324,6 +334,7 @@ fn shared_text_rides_with_every_part() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn shared_text_past_the_carry_budget_warns_once_per_plan() {
     // The carry budget is half the 4000-char chunk target, so 2001 shared
@@ -435,6 +446,7 @@ fn a_shared_stdin_image_earns_a_note_that_quiet_silences() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_small_shared_text_and_quiet_keep_the_budget_note_silent() {
     let (a, b) = two_images("perpart-warnsmall");
@@ -493,6 +505,7 @@ fn a_small_shared_text_and_quiet_keep_the_budget_note_silent() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn no_split_still_batches_one_request_per_file() {
     let (a, b) = two_images("perpart-nosplit");
@@ -522,6 +535,7 @@ fn no_split_still_batches_one_request_per_file() {
     assert!(out_dir.join("b.txt").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dry_run_batch_without_out_dir_is_refused_like_the_real_run() {
     // The delivery-target rules are pure prechecks, so --dry-run does not
@@ -545,6 +559,7 @@ fn a_dry_run_batch_without_out_dir_is_refused_like_the_real_run() {
     assert!(!out.stdout().contains("per-part batch"), "{}", out.stdout());
 }
 
+#[cfg(unix)]
 #[test]
 fn dry_run_shows_the_batch_plan_without_requesting() {
     // The dead base_url is the point: a valid batch dry-runs to a printed
@@ -579,6 +594,7 @@ fn dry_run_shows_the_batch_plan_without_requesting() {
     assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn translate_applies_per_part_to_multiple_files() {
     let dir = temp_dir("perpart-translate");
@@ -615,6 +631,7 @@ fn translate_applies_per_part_to_multiple_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_recorded_batch_is_recovered_with_the_same_names() {
     let (a, b) = two_images("perpart-history");
@@ -666,6 +683,7 @@ fn a_recorded_batch_is_recovered_with_the_same_names() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_truncated_part_fails_alone_and_the_rest_deliver() {
     let (a, b) = two_images("perpart-trunc");
@@ -701,6 +719,7 @@ fn a_truncated_part_fails_alone_and_the_rest_deliver() {
     assert!(err.contains("part 'a.png' failed: length"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_middle_failure_still_runs_every_other_part() {
     let dir = temp_dir("perpart-middle");
@@ -750,6 +769,7 @@ fn a_middle_failure_still_runs_every_other_part() {
     assert_eq!(server.requests().len(), 3);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_multi_request_part_failing_mid_slices_drops_whole_part() {
     let dir = temp_dir("perpart-slices");
@@ -793,6 +813,7 @@ fn a_multi_request_part_failing_mid_slices_drops_whole_part() {
     assert!(err.contains("part 'a.png' failed"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn streaming_transport_writes_the_same_named_files() {
     let (a, b) = two_images("perpart-stream");
@@ -825,6 +846,7 @@ fn streaming_transport_writes_the_same_named_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn empty_replies_fail_their_parts_instead_of_writing_gaps() {
     let (a, b) = two_images("perpart-empty");
@@ -852,6 +874,7 @@ fn empty_replies_fail_their_parts_instead_of_writing_gaps() {
     assert!(!out_dir.join("b.txt").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn json_report_on_a_successful_batch_lists_every_artifact() {
     let (a, b) = two_images("perpart-json");
@@ -879,6 +902,7 @@ fn json_report_on_a_successful_batch_lists_every_artifact() {
     assert_eq!(report["failed_parts"].as_array().unwrap().len(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn json_report_on_a_partial_batch_carries_the_failures() {
     let (a, b) = two_images("perpart-jsonp");
@@ -916,6 +940,7 @@ fn json_report_on_a_partial_batch_carries_the_failures() {
     assert_eq!(report["artifacts"][0]["id"], "b");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_recorded_partial_batch_restores_with_its_failure_list() {
     // The original run's report names the failed part and exits 6; the
@@ -1012,6 +1037,7 @@ fn a_recorded_partial_batch_restores_with_its_failure_list() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_batch_cannot_target_the_clipboard() {
     let (a, b) = two_images("perpart-copy");
@@ -1037,6 +1063,7 @@ fn a_batch_cannot_target_the_clipboard() {
 
 /// Three paragraphs of exactly 2000 chars each: any two overflow the
 /// 4000-char packing target, so the text chunks into exactly three.
+#[cfg(unix)]
 fn three_chunk_text() -> String {
     (0..3)
         .map(|i| format!("第{i}部分。{}", "甲".repeat(1995)))
@@ -1044,6 +1071,7 @@ fn three_chunk_text() -> String {
         .join("\n\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn a_single_chunk_file_delivers_its_map_reply_in_a_chunk_reduce_batch() {
     // The combination a custom task may declare — per_part plus

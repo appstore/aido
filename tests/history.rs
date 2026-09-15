@@ -580,6 +580,7 @@ fn last_without_history_fails_cleanly() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn last_can_restore_media_into_a_directory() {
     let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
@@ -841,6 +842,7 @@ fn last_skips_a_damaged_newest_entry() {
     assert_eq!(out.stdout(), "OLDER\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn unsatisfied_generation_is_recorded_with_its_artifacts() {
     // --count 2 but the service returns one image: exit 4, and the good

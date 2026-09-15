@@ -61,6 +61,7 @@ fn dash_reads_stdin_at_its_position_between_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn unconsumed_pipe_with_explicit_material_is_an_error() {
     let file = temp_file("a.txt", b"from file\n");
@@ -547,6 +548,7 @@ fn task_rejects_foreign_parameters() {
     assert!(err.contains("ocr"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn dry_run_does_not_touch_the_clipboard() {
     // --paste under --dry-run must plan against a placeholder: the
@@ -566,6 +568,7 @@ fn dry_run_does_not_touch_the_clipboard() {
     assert!(stdout.contains("unknown (decided at runtime)"), "{stdout}");
 }
 
+#[cfg(unix)]
 fn expansion_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("aido-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
