@@ -88,9 +88,18 @@ fn env_key(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// The run's spinner, shared with the live sinks: the first delta that
+/// reaches stdout takes and stops it (see `DeltaSink::emit`).
+type SharedSpinner = Rc<RefCell<Option<Spinner>>>;
+
 struct DeltaSink {
     merged: String,
     live: bool,
+    /// Present only when the live text and the spinner share one terminal
+    /// (stdout is a TTY too): the first live emit takes and stops it. A
+    /// piped stdout never displays the content, so there the spinner runs
+    /// to the end of the run as before.
+    spinner: Option<SharedSpinner>,
     chars_seen: u64,
     /// Only the text printed live: `chars_seen` also counts buffered
     /// sinks, whose output never reached the terminal.
@@ -102,6 +111,16 @@ impl DeltaSink {
         self.chars_seen += text.chars().count() as u64;
         self.merged.push_str(text);
         if self.live {
+            // The spinner and the live reply share one terminal: before
+            // the first delta reaches stdout, retire the spinner — its
+            // \r-redraws would otherwise land inside the streamed lines
+            // and chop them up (issue #62). stop() erases the line and
+            // joins the thread, so the content starts on a clean screen.
+            if let Some(cell) = self.spinner.take() {
+                if let Some(spinner) = cell.borrow_mut().take() {
+                    spinner.stop();
+                }
+            }
             print!("{text}");
             let _ = std::io::stdout().flush();
             self.live_chars += text.chars().count() as u64;
@@ -200,10 +219,13 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             .unwrap_or(1)
     };
 
-    let spinner = if plan.quiet {
-        Spinner::disabled()
+    let spinner: SharedSpinner = if plan.quiet {
+        Rc::new(RefCell::new(None))
     } else {
-        Spinner::start(&format!("asking {}...", plan.resolved.model))
+        Rc::new(RefCell::new(Some(Spinner::start(&format!(
+            "asking {}...",
+            plan.resolved.model
+        )))))
     };
 
     let mut media_artifacts: Vec<Artifact> = Vec::new();
@@ -312,9 +334,14 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 .steps
                 .iter()
                 .any(|s| s.part == step.part && s.role == StepRole::Reduce);
+            let live = live_stdout && !batch;
             let sink = Rc::new(RefCell::new(DeltaSink {
                 merged: String::new(),
-                live: live_stdout && !batch,
+                live,
+                // Only a terminal stdout shares the screen with the
+                // spinner; a piped one never displays the content, so it
+                // keeps the indicator for the whole run.
+                spinner: (live && plan.terminal.stdout).then(|| spinner.clone()),
                 chars_seen: 0,
                 live_chars: 0,
             }));
@@ -372,7 +399,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             } else {
                 format!("asking {}...", plan.resolved.model)
             };
-            spinner.set_message(&label);
+            // The cell may already be empty: a live sink retired the
+            // spinner at its first delta, and later steps stay quiet so
+            // the streamed content keeps the terminal to itself.
+            if let Some(spinner) = spinner.borrow().as_ref() {
+                spinner.set_message(&label);
+            }
         }
         // A reduce step's material is its group's collected map replies —
         // placeholders in the plan, filled in here. The task's original
@@ -565,8 +597,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     if let Some(g) = group.take() {
         close_group!(g, artifacts, failed_parts);
     }
-    spinner.set_progress(total_chars);
-    spinner.stop();
+    // A live run already retired its spinner at the first delta; this
+    // covers every other path (buffered, batch, no live output).
+    if let Some(spinner) = spinner.borrow_mut().take() {
+        spinner.set_progress(total_chars);
+        spinner.stop();
+    }
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
@@ -653,6 +689,7 @@ mod tests {
         let mut buffered = DeltaSink {
             merged: String::new(),
             live: false,
+            spinner: None,
             chars_seen: 0,
             live_chars: 0,
         };
@@ -664,6 +701,7 @@ mod tests {
         let mut live = DeltaSink {
             merged: String::new(),
             live: true,
+            spinner: None,
             chars_seen: 0,
             live_chars: 0,
         };
@@ -671,6 +709,41 @@ mod tests {
         live.emit("四");
         assert_eq!(live.chars_seen, 4);
         assert_eq!(live.live_chars, 4);
+    }
+
+    #[test]
+    fn first_live_emit_retires_the_spinner_buffered_keeps_it() {
+        // The spinner and a live reply share one terminal, so the first
+        // delta takes the shared spinner out and stops it before printing
+        // (issue #62): its redraws can never land inside the content. A
+        // buffered sink never touches the cell — its output prints after
+        // the run stopped the spinner itself.
+        let cell: SharedSpinner = Rc::new(RefCell::new(Some(Spinner::disabled())));
+        let mut live = DeltaSink {
+            merged: String::new(),
+            live: true,
+            spinner: Some(cell.clone()),
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        live.emit("君不见黄河之水天上来");
+        assert!(cell.borrow().is_none());
+        // Later deltas find an empty cell and keep streaming untouched.
+        live.emit("，奔流到海不复回。");
+        assert!(cell.borrow().is_none());
+
+        // A fresh cell for the buffered case: its emit must leave the
+        // spinner in place.
+        let cell: SharedSpinner = Rc::new(RefCell::new(Some(Spinner::disabled())));
+        let mut buffered = DeltaSink {
+            merged: String::new(),
+            live: false,
+            spinner: Some(cell.clone()),
+            chars_seen: 0,
+            live_chars: 0,
+        };
+        buffered.emit("still there");
+        assert!(cell.borrow().is_some());
     }
 
     #[test]
