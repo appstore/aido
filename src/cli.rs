@@ -849,7 +849,8 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum HistoryCmd {
-    /// List recorded runs, newest first; the index addresses `show`
+    /// List recorded runs, oldest first (newest last); the index
+    /// addresses `show` (1 = newest)
     List,
     /// Redeliver a recorded run
     Show {

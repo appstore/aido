@@ -257,7 +257,7 @@ fn fake_complete_run(dir: &std::path::Path, id: &str, text: &str) {
 }
 
 #[test]
-fn history_list_numbers_newest_first_and_show_takes_an_index() {
+fn history_list_prints_newest_last_and_show_takes_an_index() {
     let dir = temp_dir("hist-index");
     let envs = [("AIDO_HISTORY_DIR", dir.to_str().unwrap())];
 
@@ -295,15 +295,16 @@ fn history_list_numbers_newest_first_and_show_takes_an_index() {
     let older = runs[0].file_name().unwrap().to_str().unwrap();
     let newest = runs[1].file_name().unwrap().to_str().unwrap();
 
-    // the list is numbered newest first, and those numbers address `show`
+    // the list prints oldest first so the newest row is the last one on
+    // screen (issue #64), and the numbers still address `show`
     let out = run(&["history", "list"], b"", &envs);
     out.assert_code(0);
     let lines: Vec<String> = out.stdout().lines().map(String::from).collect();
     assert_eq!(lines.len(), 2, "{}", out.stdout());
-    assert!(lines[0].starts_with("1  "), "{}", out.stdout());
-    assert!(lines[0].contains(newest), "{}", out.stdout());
-    assert!(lines[1].starts_with("2  "), "{}", out.stdout());
-    assert!(lines[1].contains(older), "{}", out.stdout());
+    assert!(lines[0].starts_with("2  "), "{}", out.stdout());
+    assert!(lines[0].contains(older), "{}", out.stdout());
+    assert!(lines[1].starts_with("1  "), "{}", out.stdout());
+    assert!(lines[1].contains(newest), "{}", out.stdout());
 
     // `show 1` redelivers the newest run; delivery flags apply
     let file = dir.join("out.txt");
