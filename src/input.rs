@@ -1156,14 +1156,12 @@ mod tests {
         );
         let pattern = format!("{}/**/*.txt", dir.display());
         let paths = expand_glob(&pattern, MAX_EXPANSION).unwrap();
-        let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         // `**` matches zero directories too, and skips dotfiles on the way.
+        // Compare as paths, not display strings: matched paths carry the
+        // platform separator, which on Windows is not the pattern's `/`.
         assert_eq!(
-            names,
-            vec![
-                format!("{}/sub/nested.txt", dir.display()),
-                format!("{}/top.txt", dir.display()),
-            ]
+            paths,
+            vec![dir.join("sub").join("nested.txt"), dir.join("top.txt")],
         );
     }
 
