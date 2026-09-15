@@ -484,10 +484,12 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
                 return Ok(());
             }
             let width = ids.len().to_string().len();
-            // Newest first: the printed index is what `history show`
-            // takes as its operand.
-            for (n, id) in ids.iter().rev().enumerate() {
-                let n = n + 1;
+            // Oldest first, so the newest row lands at the bottom of the
+            // terminal where the reader is looking (issue #64). The printed
+            // number is still what `history show` takes as its operand:
+            // 1 = newest, exactly the last row printed.
+            for (i, id) in ids.iter().enumerate() {
+                let n = ids.len() - i;
                 // Manifest-only: the list labels runs without reading
                 // their artifact bytes back.
                 match history::load_meta(id) {
