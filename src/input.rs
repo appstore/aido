@@ -123,12 +123,10 @@ fn fd0_has_unread_bytes() -> bool {
             }
             _ => {
                 let mut pending: libc::c_int = 0;
-                if libc::ioctl(
-                    libc::STDIN_FILENO,
-                    libc::FIONREAD as libc::c_ulong,
-                    &mut pending,
-                ) == 0
-                {
+                // FIONREAD is typed as the platform's ioctl request type in
+                // libc (c_ulong under glibc, c_int under musl): no cast, or
+                // the musl build breaks.
+                if libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut pending) == 0 {
                     pending > 0
                 } else {
                     let mut fds = [libc::pollfd {
