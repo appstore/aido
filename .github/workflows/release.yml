@@ -76,14 +76,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # musl 产物必须完全静态；file 输出含 "statically linked"（含 static-pie 情形）
+      # musl 产物必须完全静态；file 对老式静态输出 "statically linked"、
+      # 对 static-pie 输出 "static-pie linked"，两者都算静态，有 interpreter 即失败
       - name: Verify static binary
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           bin="target/${{ matrix.target }}/release/aido"
           file "$bin"
-          file "$bin" | grep -q "statically linked" || {
-            echo "::error::musl binary is not statically linked"
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "::error::musl binary is dynamically linked"
+            exit 1
+          fi
+          file "$bin" | grep -qE "statically linked|static-pie linked" || {
+            echo "::error::musl binary is neither statically linked nor static-pie"
             exit 1
           }
 
