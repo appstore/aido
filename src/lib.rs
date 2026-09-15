@@ -14,6 +14,7 @@ pub mod config;
 pub mod domain;
 pub mod history;
 pub mod input;
+pub mod materialize;
 pub mod output;
 pub mod plan;
 pub mod processors;

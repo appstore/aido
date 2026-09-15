@@ -367,6 +367,74 @@ fn shared_text_past_the_carry_budget_warns_once_per_plan() {
     }
 }
 
+/// A piped image is shared context that rides every part's request —
+/// one paid copy per request. It earns its own stderr note (images were
+/// never part of the text-char count), and --quiet silences it.
+#[test]
+fn a_shared_stdin_image_earns_a_note_that_quiet_silences() {
+    let (a, b) = two_images("perpart-imgnote");
+    let out_dir = temp_dir("perpart-imgnote-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let arg = cfg.display().to_string();
+    let out = run(
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "-",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &solid_png(2, 2),
+        &[("AIDO_CONFIG", arg.as_str())],
+    );
+    out.assert_code(0);
+    let err = out.stderr();
+    assert!(
+        err.contains("1 shared image rides with every part's request"),
+        "{err}"
+    );
+    // Every request really carries the shared image alongside its own.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for raw in &requests {
+        assert_eq!(count_images(raw), 2, "the shared image rides along");
+    }
+
+    // The same batch under --quiet stays silent.
+    let (a, b) = two_images("perpart-imgquiet");
+    let out_dir = temp_dir("perpart-imgquiet-out");
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B")]);
+    let cfg = batch_cfg(&server.url());
+    let arg = cfg.display().to_string();
+    let out = run(
+        &[
+            "ocr",
+            "--profile",
+            "test",
+            "--no-stream",
+            "--quiet",
+            "-",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+        &solid_png(2, 2),
+        &[("AIDO_CONFIG", arg.as_str())],
+    );
+    out.assert_code(0);
+    assert!(
+        !out.stderr().contains("shared image"),
+        "--quiet suppresses the note: {}",
+        out.stderr()
+    );
+}
+
 #[test]
 fn a_small_shared_text_and_quiet_keep_the_budget_note_silent() {
     let (a, b) = two_images("perpart-warnsmall");

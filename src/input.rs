@@ -220,6 +220,28 @@ pub fn gather(
     dry_run: bool,
     env: &mut InputEnv<'_>,
 ) -> Result<Vec<InputPart>> {
+    let mut notes = Vec::new();
+    gather_with_notes(
+        specs,
+        requires_material,
+        total_limit,
+        dry_run,
+        env,
+        &mut notes,
+    )
+}
+
+/// [`gather`] plus a sink for the materializers' notes about partial
+/// material (a page that yielded nothing, an image in a codec aido
+/// cannot carry): the caller decides whether and how to surface them.
+pub fn gather_with_notes(
+    specs: &[SourceSpec],
+    requires_material: bool,
+    total_limit: Option<u64>,
+    dry_run: bool,
+    env: &mut InputEnv<'_>,
+    notes: &mut Vec<String>,
+) -> Result<Vec<InputPart>> {
     if specs
         .iter()
         .filter(|s| matches!(s, SourceSpec::Stdin))
@@ -248,7 +270,16 @@ pub fn gather(
             if bytes.is_empty() {
                 bail!("stdin is empty; nothing to send (the clipboard is never a fallback)");
             }
-            return Ok(vec![classify("stdin", bytes, InputSource::Stdin, 0)?]);
+            // Materialization makes the expanded output bigger than the
+            // bytes read, so this path charges the same budget the loop
+            // below charges: piped material is never exempt from the run's
+            // total limit.
+            let mut parts = Vec::new();
+            let mut total = 0u64;
+            for part in make_parts("stdin", bytes, InputSource::Stdin, 0, 0, notes)? {
+                push_part(&mut parts, &mut total, limit, part)?;
+            }
+            return Ok(parts);
         }
         if requires_material {
             if dry_run {
@@ -272,16 +303,22 @@ pub fn gather(
 
     let mut parts = Vec::new();
     let mut total: u64 = 0;
+    // One sequence number per materialized document, so two specs of the
+    // same file (`ocr book.pdf book.pdf`) keep separate per-part units
+    // instead of silently merging into one.
+    let mut document = 0usize;
     for spec in specs {
         match spec {
             SourceSpec::File(path) => {
                 for path in expand_file_spec(path, MAX_EXPANSION)? {
-                    push_material(&mut parts, &mut total, limit, &path)?;
+                    push_material(&mut parts, &mut total, limit, &path, document, notes)?;
+                    document += 1;
                 }
             }
             SourceSpec::Glob(pattern) => {
                 for path in expand_glob(pattern, MAX_EXPANSION)? {
-                    push_material(&mut parts, &mut total, limit, &path)?;
+                    push_material(&mut parts, &mut total, limit, &path, document, notes)?;
+                    document += 1;
                 }
             }
             SourceSpec::Stdin => {
@@ -289,8 +326,17 @@ pub fn gather(
                 if bytes.is_empty() {
                     bail!("stdin is empty; nothing to send");
                 }
-                let part = classify("stdin", bytes, InputSource::Stdin, parts.len())?;
-                push_part(&mut parts, &mut total, limit, part)?;
+                for part in make_parts(
+                    "stdin",
+                    bytes,
+                    InputSource::Stdin,
+                    document,
+                    parts.len(),
+                    notes,
+                )? {
+                    push_part(&mut parts, &mut total, limit, part)?;
+                }
+                document += 1;
             }
             SourceSpec::Paste => {
                 if dry_run {
@@ -315,6 +361,7 @@ pub fn gather(
                     unknown_kind: false,
                     mime: "text/plain".into(),
                     content: InputContent::Text(value.clone()),
+                    unit: None,
                 };
                 push_part(&mut parts, &mut total, limit, part)?;
             }
@@ -338,22 +385,52 @@ fn push_part(
     Ok(())
 }
 
+/// Bytes become parts: recognized document containers materialize into
+/// several text/image parts ([`materialize::expand`]); everything else
+/// classifies into one part, exactly as before materialization existed.
+/// The materializer's notes about partial material are appended to the
+/// run's sink, in gather order.
+///
+/// [`materialize::expand`]: crate::materialize::expand
+fn make_parts(
+    origin: &str,
+    bytes: Vec<u8>,
+    source: InputSource,
+    document: usize,
+    start_id: usize,
+    notes: &mut Vec<String>,
+) -> Result<Vec<InputPart>> {
+    match crate::materialize::expand(origin, &bytes, &source, document, start_id)? {
+        Some((parts, doc_notes)) => {
+            notes.extend(doc_notes);
+            Ok(parts)
+        }
+        None => Ok(vec![classify(origin, bytes, source, start_id)?]),
+    }
+}
+
 /// Read one file fully and append its part.
 fn push_material(
     parts: &mut Vec<InputPart>,
     total: &mut u64,
     limit: u64,
     path: &Path,
+    document: usize,
+    notes: &mut Vec<String>,
 ) -> Result<()> {
     let bytes = read_file(path, MAX_PART_BYTES, limit.saturating_sub(*total))?;
     let origin = path.display().to_string();
-    let part = classify(
+    for part in make_parts(
         &origin,
         bytes,
         InputSource::File(path.to_path_buf()),
+        document,
         parts.len(),
-    )?;
-    push_part(parts, total, limit, part)
+        notes,
+    )? {
+        push_part(parts, total, limit, part)?;
+    }
+    Ok(())
 }
 
 fn part_size(part: &InputPart) -> usize {
@@ -377,6 +454,7 @@ fn dry_run_clipboard_part(id: usize) -> InputPart {
         unknown_kind: true,
         mime: "text/plain".into(),
         content: InputContent::Text(String::new()),
+        unit: None,
     }
 }
 
@@ -394,6 +472,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(t),
+                unit: None,
             })
         }
         crate::clipboard::ClipboardContent::Png(png) => {
@@ -408,6 +487,7 @@ fn clipboard_part(content: crate::clipboard::ClipboardContent, id: usize) -> Res
                 unknown_kind: false,
                 mime: "image/png".into(),
                 content: InputContent::Media(png),
+                unit: None,
             })
         }
     }
@@ -577,6 +657,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
+            unit: None,
         });
     }
     if let Some((mime, _)) = audio_type(&bytes) {
@@ -588,6 +669,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
             unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
+            unit: None,
         });
     }
     match String::from_utf8(bytes) {
@@ -603,6 +685,7 @@ fn classify(origin: &str, bytes: Vec<u8>, source: InputSource, id: usize) -> Res
                 unknown_kind: false,
                 mime: "text/plain".into(),
                 content: InputContent::Text(text),
+                unit: None,
             })
         }
         Err(_) => bail!("'{origin}' is neither valid UTF-8 text nor a supported image/audio file"),

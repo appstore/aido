@@ -1,6 +1,6 @@
 name: test
 
-# PR 和 push 到 master：格式检查 + clippy + 测试（Linux/macOS）+ MSRV 编译检查。
+# PR 和 push 到 master：格式检查 + clippy + 测试（Linux/macOS/Windows）+ MSRV 编译检查。
 # 发布流程见 release.yml（只管 release 分支）。
 on:
   pull_request:
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v7
@@ -54,7 +54,10 @@ jobs:
       # 特性把 aws-lc-sys（源码构建需要 cmake）拉进依赖树，运行时 TLS 实际
       # 用 ring。本步骤不拦截构建：aws-lc-rs 在树里时发 warning 注解；
       # 哪天它消失（上游修正），提醒移除本检查和 README 的 cmake 说明。
-      - name: Dependency tree report (aws-lc-rs)
+      # 文档物化层（lopdf/calamine/zip）必须保持纯 Rust deflate 后端
+      # （miniz_oxide / zlib-rs）：libz-sys / zlib-ng-sys 一旦进树即失败，
+      # 守住"单个可执行文件、无 runtime 依赖"的性质。
+      - name: Dependency tree report (aws-lc-rs, C backends)
         if: runner.os == 'Linux'
         run: |
           if cargo tree --locked -i aws-lc-rs; then
@@ -62,6 +65,13 @@ jobs:
           else
             echo "::notice::aws-lc-rs has left the dependency tree (upstream fixed?). Update the README build note and remove this check."
           fi
+          for crate in libz-sys zlib-ng-sys; do
+            if cargo tree --locked -i "$crate" >/dev/null 2>&1; then
+              echo "::error::$crate appeared in the dependency tree; the document loaders (lopdf/calamine/zip) must stay on pure-Rust deflate (miniz_oxide/zlib-rs)"
+              exit 1
+            fi
+          done
+          echo "no C zlib backends in the tree"
 
   no-default-features:
     # R06：edge-tts 现在是 aido 侧 feature（默认开启）。关掉它必须仍然可编译，
@@ -96,6 +106,46 @@ jobs:
           else
             echo "aws-lc-rs is out of the tree (edge-tts feature off)"
           fi
+
+  pdfium:
+    # `pdfium` feature 的渲染回退（pdf_render.rs 与 pdf.rs 的全部
+    # #[cfg(feature = "pdfium")] 分支）默认构建完全编译不到，唯一能
+    # 验证它的地方就是这里：链接 kernoeb/pdfium-static 的静态档案跑
+    # 全量测试。档案 ~21 MB，按内容寻址缓存。
+    name: pdfium
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PDFIUM_TAG: chromium/7985
+      # kernoeb/pdfium-static release 资产的 sha256（gh api 取的 digest）
+      PDFIUM_SHA256: e135b87152fbf4a78fe02a1e2b3228cdd7e60af9888546cd4399790e7e80dff4
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pdfium
+
+      - name: Fetch static pdfium archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          cd "$RUNNER_TEMP/pdfium"
+          curl -sSfL -O "https://github.com/kernoeb/pdfium-static/releases/download/${PDFIUM_TAG}/libpdfium-linux-x64.a"
+          echo "${PDFIUM_SHA256}  libpdfium-linux-x64.a" | sha256sum -c -
+
+      - name: Clippy (pdfium)
+        env:
+          PDFIUM_LIB_DIR: ${{ runner.temp }}/pdfium
+        run: cargo clippy --all-targets --locked --features pdfium -- -D warnings
+
+      - name: Test (pdfium)
+        env:
+          PDFIUM_LIB_DIR: ${{ runner.temp }}/pdfium
+        run: cargo test --locked --features pdfium
 
   musl:
     # x86_64-unknown-linux-musl 是 release 产物目标（全静态 Linux 二进制）。

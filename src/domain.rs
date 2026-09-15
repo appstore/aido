@@ -106,6 +106,11 @@ pub struct InputPart {
     pub unknown_kind: bool,
     pub mime: String,
     pub content: InputContent,
+    /// The sub-document unit a materialized part belongs to, e.g. a PDF
+    /// page (`"story.pdf#p3"`): every part sharing a key plans as one
+    /// per-part request, so a page's image and text layer travel together.
+    /// `None` means the part is its own unit — every non-document input.
+    pub unit: Option<String>,
 }
 
 impl InputPart {
@@ -499,6 +504,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
+            unit: None,
         }
     }
 
@@ -511,6 +517,7 @@ mod tests {
             unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(vec![1, 2, 3]),
+            unit: None,
         }
     }
 
