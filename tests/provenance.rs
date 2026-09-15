@@ -10,6 +10,7 @@ mod support;
 
 use support::*;
 
+#[cfg(unix)]
 fn run_cfg(url: &str) -> std::path::PathBuf {
     settings_config(&format!(
         "[settings]\nhistory_keep = 0\n\
@@ -25,6 +26,7 @@ fn manifest_of(dir: &std::path::Path) -> serde_json::Value {
 /// Three paragraphs of exactly 2000 chars each: any two overflow the
 /// 4000-char packing target, so the text chunks into exactly three (the
 /// same shape tests/chunk.rs uses).
+#[cfg(unix)]
 fn three_chunk_text() -> String {
     (0..3)
         .map(|i| format!("第{i}部分。{}", "甲".repeat(1995)))
@@ -32,6 +34,7 @@ fn three_chunk_text() -> String {
         .join("\n\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn a_single_request_run_names_request_zero() {
     let out_dir = temp_dir("prov-single-out");
@@ -61,6 +64,7 @@ fn a_single_request_run_names_request_zero() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ocr_slices_merge_under_one_merged_provenance() {
     // A 3200px-tall image splits into two slice requests; the replies
@@ -97,6 +101,7 @@ fn ocr_slices_merge_under_one_merged_provenance() {
     assert!(text.contains("第一片") && text.contains("第二片"), "{text}");
 }
 
+#[cfg(unix)]
 #[test]
 fn chunk_join_names_every_request_it_joined() {
     let file = temp_file("book.txt", three_chunk_text().as_bytes());
@@ -131,6 +136,7 @@ fn chunk_join_names_every_request_it_joined() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn chunk_reduce_names_only_the_reduce_request() {
     // Three map replies are intermediate material; the delivered artifact
@@ -171,6 +177,7 @@ fn chunk_reduce_names_only_the_reduce_request() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn image_artifacts_name_the_request_that_made_them() {
     // --count 2 is one request asking for two images: both artifacts come
@@ -218,6 +225,7 @@ fn image_artifacts_name_the_request_that_made_them() {
     assert_eq!(artifacts[1]["provenance"], expected);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_speech_artifact_names_its_request() {
     let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
@@ -259,6 +267,7 @@ fn a_speech_artifact_names_its_request() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn restored_artifacts_keep_their_recorded_provenance() {
     // `last` re-delivers a recorded run without a new request: history

@@ -6,10 +6,13 @@
 
 mod support;
 
+// 本文件的测试全部走伪终端(unix-only),windows 下 support 整体用不上
+#[cfg(unix)]
 use support::*;
 
 /// ~4600 chars of CJK paragraph text: past the 4000-char chunk target. A
 /// byte-based splitter would cut this into four; a char-based one into two.
+#[cfg(unix)]
 fn long_text() -> String {
     (0..200)
         .map(|i| format!("第{i}段，这是用来测试长文分块的内容句子。"))
@@ -19,6 +22,7 @@ fn long_text() -> String {
 
 /// Three paragraphs of exactly 2000 chars each: any two overflow the
 /// 4000-char packing target, so the text chunks into exactly three.
+#[cfg(unix)]
 fn three_chunk_text() -> String {
     (0..3)
         .map(|i| format!("第{i}部分。{}", "甲".repeat(1995)))
@@ -26,6 +30,7 @@ fn three_chunk_text() -> String {
         .join("\n\n")
 }
 
+#[cfg(unix)]
 fn chunk_cfg(url: &str) -> std::path::PathBuf {
     settings_config(&format!(
         "[settings]\nhistory_keep = 0\n\
@@ -36,6 +41,7 @@ fn chunk_cfg(url: &str) -> std::path::PathBuf {
 
 /// The same config but with recording on, for the failure tests that
 /// assert what history kept.
+#[cfg(unix)]
 fn chunk_hist_cfg(url: &str) -> std::path::PathBuf {
     settings_config(&format!(
         "[settings]\nhistory_keep = 5\n\
@@ -45,6 +51,7 @@ fn chunk_hist_cfg(url: &str) -> std::path::PathBuf {
 }
 
 /// The recorded run's parsed manifest (one run dir, expected).
+#[cfg(unix)]
 fn recorded_manifest(dir: &std::path::Path) -> (std::path::PathBuf, serde_json::Value) {
     let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .unwrap()
@@ -60,6 +67,7 @@ fn recorded_manifest(dir: &std::path::Path) -> (std::path::PathBuf, serde_json::
     (run, manifest)
 }
 
+#[cfg(unix)]
 #[test]
 fn long_text_splits_into_two_requests_and_replies_join() {
     let file = temp_file("book.txt", long_text().as_bytes());
@@ -107,6 +115,7 @@ fn long_text_splits_into_two_requests_and_replies_join() {
     assert!(second.contains("book.txt [chunk 2/2] ---"), "{second}");
 }
 
+#[cfg(unix)]
 #[test]
 fn streaming_chunks_join_buffered_ones_byte_for_byte() {
     let file = temp_file("book.txt", long_text().as_bytes());
@@ -124,6 +133,7 @@ fn streaming_chunks_join_buffered_ones_byte_for_byte() {
     assert_eq!(out.stdout(), "第一块的流式结果\n\n第二块\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn chunk_reduce_collects_the_replies_into_one_consolidation_request() {
     let file = temp_file("book.txt", three_chunk_text().as_bytes());
@@ -171,6 +181,7 @@ fn chunk_reduce_collects_the_replies_into_one_consolidation_request() {
     assert_eq!(out.stdout(), "整篇的最终摘要\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn streaming_reduce_prints_only_the_final_reply() {
     let file = temp_file("book.txt", three_chunk_text().as_bytes());
@@ -193,6 +204,7 @@ fn streaming_reduce_prints_only_the_final_reply() {
     assert_eq!(out.stdout(), "整篇的最终摘要\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn single_chunk_summarize_makes_one_request_without_reduce() {
     let file = temp_file("short.txt", "只是一段短文本，无需分块。".as_bytes());
@@ -215,6 +227,7 @@ fn single_chunk_summarize_makes_one_request_without_reduce() {
     assert_eq!(out.stdout(), "短文本的摘要\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn no_split_sends_the_text_whole() {
     let file = temp_file("book.txt", long_text().as_bytes());
@@ -237,6 +250,7 @@ fn no_split_sends_the_text_whole() {
     assert_eq!(server.requests().len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn dry_run_shows_the_chunk_plan_without_requesting() {
     let file = temp_file("book.txt", long_text().as_bytes());
@@ -259,6 +273,7 @@ fn dry_run_shows_the_chunk_plan_without_requesting() {
     assert!(stdout.contains("; consolidate 2 chunks"), "{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
 fn glossary_travels_with_every_chunk_in_command_line_order() {
     // The "one document as context to process another" case: the glossary
@@ -318,6 +333,7 @@ fn glossary_travels_with_every_chunk_in_command_line_order() {
     assert!(!reduce.contains("aido=助手"), "{reduce}");
 }
 
+#[cfg(unix)]
 #[test]
 fn material_order_follows_the_command_line_when_the_document_is_first() {
     // Reversed command line: every request carries the chunk first and the
@@ -368,6 +384,7 @@ fn material_order_follows_the_command_line_when_the_document_is_first() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn oversized_glossary_falls_back_to_the_first_request_only() {
     // A context file over half the chunk budget (>2000 chars) but under
@@ -420,6 +437,7 @@ fn oversized_glossary_falls_back_to_the_first_request_only() {
 
 // --- a failing reduce run keeps its map replies (R07) ----------------------
 
+#[cfg(unix)]
 #[test]
 fn reduce_failure_keeps_every_map_reply_in_history() {
     // Three chunks, so three paid map replies — and the reduce request
@@ -527,6 +545,7 @@ fn reduce_failure_keeps_every_map_reply_in_history() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn map_failure_keeps_the_replies_that_arrived() {
     // The second of three map requests fails: the run stops with only
@@ -585,6 +604,7 @@ fn map_failure_keeps_the_replies_that_arrived() {
 
 // --- --total-timeout caps the whole run, not each request (F41) -----------
 
+#[cfg(unix)]
 #[test]
 fn total_timeout_stops_the_second_chunk_and_keeps_the_first_reply() {
     // Two chunks; the second reply is delayed far past the 3s whole-run
@@ -640,6 +660,7 @@ fn total_timeout_stops_the_second_chunk_and_keeps_the_first_reply() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn without_a_total_timeout_a_delayed_second_reply_still_completes() {
     // The same two-request shape with no --total-timeout: the budget wrap

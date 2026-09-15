@@ -217,6 +217,9 @@ fn chunk_part(part: &InputPart, i: usize, total: usize, text: &str) -> InputPart
         unknown_kind: false,
         mime: part.mime.clone(),
         content: InputContent::Text(text.into()),
+        // A chunk is its source part's material, so it stays in the
+        // source's sub-document unit.
+        unit: part.unit.clone(),
     }
 }
 
@@ -493,6 +496,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(text.into()),
+            unit: None,
         }
     }
 

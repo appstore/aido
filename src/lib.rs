@@ -14,9 +14,13 @@ pub mod config;
 pub mod domain;
 pub mod history;
 pub mod input;
+pub mod materialize;
 pub mod output;
 pub mod plan;
 pub mod processors;
 pub mod runner;
 pub mod spinner;
 pub mod tasks;
+
+#[cfg(test)]
+mod test_support;

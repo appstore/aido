@@ -198,6 +198,9 @@ fn encode_slice(
         unknown_kind: false,
         mime: "image/png".into(),
         content: crate::domain::InputContent::Media(png),
+        // A slice is its source part's material, so it stays in the
+        // source's sub-document unit.
+        unit: part.unit.clone(),
     })
 }
 
@@ -440,6 +443,7 @@ mod tests {
             unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(png),
+            unit: None,
         }
     }
 
@@ -452,6 +456,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(text.into()),
+            unit: None,
         }
     }
 
@@ -496,6 +501,7 @@ mod tests {
             unknown_kind: false,
             mime: "image/jpeg".into(),
             content: InputContent::Media(jpg),
+            unit: None,
         }
     }
 

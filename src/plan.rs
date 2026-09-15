@@ -10,8 +10,8 @@ use crate::cli::{Cli, OutputFormat, SourceSpec};
 use crate::config::resolve::{self, ParamSource, Resolved};
 use crate::config::Config;
 use crate::domain::{
-    extension_matches_format, first_line, AppError, AppResult, Destination, InputPart, MediaKind,
-    RunSummary,
+    extension_matches_format, first_line, AppError, AppResult, Destination, InputPart, InputSource,
+    MediaKind, RunSummary,
 };
 use crate::history::DEFAULT_KEEP;
 use crate::input::{self, InputEnv};
@@ -61,8 +61,9 @@ pub struct ExecutionPlan {
     /// The processing strategy actually selected for this run (the task's
     /// choice, overridden by `--no-split`).
     pub processor: ProcessorKind,
-    /// Per-part batching: the strategy planned once per file part, one
-    /// artifact (and one failure) per part.
+    /// Per-part batching: the strategy planned once per batch unit (a
+    /// file, or one document page/sheet), one artifact (and one failure)
+    /// per unit.
     pub per_part: bool,
     pub format: Option<OutputFormat>,
     pub destinations: Vec<Destination>,
@@ -109,16 +110,27 @@ pub fn build(
     let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
 
     // --- inputs -----------------------------------------------------------
-    let inputs = input::gather(
+    let mut notes = Vec::new();
+    let inputs = input::gather_with_notes(
         specs,
         task.requires_material,
         cfg.settings.input_bytes,
         cli.dry_run,
         env,
+        &mut notes,
     )
     // The chain matters for expansion errors: "cannot expand 'pattern'"
     // should still show the underlying io cause.
     .map_err(|e| AppError::usage(format!("{e:#}")))?;
+    // Materialization notes (a page that yielded nothing, an image in a
+    // codec aido cannot carry) belong to a gather that succeeded — the
+    // same side-channel voice the processors use: quiet suppresses them,
+    // nothing here is a failure.
+    if !cli.quiet {
+        for note in &notes {
+            eprintln!("note: {note}");
+        }
+    }
     validate_inputs(task, &resolved, &inputs)?;
     // Adapter availability: the EdgeTts variant stays compiled without the
     // feature (so a config naming 'edge-tts' still parses), but no adapter
@@ -158,8 +170,9 @@ pub fn build(
     }
     .map_err(|e| AppError::usage(e.to_string()))?;
     assert_parts_contiguous(&steps)?;
-    // A batch is real only with more than one part: a single file plans
-    // and delivers exactly as before.
+    // A batch is real only with more than one unit (a part group): a
+    // single file — or a one-page document — plans and delivers exactly
+    // as before.
     let mut part_ids = steps.iter().filter_map(|s| s.part).collect::<Vec<usize>>();
     part_ids.sort_unstable();
     part_ids.dedup();
@@ -175,8 +188,8 @@ pub fn build(
         }
         if cli.out_dir.is_none() {
             return Err(AppError::usage(format!(
-                "{} inputs are processed one request each; use --out-dir to collect \
-                 one result per input",
+                "{} units are processed one request each; use --out-dir to collect \
+                 one result per page or sheet",
                 part_ids.len()
             )));
         }
@@ -294,10 +307,10 @@ pub fn build(
 /// differs from the group's, so same-part steps must be contiguous: a
 /// step that returns to an earlier part would silently split that part
 /// into several groups whose artifacts collide on one stem.
-/// `perpart::plan_steps` appends per part in order so the invariant holds
-/// today, but `RequestStep.part` is public — this check turns a future
-/// reorder's violation into an explicit error instead. Untagged steps
-/// (`part: None`, the non-batch path) are ignored: only the tagged
+/// `perpart::plan_steps` appends per unit in part order so the invariant
+/// holds today, but `RequestStep.part` is public — this check turns a
+/// future reorder's violation into an explicit error instead. Untagged
+/// steps (`part: None`, the non-batch path) are ignored: only the tagged
 /// sequence is constrained.
 fn assert_parts_contiguous(steps: &[RequestStep]) -> AppResult<()> {
     let mut last: Option<usize> = None;
@@ -470,20 +483,24 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
             if !allowed.contains(&part.kind) {
                 return Err(AppError::usage(format!(
                     "input '{}' is {}, which this task/profile does not accept \
-                     (allowed: {})",
+                     (allowed: {}){}",
                     part.name,
                     part.kind,
                     allowed
                         .iter()
                         .map(|k| k.as_str())
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    origin_note(part)
                 )));
             }
         } else if !resolved.adapter.inputs().contains(&part.kind) {
             return Err(AppError::usage(format!(
-                "adapter '{}' does not accept input type '{}' (input '{}')",
-                resolved.adapter, part.kind, part.name
+                "adapter '{}' does not accept input type '{}' (input '{}'){}",
+                resolved.adapter,
+                part.kind,
+                part.name,
+                origin_note(part)
             )));
         }
     }
@@ -498,6 +515,26 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     Ok(())
+}
+
+/// Materialized parts are the only ones whose name is not a name the user
+/// typed (`report-p1` for `report.xlsx`), so a type rejection about them
+/// points back at the file that produced them.
+fn origin_note(part: &InputPart) -> String {
+    match &part.source {
+        InputSource::File(path) => {
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            if file.as_deref() == Some(part.name.as_str()) {
+                String::new()
+            } else {
+                format!(
+                    " — part of '{}' (documents expand to one part per page/sheet)",
+                    path.display()
+                )
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn select_processor(cli: &Cli, task: &Task) -> ProcessorKind {

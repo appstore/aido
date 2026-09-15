@@ -239,6 +239,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
+            unit: None,
         }
     }
 

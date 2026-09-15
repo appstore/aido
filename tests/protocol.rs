@@ -3,6 +3,7 @@
 
 mod support;
 
+#[cfg(unix)]
 use std::io::Write as _;
 
 use support::*;
@@ -344,6 +345,7 @@ fn connection_failure_exits_three() {
     out.assert_code(3);
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_required_artifact_kind_is_a_generation_failure() {
     // tts route returns JSON instead of audio bytes
@@ -404,6 +406,7 @@ fn responses_route_instruction_and_parts() {
 
 // --- speech ---------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn speech_send_material_as_input_and_instructions_separately() {
     let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
@@ -450,6 +453,7 @@ fn speech_send_material_as_input_and_instructions_separately() {
 
 // --- transcription --------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn transcription_uploads_one_audio_as_multipart() {
     let server = Server::json(r#"{"text":"meeting notes"}"#);
@@ -482,6 +486,7 @@ fn transcription_uploads_one_audio_as_multipart() {
 
 // --- images ---------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn image_generation_sends_prompt_and_count_and_writes_all() {
     let png = solid_png(2, 2);
@@ -522,6 +527,7 @@ fn image_generation_sends_prompt_and_count_and_writes_all() {
     assert_eq!(req["n"], 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn generated_image_download_does_not_forward_api_credentials() {
     let png = solid_png(2, 2);
@@ -572,6 +578,7 @@ fn generated_image_download_does_not_forward_api_credentials() {
 
 // --- OCR slices -----------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn tall_image_is_sliced_and_replies_merge_on_one_boundary() {
     let png = solid_png(64, 3200);
@@ -609,6 +616,7 @@ fn tall_image_is_sliced_and_replies_merge_on_one_boundary() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn no_split_sends_the_whole_image() {
     let png = solid_png(64, 3200);
@@ -653,6 +661,7 @@ fn decompression_bomb_jpeg_is_refused_as_a_usage_error() {
     assert!(err.contains("20000"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn generated_image_bomb_is_refused_as_a_service_error() {
     // The output-side twin of the input-side bomb test above: the fake
@@ -708,6 +717,7 @@ fn generated_image_bomb_is_refused_as_a_service_error() {
 
 // --- flag semantics -------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn no_stream_is_a_buffering_request_even_on_non_streaming_adapters() {
     // `--no-stream` forces buffering; on an adapter that never streams it
@@ -725,6 +735,7 @@ fn no_stream_is_a_buffering_request_even_on_non_streaming_adapters() {
 
 // --- responses ------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn responses_instruction_only_run_sends_the_instruction_once() {
     let server = Server::json(&responses_body("ok"));
@@ -753,6 +764,7 @@ fn responses_instruction_only_run_sends_the_instruction_once() {
 
 // --- speech ---------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn speech_input_is_plain_text_without_file_labels() {
     let bytes = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x40\x1f\0\0\x01\0\x08\0data\x02\0\0\0\0\0";
@@ -794,6 +806,7 @@ fn speech_input_is_plain_text_without_file_labels() {
 }
 
 /// Minimal base64 encoder (standard alphabet, padding).
+#[cfg(unix)]
 fn b64(data: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();

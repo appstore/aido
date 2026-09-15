@@ -841,7 +841,9 @@ mod tests {
 
     #[test]
     fn existing_file_is_not_clobbered() {
-        let dir = std::env::temp_dir().join(format!("aido-out-test-{}", std::process::id()));
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.txt");
         std::fs::write(&target, "original").unwrap();
@@ -857,7 +859,9 @@ mod tests {
     #[test]
     fn written_mode_follows_the_file_mode_policy() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("aido-out-mode-{}", std::process::id()));
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let private = dir.join("private.txt");
         write_file_atomic(b"x", &private, false, FileMode::Private).unwrap();
@@ -877,7 +881,9 @@ mod tests {
 
     #[test]
     fn directory_gets_files_then_manifest() {
-        let dir = std::env::temp_dir().join(format!("aido-out-dir-{}", std::process::id()));
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let artifact = text_artifact("text", "body");
         let saved = write_directory(&[&artifact], &dir, "run-1", false, true).unwrap();
         assert_eq!(saved.len(), 1);

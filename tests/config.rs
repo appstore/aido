@@ -945,6 +945,7 @@ fn config_check_agrees_with_the_builtin_openai_provider_fallback() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn zero_config_tts_defaults_to_keyless_edge_tts() {
     // The built-in fallback config routes speech to the Edge adapter so
@@ -1166,6 +1167,7 @@ fn zero_config_check_agrees_with_a_real_run() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn zero_config_text_tasks_still_default_to_openai() {
     // Only speech gets the keyless default; text tasks still point at the
@@ -1179,6 +1181,7 @@ fn zero_config_text_tasks_still_default_to_openai() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn edge_tts_refuses_a_prompt_while_building_the_plan() {
     // The adapter has no instruction channel; the plan builder refuses the
@@ -1211,6 +1214,7 @@ fn edge_tts_refuses_a_prompt_while_building_the_plan() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn edge_tts_refuses_a_task_fixed_instruction_and_names_the_source() {
     // A custom speech task may carry a fixed instruction; on the keyless

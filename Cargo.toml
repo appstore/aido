@@ -12,6 +12,12 @@ default = ["edge-tts"]
 # kothok-edge-tts subtree (and aws-lc-sys, which needs cmake) from the
 # build graph. Build with --no-default-features for an aido without TTS.
 edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
+# Static pdfium rendering for PDFs aido cannot extract anything from
+# (vector-drawn pages). Off by default: the build needs PDFIUM_LIB_DIR
+# pointing at a static pdfium archive (see build.rs), and the binary
+# grows by the archive's size. Default builds render nothing and never
+# touch pdfium.
+pdfium = []
 
 [dependencies]
 anyhow = "1"
@@ -35,12 +41,25 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 toml = "0.8"
 unicode-width = "0.2"
+lopdf = "0.45.0"
+# chrono feature: dates render as YYYY-MM-DDTHH:MM:SS instead of raw
+# Excel serial numbers; chrono enters no additional crate beyond lopdf's
+# own dependency on it.
+calamine = { version = "0.36.1", features = ["chrono"] }
+# Same version and feature shape calamine uses, so both resolve to one
+# compiled instance: the xlsx loader bounds the entries calamine eagerly
+# decompresses at open time (a lying declared size in the central
+# directory costs nothing to write, and zip's deflate reader does not cap
+# output on its own).
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rust_xlsxwriter = "0.99.1"
 serde_json = "1"
 
 [target.'cfg(unix)'.dev-dependencies]

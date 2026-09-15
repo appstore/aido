@@ -305,6 +305,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
+            unit: None,
         }
     }
 
@@ -324,6 +325,7 @@ mod tests {
             unknown_kind: false,
             mime: "image/png".into(),
             content: InputContent::Media(png),
+            unit: None,
         }
     }
 
@@ -401,6 +403,7 @@ mod tests {
             unknown_kind: false,
             mime: "audio/mpeg".into(),
             content: crate::domain::InputContent::Media(vec![1, 2, 3]),
+            unit: None,
         };
         let err = build_messages(Some("sys"), None, &[audio]).unwrap_err();
         assert!(err.to_string().contains("audio"), "{err}");

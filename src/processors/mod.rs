@@ -91,6 +91,7 @@ pub(crate) fn synthetic_text(id: usize, name: &str, text: &str) -> InputPart {
         unknown_kind: false,
         mime: "text/plain".into(),
         content: InputContent::Text(text.into()),
+        unit: None,
     }
 }
 
@@ -177,6 +178,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(format!("body of {name}")),
+            unit: None,
         }
     }
 

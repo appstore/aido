@@ -14,7 +14,7 @@ aido tts --text "你好" -o hello.mp3
 
 ## 安装
 
-从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。
+从 [Releases](https://github.com/appstore/aido/releases) 下载对应平台的压缩包（Linux / macOS / Windows 二进制由 CI 自动构建，单个可执行文件，无 runtime 依赖）。Linux 另提供 musl 全静态产物（`x86_64-unknown-linux-musl`），不依赖 glibc，任意 x86_64 Linux 环境（含极简容器）可直接运行。
 
 或从源码构建（需要 Rust 1.88+）：
 
@@ -61,6 +61,8 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 | 写法 | 含义 |
 |---|---|
 | `FILE` | 输入文件，按出现顺序提交，文本/图片/音频可混用 |
+| `PDF` | 每页的内嵌图片与文本层按页序展开为材料（一页图+文即两个 part）；矢量绘制、无内嵌图亦无文本层的 PDF 默认报错并给出转图指引（见下） |
+| `XLSX` | 每个非空工作表展开为一个文本 part（markdown 表格，按工作表顺序；日期渲染为 ISO 8601） |
 | `GLOB` | glob 模式由 aido 自行展开（shell 未展开的场景——引号包裹、Windows——也能用）：结果按字典序，无匹配直接报错；`**` 显式递归 |
 | `DIR` | 目录参数：展开为一层文件（按名称排序）；点文件被跳过，子目录直接报错；要递归请用 glob |
 | `--text TEXT` | 字面文本材料，可重复、可与文件交错 |
@@ -284,6 +286,16 @@ aido config init / config check
 
 图片以 `image_url`（base64 PNG）发送，需要视觉模型（gpt-4o、glm-4.6v、qwen2.5-vl 等）。PNG 原样透传，JPEG/WebP 在适配器边界转 PNG。文本与图片可混用、顺序保留；多个文本文件按文件名分节标注。
 
+## 文档输入（PDF / XLSX）
+
+文档在本地"物化"为普通材料后再走既有管线——不经过任何服务端文件接口，所有 provider 通用，单文件、零 runtime 依赖的性质不变：
+
+- **PDF**：逐页提取内嵌图片（JPEG 原样透传、无损；Flate 位图重编码为 PNG）与文本层（含 `/ToUnicode` CMap，支持中日韩），按页序合并为材料。`ask` 会把全部页放进同一请求（绘本连页阅读）；`ocr` 是 per-part 任务，以"页"为单位——同页的图片与文本层合成一个请求，`--out-dir` 每页一个文件。只有文本层、无任何图片的 PDF 整档合并为一个文本 part（页间以 `----- page N -----` 分隔），`translate` / `summarize` 这类 per-part 文本任务因此保住跨页上下文（分块策略在段落边界切分），而不是每页孤立一个请求。无损编码之外的格式（JPEG 2000、CCITT 传真、JBIG2、PNG predictor 的阵列参数形式）跳过而不报错；解不出的字形丢弃而不输出乱码——页面图片兜住信息。文档整体物化有上限（4096 个 part / 32 MB），每条内容流的解压量也有上限——恶意构造的容器（解压炸弹、谎报尺寸的表头）会被拒绝而不是拖垮进程；矢量回退的渲染同样逐页计入预算，先超限先拒绝。
+- **矢量 PDF**：既无内嵌图也无文本层的 PDF（纯矢量绘制）默认报错，报错里给出转图指引（`pdftoppm -png`）；以 `--features pdfium` 构建的版本会用静态链入的 [pdfium](https://github.com/bblanchon/pdfium-binaries/releases)（取 `-static` 产物，设置 `PDFIUM_LIB_DIR` 指向其目录）把每页渲染成图片，默认构建完全不触碰 pdfium。链接期如报 C++ 符号缺失，按 build.rs 顶部注释补 `-lstdc++` / `-lc++`。
+- **XLSX**：每个非空工作表一个文本 part，markdown 表格、日期 `YYYY-MM-DDTHH:MM:SS`。超过 400 万单元格的巨型工作表会被拒绝（完整载入内存的保护），加载器急切解压的条目（共享字符串等）另有实测解压量上限——表头谎报尺寸拦不住它；中等大小的大表会撞单请求上下文，建议走 `summarize`（自动分块）。`.xlsm` 宏不会被读取或执行。
+
+.docx / .pptx 已识别但尚未支持，会报错提示先转文本（或图片）；csv / md / txt 本就是文本输入，直接可用。
+
 ## Linux 剪贴板说明
 
 X11（以及多数 Wayland 合成器）的剪贴板内容依附于写入它的进程，进程退出后内容即失效。aido 写剪贴板时会自动派生一个后台子进程，把内容保持一段时间（默认 45 秒，`settings.hold_secs` 可调），行为与 `xclip` / `wl-copy` 一致。
@@ -309,7 +321,7 @@ X11（以及多数 Wayland 合成器）的剪贴板内容依附于写入它的�
 
 ## 发布流程
 
-push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workflows/release.yml)：跑测试，构建 Linux / macOS（Intel + Apple Silicon）/ Windows 二进制，打 `v<version>` 标签并发布到 [Releases](https://github.com/appstore/aido/releases)。
+push（或合并）到 `release` 分支会触发 [GitHub Actions](.github/workflows/release.yml)：跑测试，构建 Linux（gnu + musl 全静态）/ macOS（Intel + Apple Silicon）/ Windows 二进制，打 `v<version>` 标签并发布到 [Releases](https://github.com/appstore/aido/releases)。
 
 1. 在 `Cargo.toml` 中更新 `version`
 2. 把代码合入 `release` 分支并 push

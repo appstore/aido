@@ -376,6 +376,7 @@ mod tests {
             unknown_kind: false,
             mime: "text/plain".into(),
             content: InputContent::Text(s.into()),
+            unit: None,
         }
     }
 
@@ -388,6 +389,7 @@ mod tests {
             unknown_kind: false,
             mime: mime.into(),
             content: InputContent::Media(bytes),
+            unit: None,
         }
     }
 
