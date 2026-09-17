@@ -165,7 +165,7 @@ async fn dispatch(
         Some(Commands::Profiles) => return manage_profiles(),
         Some(Commands::Config { cmd }) => return manage_config(cmd),
         Some(Commands::History { cmd }) => return manage_history(&cli, cmd).await,
-        Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs),
+        Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs).await,
         None => {}
     }
 
@@ -843,7 +843,7 @@ fn manage_config(cmd: &ConfigCmd) -> AppResult<()> {
     }
 }
 
-fn run_hold(image: bool, secs: u64) -> AppResult<()> {
+async fn run_hold(image: bool, secs: u64) -> AppResult<()> {
     use std::io::Read;
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -861,7 +861,8 @@ fn run_hold(image: bool, secs: u64) -> AppResult<()> {
         )
         .map_err(|e| AppError::service(format!("failed to write clipboard: {e}")))?;
     }
-    std::thread::sleep(std::time::Duration::from_secs(secs));
+    // Keep the clipboard alive without blocking Ctrl+C while holding it.
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     Ok(())
 }
 
