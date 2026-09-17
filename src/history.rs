@@ -67,28 +67,42 @@ struct ManifestArtifact {
     provenance: Option<Provenance>,
 }
 
-/// A fresh run id (sortable, millisecond resolution). When the history
-/// directory is writable the run directory is created here, exclusively:
-/// two processes can never share (and clobber) one run directory. An
-/// unwritable history dir never fails the run — saving reports it later,
-/// best-effort.
+/// Reserve a sortable millisecond run id when history is writable.
+/// Reservation failures warn but do not prevent generation; saving history
+/// remains best-effort.
 pub fn new_run_id() -> String {
-    let dir = history_dir();
+    new_run_id_in(history_dir().as_deref())
+}
+
+fn new_run_id_in(dir: Option<&Path>) -> String {
     let mut elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    let Some(d) = dir else {
+        return stamp(elapsed);
+    };
+    if let Err(e) = std::fs::create_dir_all(d) {
+        eprintln!(
+            "warning: cannot create history directory {}: {e}",
+            d.display()
+        );
+        return stamp(elapsed);
+    }
     loop {
         let id = stamp(elapsed);
-        let Some(d) = &dir else {
-            return id; // no history dir: the id is for reports only
-        };
         match std::fs::create_dir(d.join(&id)) {
             Ok(()) => return id,
             // Lost a millisecond-stamp race with another process: bump.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 elapsed += Duration::from_millis(1);
             }
-            Err(_) => return id,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot reserve a history run directory {}: {e}",
+                    d.join(&id).display()
+                );
+                return id;
+            }
         }
     }
 }
@@ -392,10 +406,10 @@ pub fn prune(keep: usize, budget: u64) {
     }
 }
 
-/// A run directory without a manifest was left by a process that died
-/// between creating the dir and committing the manifest. Once it is too
-/// old to be in-flight, it is litter (possibly full artifact bytes) that
-/// listing, recovery and the budgets would otherwise ignore forever.
+/// Reclaim manifest-less directories after 24 hours without filesystem
+/// activity. This is an age heuristic, not a liveness check: an active
+/// request that writes nothing for that long is indistinguishable from
+/// abandoned work.
 fn reclaim_abandoned(dir: &Path) {
     const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -412,16 +426,60 @@ fn reclaim_abandoned(dir: &Path) {
         if !is_stamp(name) || path.join("manifest.json").exists() {
             continue;
         }
-        let age_ok = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
+        let newest = match newest_file_mtime(&path, 0) {
+            // No files at all: the dir's own mtime is the fallback.
+            Ok(None) => entry.metadata().and_then(|m| m.modified()).ok(),
+            Ok(Some(mtime)) => entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|dir_mtime| dir_mtime.max(mtime)),
+            // An unreadable run dir is kept: reclaim only removes
+            // provable litter, never a run it could not inspect.
+            Err(_) => None,
+        };
+        let age_ok = newest
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > ABANDONED_AFTER);
         if age_ok {
             remove_run(dir, name);
         }
     }
+}
+
+/// Scan files, not directory mtimes; `Ok(None)` means no files were found.
+/// Run dirs are normally flat. Allow three nested directories, but retain
+/// a run if the walk cannot finish (errors or excess depth), rather than
+/// mistaking an unobserved recent file for abandoned litter. DirEntry's
+/// metadata does not follow symlinks, so we never recurse through them.
+fn newest_file_mtime(dir: &Path, depth: u8) -> std::io::Result<Option<SystemTime>> {
+    const MAX_DEPTH: u8 = 3;
+    if depth > MAX_DEPTH {
+        return Err(std::io::Error::other("history scan depth exceeded"));
+    }
+    let mut newest: Option<SystemTime> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        let mtime = if meta.is_dir() {
+            newest_file_mtime(&entry.path(), depth + 1)?
+        } else {
+            Some(meta.modified()?)
+        };
+        if let Some(mtime) = mtime {
+            newest = Some(newest.map_or(mtime, |n| n.max(mtime)));
+        }
+    }
+    Ok(newest)
+}
+
+/// The mtime `path` would report, for tests that fake age.
+#[cfg(test)]
+fn set_mtime(path: &Path, mtime: SystemTime) {
+    use std::fs::FileTimes;
+    let file = std::fs::File::open(path).expect("open for set_mtime");
+    file.set_times(FileTimes::new().set_modified(mtime))
+        .expect("set mtime");
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -550,5 +608,103 @@ mod tests {
             "format":"text","file":"text.txt","size":5}]}"#;
         let old: Manifest = serde_json::from_str(old).unwrap();
         assert_eq!(old.artifacts[0].provenance, None);
+    }
+
+    #[test]
+    fn reservation_creates_missing_parents_and_unique_directories() {
+        let dir = crate::test_support::run_root()
+            .join("hist-reserve")
+            .join("nested");
+        let first = new_run_id_in(Some(&dir));
+        let second = new_run_id_in(Some(&dir));
+        assert_ne!(first, second);
+        assert!(dir.join(first).is_dir());
+        assert!(dir.join(second).is_dir());
+    }
+
+    #[test]
+    fn reservation_failure_keeps_generation_possible() {
+        let file = crate::test_support::run_root().join("hist-reserve-file");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(is_stamp(&new_run_id_in(Some(&file))));
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+        assert!(is_stamp(&new_run_id_in(None)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_keeps_an_old_dir_with_a_recently_written_file() {
+        let dir = crate::test_support::run_root().join("hist-reclaim-recent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = dir.join("20260101-000000.000");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("image.png.tmp"), b"partial").unwrap();
+        // The dir itself (and its litter) is well over the age limit.
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        set_mtime(&dir, old);
+        set_mtime(&run, old);
+
+        reclaim_abandoned(&dir);
+        assert!(
+            run.is_dir(),
+            "an in-flight run with fresh writes must survive reclaim"
+        );
+    }
+
+    /// A dead litter dir whose files stopped refreshing is still litter:
+    /// all file mtimes (not just the dir's) are old, so it is reclaimed.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_still_removes_an_old_dir_with_only_old_files() {
+        let dir = crate::test_support::run_root().join("hist-reclaim-dead");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = dir.join("20260101-000000.000");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("image.png.tmp"), b"partial").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        set_mtime(&dir, old);
+        set_mtime(&run, old);
+        set_mtime(&run.join("image.png.tmp"), old);
+
+        reclaim_abandoned(&dir);
+        assert!(!run.exists(), "a dead litter dir must still be reclaimed");
+    }
+
+    /// With no files at all there is no file mtime to read: the dir's own
+    /// mtime is the fallback. Old empty litter goes; fresh empty dirs stay.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_falls_back_to_dir_mtime_when_empty() {
+        let dir = crate::test_support::run_root().join("hist-reclaim-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("20260101-000000.000");
+        let fresh = dir.join("20260101-000000.001");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        set_mtime(&old, SystemTime::now() - Duration::from_secs(48 * 3600));
+
+        reclaim_abandoned(&dir);
+        assert!(!old.exists(), "an old empty dir must still be reclaimed");
+        assert!(fresh.exists(), "a fresh empty dir must survive reclaim");
+    }
+
+    /// The fresh-mtime scan is recursive: a recent write in a nested
+    /// directory (unexpected for a run dir, but possible) also protects it.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_reads_nested_files() {
+        let dir = crate::test_support::run_root().join("hist-reclaim-nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = dir.join("20260101-000000.000");
+        let nested = run.join("parts").join("0");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("chunk.txt"), b"recent").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
+        set_mtime(&dir, old);
+        set_mtime(&run, old);
+        set_mtime(&nested, old);
+
+        reclaim_abandoned(&dir);
+        assert!(run.is_dir(), "a nested recent write must protect the run");
     }
 }
