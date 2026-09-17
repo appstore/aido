@@ -29,7 +29,7 @@
 //! a render no tool can see into: with the `pdfium` feature aido renders
 //! its pages; without it the run fails naming that build flag.
 
-use super::{doc_stem, part, push, Budget};
+use super::{append, doc_stem, part, Budget};
 use crate::domain::{InputContent, InputPart, InputSource, MediaKind};
 use anyhow::{bail, Context, Result};
 use lopdf::{Document, Object};
@@ -83,23 +83,40 @@ pub(super) fn expand(
     // with nothing to contribute — the notes channel's raw material.
     let mut skips: Vec<(u32, &'static str)> = Vec::new();
     let mut empty_pages: Vec<u32> = Vec::new();
-    // Each page's material, collected before any part is pushed: whether
-    // the document yielded any image at all decides its shape below.
+    // Retained payloads are admitted before extracting the next item.
+    // The loaded PDF and one image/page decoder's working memory remain
+    // separate from this aggregate extracted-material bound.
     let mut pages_items: Vec<Vec<(MediaKind, &'static str, InputContent)>> =
         Vec::with_capacity(pages.len());
     let mut any_image = false;
+    let mut text_pages = 0usize;
     for (page, page_id) in &pages {
         let mut items: Vec<(MediaKind, &'static str, InputContent)> = Vec::new();
-        for (bytes, mime) in page_images(&doc, *page_id, *page, &mut skips) {
+        page_images(&doc, *page_id, *page, &mut skips, &mut |bytes, mime| {
+            // Until this first supported image, text reserved ONE part.
+            // Now all preceding nonempty text pages become final parts.
+            let prior_text_parts = if any_image {
+                0
+            } else {
+                text_pages.saturating_sub(1)
+            };
+            budget.admit_material(origin, bytes.len(), 1 + prior_text_parts)?;
             any_image = true;
             items.push((MediaKind::Image, mime, InputContent::Media(bytes)));
-        }
+            Ok(())
+        })?;
         // One page at a time: the extractor returns text chunks, so only a
         // single-page request maps its result to that page. A page whose
         // text fails (undecodable font, over-limit stream) yields no text
         // — never garbage — and its image carries the information instead.
         if let Ok(text) = doc.extract_text_with_limit(&[*page], MAX_CONTENT_BYTES) {
             if !text.trim().is_empty() {
+                budget.admit_material(
+                    origin,
+                    text.len(),
+                    usize::from(any_image || text_pages == 0),
+                )?;
+                text_pages += 1;
                 items.push((MediaKind::Text, "text/plain", InputContent::Text(text)));
             }
         }
@@ -131,10 +148,8 @@ pub(super) fn expand(
                 } else {
                     format!("{stem}-p{page}")
                 };
-                push(
-                    budget,
+                append(
                     &mut parts,
-                    origin,
                     part(
                         source.clone(),
                         name,
@@ -143,7 +158,7 @@ pub(super) fn expand(
                         content,
                         Some(unit.clone()),
                     ),
-                )?;
+                );
             }
         }
     } else if has_text {
@@ -154,24 +169,46 @@ pub(super) fn expand(
         // what its chunk strategy exists to avoid; merged, the chunker
         // splits at paragraph boundaries and carries context between
         // chunks. One unit for the whole document, like a workbook sheet.
-        let mut text = String::new();
-        for ((page, _), items) in pages.iter().zip(&pages_items) {
-            for (_, _, content) in items {
-                if let InputContent::Text(t) = content {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
-                    }
-                    if pages.len() > 1 {
-                        text.push_str(&format!("----- page {page} -----\n\n"));
-                    }
-                    text.push_str(t);
+        // Markers exist only in the text-only shape. Charging them earlier
+        // could reject a valid mixed PDF whose first image appears late.
+        // Admit ALL glue before any concatenation, including separators.
+        let mut glue = text_pages.saturating_sub(1) * 2;
+        if pages.len() > 1 {
+            for ((page, _), items) in pages.iter().zip(&pages_items) {
+                if !items.is_empty() {
+                    glue += format!("----- page {page} -----\n\n").len();
                 }
             }
         }
-        push(
-            budget,
+        budget.admit_material(origin, glue, 0)?;
+        let mut text = String::new();
+        // Consume rather than borrow the chunks: reuse the first buffer
+        // and release subsequent page buffers as they are appended, rather
+        // than keeping a second full aggregate alive until the merge ends.
+        for ((page, _), items) in pages.iter().zip(pages_items) {
+            for (_, _, content) in items {
+                if let InputContent::Text(mut t) = content {
+                    let marker = if pages.len() > 1 {
+                        format!("----- page {page} -----\n\n")
+                    } else {
+                        String::new()
+                    };
+                    if text.is_empty() {
+                        t.insert_str(0, &marker);
+                        text = t;
+                    } else {
+                        text.reserve_exact(2 + marker.len() + t.len());
+                        text.push_str("\n\n");
+                        text.push_str(&marker);
+                        text.push_str(&t);
+                    }
+                }
+            }
+        }
+        // The single merged part was budgeted piecewise at extraction;
+        // appending it must not charge the whole aggregate a second time.
+        append(
             &mut parts,
-            origin,
             part(
                 source.clone(),
                 stem.clone(),
@@ -180,7 +217,7 @@ pub(super) fn expand(
                 InputContent::Text(text),
                 Some(format!("{origin}#{document}")),
             ),
-        )?;
+        );
     }
     partial_material_notes(budget, &skips, &empty_pages, pages.len());
     if parts.is_empty() {
@@ -204,7 +241,7 @@ pub(super) fn expand(
                     InputContent::Media(png),
                     Some(format!("{origin}#{document}#p{page}")),
                 );
-                push(budget, &mut parts, origin, built)
+                super::push(budget, &mut parts, origin, built)
             });
             if let Err(render_err) = render {
                 // The encryption hint rides on both nothing-came-out
@@ -293,16 +330,23 @@ fn partial_material_notes(
 /// XObject's own content stream is parsed for its `/Do` names and
 /// descended into through the form's own `/Resources` (forms inherit
 /// nothing from the page), so images wrapped in forms materialize like
-/// direct ones. An object drawn repeatedly (borders, shadows, a form
+/// flat ones. An object drawn repeatedly (borders, shadows, a form
 /// stamped twice) is materialized once — the dedupe spans the whole page,
 /// nested scopes included. Undecodable images contribute nothing but a
 /// skip reason — the remaining material still ships.
+///
+/// Each decoded image is handed to `emit` one at a time instead of
+/// returning the page's `Vec` whole, so the caller admits every image to
+/// the budget before the next image is decoded — a page's material never
+/// accumulates behind the budget's back. An `Err` from `emit` (the
+/// budget's refusal) stops the walk and propagates.
 fn page_images(
     doc: &Document,
     page_id: lopdf::ObjectId,
     page: u32,
     skips: &mut Vec<(u32, &'static str)>,
-) -> Vec<(Vec<u8>, &'static str)> {
+    emit: &mut impl FnMut(Vec<u8>, &'static str) -> Result<()>,
+) -> Result<()> {
     let xobjects = xobject_streams(doc, page_id, b"XObject");
     let content = doc
         .get_page_content_with_limit(page_id, MAX_CONTENT_BYTES)
@@ -313,20 +357,20 @@ fn page_images(
         None => xobjects.iter().map(|(name, _, _)| name.clone()).collect(),
     };
     let mut scope = Scope::default();
-    collect_scope(doc, &xobjects, &order, 0, &mut scope);
+    collect_scope(doc, &xobjects, &order, 0, &mut scope, emit)?;
     skips.extend(scope.skips.drain(..).map(|reason| (page, reason)));
-    scope.material
+    Ok(())
 }
 
-/// What one page's drawing walk accumulates: the material in draw order,
-/// per-image skip reasons, and the images/forms already visited (an
-/// object reached through two scopes — or a form drawn twice — counts
-/// once, on first visit).
+/// What one page's drawing walk accumulates: per-image skip reasons and
+/// the images/forms already visited (an object reached through two
+/// scopes — or a form drawn twice — counts once, on first visit). The
+/// material itself is not held: each decoded image goes straight to the
+/// caller's `emit`, so nothing page-sized piles up behind the budget.
 #[derive(Default)]
 struct Scope {
     decoded: HashSet<lopdf::ObjectId>,
     seen_forms: HashSet<lopdf::ObjectId>,
-    material: Vec<(Vec<u8>, &'static str)>,
     skips: Vec<&'static str>,
 }
 
@@ -342,19 +386,20 @@ fn do_names(content: &lopdf::content::Content) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// One drawing scope's XObjects, drawn in `order`, collected into
-/// `material`; Form XObjects recurse into their own resources down to
-/// [`MAX_FORM_DEPTH`] levels. `decoded` is shared across the whole page,
-/// so an image reached through two scopes — or a form drawn twice —
-/// materializes once. Names with no entry in `xobjects` (a missing or
-/// non-stream resource) are skipped, as before.
+/// One drawing scope's XObjects, drawn in `order`, each decoded image
+/// handed to `emit` as it is produced; Form XObjects recurse into their
+/// own resources down to [`MAX_FORM_DEPTH`] levels. `decoded` is shared
+/// across the whole page, so an image reached through two scopes — or a
+/// form drawn twice — materializes once. Names with no entry in
+/// `xobjects` (a missing or non-stream resource) are skipped, as before.
 fn collect_scope(
     doc: &Document,
     xobjects: &[(Vec<u8>, lopdf::ObjectId, &lopdf::Stream)],
     order: &[Vec<u8>],
     depth: usize,
     scope: &mut Scope,
-) {
+    emit: &mut impl FnMut(Vec<u8>, &'static str) -> Result<()>,
+) -> Result<()> {
     let by_name: HashMap<&[u8], usize> = xobjects
         .iter()
         .enumerate()
@@ -380,7 +425,7 @@ fn collect_scope(
             if depth < MAX_FORM_DEPTH {
                 let inner = form_xobjects(doc, stream);
                 let inner_order = form_draw_order(stream, &inner);
-                collect_scope(doc, &inner, &inner_order, depth + 1, scope);
+                collect_scope(doc, &inner, &inner_order, depth + 1, scope, emit)?;
             }
             continue;
         }
@@ -388,11 +433,12 @@ fn collect_scope(
             continue;
         }
         match decode_image(stream, doc) {
-            Ok(Some((bytes, mime))) => scope.material.push((bytes, mime)),
+            Ok(Some((bytes, mime))) => emit(bytes, mime)?,
             Ok(None) => {} // neither image nor form: not ours to judge
             Err(reason) => scope.skips.push(reason),
         }
     }
+    Ok(())
 }
 
 /// Whether the XObject is a Form — the wrapper kind whose content stream
@@ -810,6 +856,195 @@ mod tests {
     /// tests.
     fn expand_bytes(bytes: &[u8]) -> Result<Vec<InputPart>> {
         expand_with_notes(bytes).map(|(parts, _)| parts)
+    }
+
+    fn expand_budget(bytes: &[u8], budget: &mut Budget) -> Result<Vec<InputPart>> {
+        expand(
+            "story.pdf",
+            bytes,
+            &InputSource::File("story.pdf".into()),
+            7,
+            20,
+            budget,
+        )
+    }
+
+    #[test]
+    fn extraction_admits_images_at_byte_and_part_boundaries() {
+        let jpeg = tiny_jpeg();
+        let bytes = book(&[jpeg.clone(), jpeg.clone(), jpeg.clone()], false, true);
+        let mut budget = Budget::with_byte_cap(jpeg.len() * 2 - 1);
+        let err = expand_budget(&bytes, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("MB of material"), "{err}");
+        assert_eq!((budget.bytes, budget.parts), (jpeg.len(), 1));
+
+        let bytes = book(&[jpeg.clone(), jpeg.clone()], false, true);
+        let mut budget = Budget::with_byte_cap(jpeg.len() * 2);
+        let parts = expand_budget(&bytes, &mut budget).unwrap();
+        assert_eq!((budget.bytes, budget.parts), (jpeg.len() * 2, 2));
+        assert_eq!(parts.iter().map(|p| p.id).collect::<Vec<_>>(), [20, 21]);
+        assert_eq!(parts[1].unit.as_deref(), Some("story.pdf#7#p2"));
+
+        let mut budget = Budget::new();
+        budget.parts = super::super::MAX_PARTS_PER_DOCUMENT - 1;
+        let err = expand_budget(&bytes, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("4096 parts"), "{err}");
+        assert_eq!(budget.bytes, jpeg.len());
+        assert_eq!(budget.parts, super::super::MAX_PARTS_PER_DOCUMENT);
+    }
+
+    #[test]
+    fn image_walk_stops_before_decoding_the_next_image_on_refusal() {
+        // Three ordinary tiny images, not an oversized or malformed PDF.
+        // Scope's visited set proves that refusal stops decoding, rather
+        // than merely rejecting a pre-collected page Vec at delivery time.
+        let jpeg = tiny_jpeg();
+        let doc = Document::load_mem(&book(
+            &[jpeg.clone(), jpeg.clone(), jpeg.clone()],
+            false,
+            true,
+        ))
+        .unwrap();
+        let images: Vec<_> = doc
+            .objects
+            .iter()
+            .filter_map(|(&id, object)| {
+                let stream = object.as_stream().ok()?;
+                matches!(stream.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                    .then(|| (format!("Im{}", id.0).into_bytes(), id, stream))
+            })
+            .collect();
+        let order: Vec<_> = images.iter().map(|(name, _, _)| name.clone()).collect();
+        for part_limited in [false, true] {
+            let mut budget = Budget::with_byte_cap(if part_limited {
+                jpeg.len() * 3
+            } else {
+                jpeg.len()
+            });
+            if part_limited {
+                budget.parts = super::super::MAX_PARTS_PER_DOCUMENT - 1;
+            }
+            let mut scope = Scope::default();
+            let mut calls = 0;
+            let err = collect_scope(&doc, &images, &order, 0, &mut scope, &mut |bytes, _| {
+                calls += 1;
+                budget.admit("story.pdf", bytes.len())
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains(if part_limited {
+                "4096 parts"
+            } else {
+                "MB of material"
+            }));
+            assert_eq!(calls, 2);
+            assert_eq!(scope.decoded.len(), 2);
+            assert!(!scope.decoded.contains(&images[2].1));
+            assert_eq!(budget.bytes, jpeg.len());
+        }
+    }
+
+    #[test]
+    fn text_collection_stops_at_admission_before_merge() {
+        let bytes = text_only_book(3);
+        let doc = Document::load_mem(&bytes).unwrap();
+        let first = doc
+            .extract_text_with_limit(&[1], MAX_CONTENT_BYTES)
+            .unwrap();
+        let mut budget = Budget::with_byte_cap(first.len());
+        let err = expand_budget(&bytes, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("MB of material"), "{err}");
+        // Only first-page raw text has been admitted, no merge glue or
+        // later text; the provisional part remains ONE.
+        assert_eq!((budget.bytes, budget.parts), (first.len(), 1));
+    }
+
+    #[test]
+    fn merged_text_budgets_all_glue_and_only_one_final_part() {
+        let bytes = text_only_book(3);
+        let expected = expand_bytes(&bytes)
+            .unwrap()
+            .remove(0)
+            .text()
+            .unwrap()
+            .to_owned();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let raw: usize = (1..=3)
+            .map(|page| {
+                doc.extract_text_with_limit(&[page], MAX_CONTENT_BYTES)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(expected.len() - raw, 3 * "----- page 1 -----\n\n".len() + 4);
+        let mut budget = Budget::with_byte_cap(expected.len() - 1);
+        let err = expand_budget(&bytes, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("MB of material"), "{err}");
+        assert_eq!((budget.bytes, budget.parts), (raw, 1));
+
+        let mut budget = Budget::with_byte_cap(expected.len() + 5);
+        budget.admit("prior", 5).unwrap();
+        budget.parts = super::super::MAX_PARTS_PER_DOCUMENT - 1;
+        let parts = expand_budget(&bytes, &mut budget).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].text(), Some(expected.as_str()));
+        assert_eq!(parts[0].unit.as_deref(), Some("story.pdf#7"));
+        assert_eq!(budget.bytes, expected.len() + 5);
+        assert_eq!(budget.parts, super::super::MAX_PARTS_PER_DOCUMENT);
+    }
+
+    #[test]
+    fn late_image_converts_prior_text_parts_without_charging_markers() {
+        let mut doc = Document::load_mem(&text_only_book(3)).unwrap();
+        let image_doc = Document::load_mem(&book(&[tiny_jpeg()], false, true)).unwrap();
+        let image = image_doc
+            .objects
+            .values()
+            .find(|o| {
+                o.as_stream().is_ok_and(
+                    |s| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"),
+                )
+            })
+            .unwrap()
+            .clone();
+        let image_id = doc.add_object(image);
+        let content = doc.add_object(Stream::new(dictionary! {}, b"/Im Do".to_vec()));
+        let page_id = doc.get_pages()[&3];
+        let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        page.set("Contents", content);
+        page.set(
+            "Resources",
+            dictionary! { "XObject" => dictionary! { "Im" => image_id } },
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let raw: usize = (1..=2)
+            .map(|page| {
+                doc.extract_text_with_limit(&[page], MAX_CONTENT_BYTES)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        let size = raw + tiny_jpeg().len();
+        let mut budget = Budget::with_byte_cap(size);
+        let parts = expand_budget(&bytes, &mut budget).unwrap();
+        assert_eq!((budget.bytes, budget.parts), (size, 3));
+        assert_eq!(
+            parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["story-p1", "story-p2", "story-p3"]
+        );
+        assert!(parts[..2]
+            .iter()
+            .all(|p| !p.text().unwrap().contains("-----")));
+        assert_eq!(parts[2].kind, MediaKind::Image);
+
+        let mut budget = Budget::new();
+        budget.parts = super::super::MAX_PARTS_PER_DOCUMENT - 2;
+        let err = expand_budget(&bytes, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("4096 parts"), "{err}");
+        // Both text pages fit as one provisional part; the late image's
+        // conversion fails atomically, before any image payload is retained.
+        assert_eq!(budget.bytes, raw);
+        assert_eq!(budget.parts, super::super::MAX_PARTS_PER_DOCUMENT - 1);
     }
 
     #[test]
