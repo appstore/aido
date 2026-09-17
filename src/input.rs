@@ -728,7 +728,11 @@ fn audio_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
         Some(("audio/wav", "wav"))
     } else if bytes.starts_with(b"ID3")
-        || (bytes.len() > 1 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+        || (bytes.len() >= 2
+            && bytes[0] == 0xff
+            && bytes[1] & 0xe0 == 0xe0
+            && bytes[1] & 0x06 != 0
+            && bytes[1] & 0x18 != 0x08)
     {
         Some(("audio/mpeg", "mp3"))
     } else if bytes.starts_with(b"fLaC") {
@@ -765,6 +769,35 @@ mod tests {
 
     fn file(p: &str) -> SourceSpec {
         SourceSpec::File(p.into())
+    }
+
+    #[test]
+    fn loose_mpeg_sync_is_not_audio() {
+        // Missing sync, reserved layer, and reserved version.
+        for second in [0x0a, 0xe0, 0xea, 0xf8] {
+            let bytes = [0xff, second, 0x00, 0x01];
+            assert_eq!(audio_type(&bytes), None, "header: {bytes:02x?}");
+            let err = classify("blob.bin", bytes.to_vec(), InputSource::Stdin, 0).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "'blob.bin' is neither valid UTF-8 text nor a supported image/audio file"
+            );
+        }
+    }
+
+    #[test]
+    fn mpeg_headers_and_id3_still_classify_as_audio() {
+        for bytes in [
+            b"ID3\x04\x00".as_slice(),
+            &[0xff, 0xfb, 0x90, 0x00],
+            &[0xff, 0xff, 0x40, 0x00],
+        ] {
+            assert_eq!(audio_type(bytes), Some(("audio/mpeg", "mp3")));
+            let part = classify("song.mp3", bytes.to_vec(), InputSource::Stdin, 0).unwrap();
+            assert_eq!(part.kind, MediaKind::Audio);
+            assert_eq!(part.mime, "audio/mpeg");
+            assert_eq!(part.content, InputContent::Media(bytes.to_vec()));
+        }
     }
 
     #[test]
