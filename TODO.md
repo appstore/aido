@@ -564,43 +564,38 @@
   - 方案：`run_hold` 改 async + `tokio::time::sleep(...).await`，让 select 的 ctrl_c 分支照常生效（被取消时剪贴板已写完，sleep 中断无副作用）。
   - 测试：`__hold` 直通与零秒路径不回归。
 
-- [ ] **F59 · 低 · `src/input.rs:705-711` · mp3 嗅探过宽**
+- [x] **F59 · 低 · `src/input.rs:705-711` · mp3 嗅探过宽**
   - `FF Ex` 开头的任意二进制（如损坏图片）被归为 audio/mpeg，用户看到「adapter does not support input audio」而非「不是受支持的文件」。media.rs:200-211 的同族检查多两位掩码。
-  - 方案：对齐 media.rs 的判别，保持「既非文本也非受支持媒体」的报错方向。
-  - 测试：`FF Ex` 开头的非音频字节不再判为 audio。
+  - 处理：mp3 同步判别对齐 media.rs 的 audio_format（版本与层的保留位拒绝）；`FF FF` 因仍可表示合法 MPEG-1 Layer I 保留接受。分类失败的报错方向不变。
+  - 测试：`FF 0A`/`FF E0`/`FF EA`/`FF F8` 不再判为 audio；ID3、`FF FB`、`FF FF`（合法 Layer I）仍判为 audio。
 
-- [ ] **F60 · 低 · `src/api/responses.rs:211-217` · 终态快照非前缀即硬失败**
-  - 服务器改写已流出文本时整个 run 失败；chat 侧宽松、responses 侧严苛，契约不一致。
-  - 方案：降级为 warning + 以终态快照为准（不再 `strip_prefix` 硬失败）。
-  - 测试：终态与 delta 不一致 → 不再退出 3，产物以终态为准并带 warning。
+- [x] **F60 · 低 · `src/api/responses.rs:211-217` · 终态快照非前缀即硬失败（复核后撤回）**
+  - 原建议（降级为 warning + 以终态快照为准）不成立：runner 的产物文本来自 delta 累积，不读流式返回的 `reply.text`；宽松处理会在产物保留已流出文本的同时警告「已使用最终文本」，且与缓冲模式字节不一致。F53 的 chat 侧对同类不一致也是硬失败，两侧契约一致。
+  - 处理：保持现状；补充「改写/缩短/空快照」拒绝测试锁定行为。TODO 原方案作废。
 
-- [ ] **F61 · 低 · `src/history.rs:85-92` · `new_run_id` 非 AlreadyExists 错误静默放行**
-  - `Err(_) => return id`——历史目录不可用时无提示继续跑，创建期失败原因丢失（后续 save_generation 会打 warning，但根因丢失）。
-  - 方案：`Err(e)` 分支一次性 `eprintln!` 提示（注意可能与后续 warning 重复，措辞区分）。
+- [x] **F61 · 低 · `src/history.rs:85-92` · `new_run_id` 非 AlreadyExists 错误静默放行**
+  - 处理：拆出 `new_run_id_in(dir)`；先 `create_dir_all` 补齐缺失的历史根目录（首次运行此前必留孤儿 tmp/直接失败），再 `create_dir` 独占预留；其他错误一次性 `eprintln!` 根因后继续（保持历史不可用不阻断生成的契约）。
+  - 测试：缺失父目录自动创建且两次预留互不相同；预留路径是普通文件（如 AIDO_HISTORY_DIR 指错）时仍返回合法 stamp、不破坏原文件。
 
-- [ ] **F62 · 低 · `src/history.rs:399-425` · `reclaim_abandoned` 可回收长跑进程的在途目录**
-  - 无 manifest 且 mtime 超 24 h 即删；`--total-timeout` 无界的合法长跑（或挂起进程）会被后发调用清掉。
-  - 方案：回收条件改为「目录内最新文件 mtime」仍超 24 h（在途目录的工件/临时文件会持续刷新 mtime），不误删仍在写进的目录。
+- [x] **F62 · 低 · `src/history.rs:399-425` · `reclaim_abandoned` 可回收长跑进程的在途目录（部分缓解）**
+  - 处理：无 manifest 目录的回收年龄改按「目录内最新文件 mtime（含目录自身 mtime 取较大值，深度上限 3，扫描失败保守保留）」判断；持续写出工件的在途运行不再被误删。空目录仍回退目录自身 mtime。
+  - 剩余限制：完全静默（24 小时内未写过任何文件）的在途目录与垃圾无法区分，仍会被回收——mtime 是年龄启发式而非活性检查，注释已写明。
 
-- [ ] **F63 · 低 · `src/output.rs:376-381` · 三种目的地字节不一致**
-  - 剪贴板 `trim_end()`、stdout 补 `\n`、文件写原始字节。若属刻意（剪贴板礼仪）在注释与 README 写明，否则统一。
-  - 方案：确认意图后二选一：文档化（注释 + README「剪贴板文本去除尾部空白」）或去掉 trim_end。
+- [x] **F63 · 低 · `src/output.rs:376-381` · 三种目的地字节不一致（文档化，不改行为）**
+  - 处理：确认为刻意设计：剪贴板 trim_end（粘贴礼仪），stdout 补 `\n`，文件/历史存原始字节。`deliver_clipboard` 注释 + README「输出（去向）」补一段说明三者差异及「逐字节保留请输出到文件」。
 
-- [ ] **F64 · 低 · `src/cli.rs:530-535` · argv 解析期做文件系统探测**
-  - `looks_like_path` 调 `Path::exists()`：NFS/automount 上参数解析可挂起，结果随文件出现与否漂移（仅影响报错措辞）。
-  - 方案：改纯词法判断（含路径分隔符/以 `.`、`/` 开头等），保留现测试语义。
+- [x] **F64 · 低 · `src/cli.rs:530-535` · argv 解析期做文件系统探测**
+  - 处理：`looks_like_path` 去掉 `Path::exists()`，改纯词法判断（`/`、Windows `\`、任意 `.`、`~` 开头、glob 元字符）；诊断不再依赖文件系统状态，NFS/automount 上不会挂起。行为差异：裸目录名（如 `src`）不再被视为路径提示，可用 `./src` 显式表达。
+  - 测试：词法判定矩阵 + 报错走向（"requires a task" vs "unknown task"）。
 
-- [ ] **F65 · 低 · `src/spinner.rs:92-99` · `Drop` 不 join 线程**
-  - Ctrl+C 后 spinner 线程可能多打一帧、与 interrupted 消息交错。
-  - 方案：评估 `Drop` 转 join 的可行性（Drop 内自借用限制），可行则收敛到 `stop()`，不可行则文档注明取舍。
+- [x] **F65 · 低 · `src/spinner.rs:92-99` · `Drop` 不 join 线程（评估后不改）**
+  - 处理：保留仅置位的 Drop 并补注释：`stop()` 已在正常路径 join；取消路径在 Drop 里 join 有死锁风险（持有 stderr 锁的调用方与等待该锁的 spinner 线程互等），现有实现是权衡后的选择。交错输出窗口仅为一个 tick。
 
-- [ ] **F66 · 低 · `src/tasks.rs:213-218` · `load_all` 的 OnceLock 连错误一起缓存**
-  - 长驻嵌入场景下一次瞬时失败永久化。仅 CLI 单次进程无实害。
-  - 方案：OnceLock 只缓存成功结果（失败每次重试），或仅记录不改。
+- [x] **F66 · 低 · `src/tasks.rs:213-218` · `load_all` 的 OnceLock 连错误一起缓存（复核后不改）**
+  - 复核结论：`load_all_uncached` 对 read_dir 失败与无效用户任务文件都是警告后跳过，只有内建任务解析错误才会 Err；后者的锅在任务定义而非环境，缓存住反而是正确的 fail-fast。原 finding 的前提（瞬时文件系统错误被永久缓存）不成立，撤回；已试验的「只缓存成功」补丁已回退。
 
-- [ ] **F67 · 低 · 文档 · README 未记载 `AIDO_CONFIG` 与 `AIDO_HISTORY_DIR`**
-  - 代码均支持（config/mod.rs:94-113、history.rs:22-27），README 环境变量说明补齐。
+- [x] **F67 · 低 · 文档 · README 未记载 `AIDO_CONFIG` 与 `AIDO_HISTORY_DIR`**
+  - 处理：README「配置」章节补环境变量表（`AIDO_CONFIG` / `AIDO_TASKS_DIR` / `AIDO_HISTORY_DIR`），含默认位置、AIDO_CONFIG 缺文件即报错、相对路径与示例。
 
-- [ ] **F68 · 低 · CI · musl 静态检查靠 grep `file` 输出文案**
-  - release.yml 的文案匹配脆弱，且 musl target 从未执行测试。
-  - 方案：改用 `readelf -l` 断言无 `PT_INTERP`（或 `file` + readelf 双保险）；musl 下执行测试按可行性评估（check 已有）。
+- [x] **F68 · 低 · CI · musl 静态检查靠 grep `file` 输出文案**
+  - 处理：release.yml 的静态校验改为 `readelf`：无 `INTERP` 程序头且无 `NEEDED` 动态项（兼容 static PIE），`file` 输出仅保留展示；新增 musl target 的 `cargo test`（本机已验证 musl 全量测试通过，构建产物 readelf 判定 static）。
