@@ -544,22 +544,22 @@
   - 方案：把 budget 的 admit 提进收集循环（像 render 回调那样逐页入账），或收集时随时检查已用量、超限即 bail。注意保留「any_image 决定文档形态」的语义——形态判定需要扫完全部页，但计费可以先行。
   - 测试：多页大图 PDF → 超预算时报 budget 错误而非成功。
 
-- [ ] **F55 · 中 · `src/input.rs:494-512` · `read_file` 是 stat-then-read：预算可被绕过**
+- [x] **F55 · 中 · `src/input.rs:494-512` · `read_file` 是 stat-then-read：预算可被绕过**（`d8986db`）
   - `metadata().len()` 检查后 `fs::read` 无上限：(a) stat 与 read 之间文件变大 → 无界读入内存；(b) 报告 size=0 的特殊文件（`/proc/*`）与 FIFO 绕过 32 MB 预算（FIFO 还会挂起直到写端关闭）。同文件 `read_limited`（514-524）的 `take(max+1)` 是正确姿势。
   - 方案：`read_file` 改 `File::open` + `take(max+1)` 读入并校验；大小检查保留（错误文案更友好），total 预算检查照旧。
   - 测试：`read_limited` 合流后的行为锁定；特殊文件路径受 `take` 上限约束。
 
-- [ ] **F56 · 中 · `src/output.rs:517-535` · 临时文件名可预测且非排他创建**
+- [x] **F56 · 中 · `src/output.rs:517-535` · 临时文件名可预测且非排他创建**（`e5a9db9`）
   - `{target}.aido-tmp-{pid}` 可预测，`create(true).truncate(true)` 打开、0600 chmod 在 open 之后：同 uid 攻击者（或 pid 复用后残留同名 tmp）可在 open 与 chmod 之间做符号链接替换；残留 tmp 也让下次同 pid 运行静默截断重建。
   - 方案：临时名加随机后缀，unix 下改 `create_new(true)`（O_EXCL，创建即拒符号链接）。
   - 测试：并发两次同目标写入（无 --overwrite）恰一成一败；残留旧 tmp 不影响本次写入。
 
-- [ ] **F57 · 中 · `src/output.rs:572-579` · 非 overwrite 提交的 fallback 吞掉真实错误且带竞态**
+- [x] **F57 · 中 · `src/output.rs:572-579` · 非 overwrite 提交的 fallback 吞掉真实错误且带竞态**（`e5a9db9`，renameat2(RENAME_NOREPLACE) 落地）
   - `hard_link` 失败时 `Err(_) if target.exists()` 先存在检查（check-then-rename 竞态，两个并发 aido 可互相覆盖），`Err(_)` 把真实错误类别（如目标目录权限不足）吞成注定失败的 rename。注释已承认竞态，但吞错误没有理由。
   - 方案：fallback 至少保留原错误并入错误链（rename 失败信息带上底层原因）；Linux 上评估 `renameat2(RENAME_NOREPLACE)`（`libc` 已是依赖）消除竞态，不可行则在注释写明顺序性前提。
   - 测试：无硬链接文件系统上的 no-clobber 行为不回归；错误链包含底层原因。
 
-- [ ] **F58 · 中 · `src/app.rs:846-866` · `__hold` 在 tokio 运行时里阻塞 sleep，hold 期间 Ctrl+C 失效**
+- [x] **F58 · 中 · `src/app.rs:846-866` · `__hold` 在 tokio 运行时里阻塞 sleep，hold 期间 Ctrl+C 失效**（`5ecd0cb`）
   - `run()` 已注册 `tokio::signal::ctrl_c()`（app.rs:83-90），`run_hold` 用 `std::thread::sleep` 阻塞 worker 线程至 hold_secs（默认 45 s）：信号分支在线程解除阻塞前得不到 poll，hold 窗口内 Ctrl+C 不退出进程。
   - 方案：`run_hold` 改 async + `tokio::time::sleep(...).await`，让 select 的 ctrl_c 分支照常生效（被取消时剪贴板已写完，sleep 中断无副作用）。
   - 测试：`__hold` 直通与零秒路径不回归。
