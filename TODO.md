@@ -511,3 +511,91 @@
 ## 完成标准（第六部分适用）
 
 - 本部分全部勾选；`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` 全绿（**417 通过、0 失败、1 忽略**，忽略项为既有的 live Edge 端点用例；全套总耗时 11.7s，F52 前 ~40s）；F46 的原始复现命令（只设 `OPENAI_API_KEY` 的 dry-run 与真实运行对比）与 F47 的 tty/管道复现均由 subagent 实测验证通过。
+
+---
+
+# 第七部分 · 全库复审第三轮（2026-09-17，基线 `d076ba5`）
+
+> 本轮 findings 不建 issue，本文件即登记处。工作方式不变：每条独立 subagent 修复（先核实再修：改码 + 补测 + `cargo fmt` + `cargo clippy` + `cargo test` 全绿 + 自 review + 勾选 + 独立 commit，`fix(scope): … (Fnn)`）。分支：`fix/review-f53-f68`（基于 `d076ba5`）。
+
+## 背景与结论
+
+- 对整个代码库的第三轮独立 review。基线核对：F01–F52 修复确认落地；`history list` 最旧优先排序（fc9a5cd）与 `resolve_run` 的 `ids.len() - index` 严格互逆，`show 1`/`last`/编号三者一致；`new_run_id` 用 exclusive `create_dir`，无创建竞态。
+- 新增 14 条 finding（2 高 / 4 中 / 8 低）+ 2 条文档/CI 项（F67 F68）。
+- 问题集中在两个主题：流式协议对不合规范服务器的容错（F53/F60），与 materialize/输出侧的资源及竞态边角（F54–F57）。
+
+## 批次总览（执行顺序）
+
+| 批次 | 主题 | Findings | 说明 |
+| ---- | ---- | -------- | ---- |
+| 1 | 流式正确性与内存纪律 | F53 F54 | 两个高危：一个让正确命令给出双份结果，一个让文档预算在峰值内存上失效。 |
+| 2 | 输入/输出的资源与竞态 | F55 F56 F57 F58 | 均为独立小改动，可并行。 |
+| 3 | 容错一致性、低危清理、文档与 CI | F59–F68 | 可并行。 |
+
+## 逐条
+
+- [x] **F53 · 高 · `src/api/chat.rs:260-276` · 流式最终 message 块会把全文重放一遍**（`37f4052`）
+  - 问题：`Stream::feed` 里 `self.full_message |= choice.message.is_some()`，content 取值 `delta…or_else(message)`。兼容服务器若在 delta 流完后发一个带完整 `message.content` 的收尾块（不合 OpenAI 规范但真实存在），全文被再次 `push_str` + `on_delta`——终端显示两遍、产物双份。`responses.rs:211-217` 的终态快照做了 `strip_prefix` 去重，chat 编解码器没有对应防线。
+  - 方案：`Stream` 记录「已 delta 输出」状态；带 `message` 的块在已有 delta 时跳过其 content（或做后缀去重），`full_message` 判定保持（收尾块仍算完成事件）。
+  - 测试：delta 流 + 终块带完整 message → 文本只出现一次；delta 流 + 终块带 message 且无 delta 的既有路径不回归。
+
+- [x] **F54 · 高 · `src/materialize/pdf.rs:88-110` · 整份文档的提取结果先囤内存，32 MB 文档预算管不住峰值 RSS**（`f1612ae`）
+  - 问题：`expand_pdf` 先把所有页的图片字节（解出的 DCT/重编码 PNG）与文本收进 `pages_items`，push 循环（134-147）才逐条向 `Budget` 计费。30 MB 扫描 PDF（每页接近 16 MiB 上限的 JPEG、4096 页上限）在计费前可占远超 32 MB 内存。同文件 render fallback（197-208）逐页入账、预算到顶即拒——同一文件两种纪律；xlsx 路径已做「先量后分」。
+  - 方案：把 budget 的 admit 提进收集循环（像 render 回调那样逐页入账），或收集时随时检查已用量、超限即 bail。注意保留「any_image 决定文档形态」的语义——形态判定需要扫完全部页，但计费可以先行。
+  - 测试：多页大图 PDF → 超预算时报 budget 错误而非成功。
+
+- [x] **F55 · 中 · `src/input.rs:494-512` · `read_file` 是 stat-then-read：预算可被绕过**（`d8986db`）
+  - `metadata().len()` 检查后 `fs::read` 无上限：(a) stat 与 read 之间文件变大 → 无界读入内存；(b) 报告 size=0 的特殊文件（`/proc/*`）与 FIFO 绕过 32 MB 预算（FIFO 还会挂起直到写端关闭）。同文件 `read_limited`（514-524）的 `take(max+1)` 是正确姿势。
+  - 方案：`read_file` 改 `File::open` + `take(max+1)` 读入并校验；大小检查保留（错误文案更友好），total 预算检查照旧。
+  - 测试：`read_limited` 合流后的行为锁定；特殊文件路径受 `take` 上限约束。
+
+- [x] **F56 · 中 · `src/output.rs:517-535` · 临时文件名可预测且非排他创建**（`e5a9db9`）
+  - `{target}.aido-tmp-{pid}` 可预测，`create(true).truncate(true)` 打开、0600 chmod 在 open 之后：同 uid 攻击者（或 pid 复用后残留同名 tmp）可在 open 与 chmod 之间做符号链接替换；残留 tmp 也让下次同 pid 运行静默截断重建。
+  - 方案：临时名加随机后缀，unix 下改 `create_new(true)`（O_EXCL，创建即拒符号链接）。
+  - 测试：并发两次同目标写入（无 --overwrite）恰一成一败；残留旧 tmp 不影响本次写入。
+
+- [x] **F57 · 中 · `src/output.rs:572-579` · 非 overwrite 提交的 fallback 吞掉真实错误且带竞态**（`e5a9db9`，renameat2(RENAME_NOREPLACE) 落地）
+  - `hard_link` 失败时 `Err(_) if target.exists()` 先存在检查（check-then-rename 竞态，两个并发 aido 可互相覆盖），`Err(_)` 把真实错误类别（如目标目录权限不足）吞成注定失败的 rename。注释已承认竞态，但吞错误没有理由。
+  - 方案：fallback 至少保留原错误并入错误链（rename 失败信息带上底层原因）；Linux 上评估 `renameat2(RENAME_NOREPLACE)`（`libc` 已是依赖）消除竞态，不可行则在注释写明顺序性前提。
+  - 测试：无硬链接文件系统上的 no-clobber 行为不回归；错误链包含底层原因。
+
+- [x] **F58 · 中 · `src/app.rs:846-866` · `__hold` 在 tokio 运行时里阻塞 sleep，hold 期间 Ctrl+C 失效**（`5ecd0cb`）
+  - `run()` 已注册 `tokio::signal::ctrl_c()`（app.rs:83-90），`run_hold` 用 `std::thread::sleep` 阻塞 worker 线程至 hold_secs（默认 45 s）：信号分支在线程解除阻塞前得不到 poll，hold 窗口内 Ctrl+C 不退出进程。
+  - 方案：`run_hold` 改 async + `tokio::time::sleep(...).await`，让 select 的 ctrl_c 分支照常生效（被取消时剪贴板已写完，sleep 中断无副作用）。
+  - 测试：`__hold` 直通与零秒路径不回归。
+
+- [x] **F59 · 低 · `src/input.rs:705-711` · mp3 嗅探过宽**
+  - `FF Ex` 开头的任意二进制（如损坏图片）被归为 audio/mpeg，用户看到「adapter does not support input audio」而非「不是受支持的文件」。media.rs:200-211 的同族检查多两位掩码。
+  - 处理：mp3 同步判别对齐 media.rs 的 audio_format（版本与层的保留位拒绝）；`FF FF` 因仍可表示合法 MPEG-1 Layer I 保留接受。分类失败的报错方向不变。
+  - 测试：`FF 0A`/`FF E0`/`FF EA`/`FF F8` 不再判为 audio；ID3、`FF FB`、`FF FF`（合法 Layer I）仍判为 audio。
+
+- [x] **F60 · 低 · `src/api/responses.rs:211-217` · 终态快照非前缀即硬失败（复核后撤回）**
+  - 原建议（降级为 warning + 以终态快照为准）不成立：runner 的产物文本来自 delta 累积，不读流式返回的 `reply.text`；宽松处理会在产物保留已流出文本的同时警告「已使用最终文本」，且与缓冲模式字节不一致。F53 的 chat 侧对同类不一致也是硬失败，两侧契约一致。
+  - 处理：保持现状；补充「改写/缩短/空快照」拒绝测试锁定行为。TODO 原方案作废。
+
+- [x] **F61 · 低 · `src/history.rs:85-92` · `new_run_id` 非 AlreadyExists 错误静默放行**
+  - 处理：拆出 `new_run_id_in(dir)`；先 `create_dir_all` 补齐缺失的历史根目录（首次运行此前必留孤儿 tmp/直接失败），再 `create_dir` 独占预留；其他错误一次性 `eprintln!` 根因后继续（保持历史不可用不阻断生成的契约）。
+  - 测试：缺失父目录自动创建且两次预留互不相同；预留路径是普通文件（如 AIDO_HISTORY_DIR 指错）时仍返回合法 stamp、不破坏原文件。
+
+- [x] **F62 · 低 · `src/history.rs:399-425` · `reclaim_abandoned` 可回收长跑进程的在途目录（部分缓解）**
+  - 处理：无 manifest 目录的回收年龄改按「目录内最新文件 mtime（含目录自身 mtime 取较大值，深度上限 3，扫描失败保守保留）」判断；持续写出工件的在途运行不再被误删。空目录仍回退目录自身 mtime。
+  - 剩余限制：完全静默（24 小时内未写过任何文件）的在途目录与垃圾无法区分，仍会被回收——mtime 是年龄启发式而非活性检查，注释已写明。
+
+- [x] **F63 · 低 · `src/output.rs:376-381` · 三种目的地字节不一致（文档化，不改行为）**
+  - 处理：确认为刻意设计：剪贴板 trim_end（粘贴礼仪），stdout 补 `\n`，文件/历史存原始字节。`deliver_clipboard` 注释 + README「输出（去向）」补一段说明三者差异及「逐字节保留请输出到文件」。
+
+- [x] **F64 · 低 · `src/cli.rs:530-535` · argv 解析期做文件系统探测**
+  - 处理：`looks_like_path` 去掉 `Path::exists()`，改纯词法判断（`/`、Windows `\`、任意 `.`、`~` 开头、glob 元字符）；诊断不再依赖文件系统状态，NFS/automount 上不会挂起。行为差异：裸目录名（如 `src`）不再被视为路径提示，可用 `./src` 显式表达。
+  - 测试：词法判定矩阵 + 报错走向（"requires a task" vs "unknown task"）。
+
+- [x] **F65 · 低 · `src/spinner.rs:92-99` · `Drop` 不 join 线程（评估后不改）**
+  - 处理：保留仅置位的 Drop 并补注释：`stop()` 已在正常路径 join；取消路径在 Drop 里 join 有死锁风险（持有 stderr 锁的调用方与等待该锁的 spinner 线程互等），现有实现是权衡后的选择。交错输出窗口仅为一个 tick。
+
+- [x] **F66 · 低 · `src/tasks.rs:213-218` · `load_all` 的 OnceLock 连错误一起缓存（复核后不改）**
+  - 复核结论：`load_all_uncached` 对 read_dir 失败与无效用户任务文件都是警告后跳过，只有内建任务解析错误才会 Err；后者的锅在任务定义而非环境，缓存住反而是正确的 fail-fast。原 finding 的前提（瞬时文件系统错误被永久缓存）不成立，撤回；已试验的「只缓存成功」补丁已回退。
+
+- [x] **F67 · 低 · 文档 · README 未记载 `AIDO_CONFIG` 与 `AIDO_HISTORY_DIR`**
+  - 处理：README「配置」章节补环境变量表（`AIDO_CONFIG` / `AIDO_TASKS_DIR` / `AIDO_HISTORY_DIR`），含默认位置、AIDO_CONFIG 缺文件即报错、相对路径与示例。
+
+- [x] **F68 · 低 · CI · musl 静态检查靠 grep `file` 输出文案**
+  - 处理：release.yml 的静态校验改为 `readelf`：无 `INTERP` 程序头且无 `NEEDED` 动态项（兼容 static PIE），`file` 输出仅保留展示；新增 musl target 的 `cargo test`（本机已验证 musl 全量测试通过，构建产物 readelf 判定 static）。

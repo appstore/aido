@@ -91,9 +91,8 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        // Cancellation paths (Ctrl+C dropping the run future) discard the
-        // spinner without calling stop(): signal the thread so it ends
-        // within one tick instead of spinning against a dying process.
+        // Cancellation drops the spinner without stop(). Do not join here:
+        // the caller may hold stderr's lock while the worker needs it to exit.
         self.stop.store(true, Ordering::Relaxed);
     }
 }

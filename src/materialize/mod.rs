@@ -59,6 +59,10 @@ const MAX_NOTES: usize = 32;
 /// a confident-looking subset never ships silently.
 pub(super) struct Budget {
     bytes: usize,
+    /// The aggregate materialized-byte ceiling. Production uses
+    /// [`MAX_DOCUMENT_BYTES`]; tests inject a smaller cap so the
+    /// admission boundary is exercised without materializing 32 MB.
+    byte_cap: usize,
     parts: usize,
     notes: Vec<String>,
     /// Every message ever noted, so repeats stay deduped even after the
@@ -69,8 +73,14 @@ pub(super) struct Budget {
 
 impl Budget {
     pub(super) fn new() -> Self {
+        Self::with_byte_cap(MAX_DOCUMENT_BYTES)
+    }
+
+    /// Production uses the document cap; unit tests can use a small cap.
+    fn with_byte_cap(cap: usize) -> Self {
         Self {
             bytes: 0,
+            byte_cap: cap,
             parts: 0,
             notes: Vec::new(),
             seen: HashSet::new(),
@@ -87,17 +97,26 @@ impl Budget {
     }
 
     pub(super) fn admit(&mut self, origin: &str, size: usize) -> Result<()> {
-        self.parts += 1;
-        if self.parts > MAX_PARTS_PER_DOCUMENT {
+        self.admit_material(origin, size, 1)
+    }
+
+    /// Admit bytes and final parts independently: PDF text can grow one
+    /// merged part, then become page parts if a supported image appears.
+    /// Failed admission leaves both counters unchanged.
+    fn admit_material(&mut self, origin: &str, size: usize, parts: usize) -> Result<()> {
+        let next_parts = self.parts.saturating_add(parts);
+        if next_parts > MAX_PARTS_PER_DOCUMENT {
             bail!("'{origin}' expands to more than {MAX_PARTS_PER_DOCUMENT} parts; split it into smaller documents");
         }
-        self.bytes = self.bytes.saturating_add(size);
-        if self.bytes > MAX_DOCUMENT_BYTES {
+        let next_bytes = self.bytes.saturating_add(size);
+        if next_bytes > self.byte_cap {
             bail!(
                 "'{origin}' expands to more than {} MB of material; split it into smaller documents",
-                MAX_DOCUMENT_BYTES / (1024 * 1024)
+                self.byte_cap / (1024 * 1024)
             );
         }
+        self.parts = next_parts;
+        self.bytes = next_bytes;
         Ok(())
     }
 
@@ -229,12 +248,17 @@ pub(super) fn push(
     budget: &mut Budget,
     parts: &mut Vec<InputPart>,
     origin: &str,
-    mut part: InputPart,
+    part: InputPart,
 ) -> Result<()> {
-    part.id = start_id_of(parts);
     budget.admit(origin, size_of(&part.content))?;
-    parts.push(part);
+    append(parts, part);
     Ok(())
+}
+
+/// Append material already admitted during extraction, without charging it twice.
+fn append(parts: &mut Vec<InputPart>, mut part: InputPart) {
+    part.id = start_id_of(parts);
+    parts.push(part);
 }
 
 fn start_id_of(parts: &[InputPart]) -> usize {

@@ -527,11 +527,13 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
 
 /// A word that names no task but looks like a file path is input rather
 /// than a typo — point at the task requirement instead of "unknown task".
+/// Keep diagnostics independent of filesystem state and automount probes.
 fn looks_like_path(word: &str) -> bool {
     word.contains('/')
-        || word.contains('\\')
+        || (cfg!(windows) && word.contains('\\'))
         || word.contains('.')
-        || std::path::Path::new(word).exists()
+        || word.starts_with('~')
+        || has_glob_metachars(word)
 }
 
 /// Short flags that take a value, and the long flag each stands for.
@@ -980,6 +982,46 @@ mod tests {
         // The ask path produces the same Glob spec.
         let n = normalize(os(&["-p", "hi", "shots/*.png"])).unwrap();
         assert_eq!(n.specs, vec![SourceSpec::Glob("shots/*.png".into())]);
+    }
+
+    #[test]
+    fn path_hints_are_lexical() {
+        for word in [
+            "/missing",
+            "dir/file",
+            "dir/",
+            ".",
+            "..",
+            ".hidden",
+            "missing-file.txt",
+            "~",
+            "~user",
+            "*",
+            "file?",
+            "file[abc]",
+            "file[",
+        ] {
+            assert!(looks_like_path(word), "{word:?}");
+        }
+        for word in ["", "transalte", "missing-file", "name~", "name]"] {
+            assert!(!looks_like_path(word), "{word:?}");
+        }
+        // F64: even an existing bare directory is not a lexical path hint;
+        // callers can use `./src` to request the file-input diagnostic.
+        assert!(!looks_like_path("src"));
+        assert_eq!(looks_like_path(r"dir\file"), cfg!(windows));
+    }
+
+    #[test]
+    fn lexical_path_hints_select_file_input_guidance() {
+        for word in ["missing-file.txt", "~user", "*", "file?", "file["] {
+            let err = normalize(os(&[word])).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("requires a task"), "{word:?}: {msg}");
+            assert!(!msg.contains("unknown task"), "{word:?}: {msg}");
+        }
+        let err = normalize(os(&["missing-file"])).unwrap_err();
+        assert!(err.to_string().contains("unknown task"), "{err}");
     }
 
     #[test]
