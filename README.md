@@ -100,6 +100,8 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 
 `--out-dir` 写出的 `manifest.json` 记录本次交付：顶层 `version` 恒为 `1`（另有 `run_id` 与 `artifacts`），每个产物条目列出 `id` / `kind` / `mime` / `file` / `size`；自 0.3.0 起产物条目追加 `provenance` 字段（`{"type":"request","index":N}` 或 `{"type":"merged","requests":[…]}`，标明产物来自该次运行的哪个请求）——老读者应允许其缺省。
 
+文本去向保留既有的格式约定：文件、目录和历史保存产物原始字节；stdout 对非空且未以换行结尾的文本补一个 `\n`；剪贴板文本去除尾部空白（包括空格、制表符和换行）。需要逐字节保留文本时请输出到文件。媒体字节输出不补换行。
+
 ### 流式与退出码
 
 `--stream` / `--no-stream` 控制正文向 stdout 的实时交付（终端默认实时，管道默认缓冲；两种模式最终字节完全一致；请求仍可用 SSE 收集）。截断的回复**默认不交付**并记入历史。
@@ -115,6 +117,16 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 | 130 | 用户取消（Ctrl+C） |
 
 ## 配置：Provider / Profile / Task 三层
+
+路径可通过以下环境变量覆盖；未设置或仅包含空白时使用平台默认位置。相对路径相对于当前工作目录。
+
+| 环境变量 | 用途与默认位置 |
+|---|---|
+| `AIDO_CONFIG` | 配置文件；默认平台配置目录下的 `aido/config.toml`。显式指定的文件不存在时直接报错，不回退默认配置。 |
+| `AIDO_TASKS_DIR` | 用户任务目录；默认平台配置目录下的 `aido/tasks/`。 |
+| `AIDO_HISTORY_DIR` | 历史目录；默认平台本地数据目录下的 `aido/history/`。 |
+
+Linux 通常使用 `~/.config/aido/` 和 `~/.local/share/aido/history/`（遵循 XDG 配置）。例如：`AIDO_CONFIG=./config.toml AIDO_HISTORY_DIR=./history aido ask --text "你好"`。
 
 - **Provider** 拥有连接：地址、凭据环境变量名、operation → 适配器路由。
 - **Profile** 拥有模型选择与调用默认值，引用一个 Provider。

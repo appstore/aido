@@ -370,6 +370,7 @@ fn refuse_delivery(
 
 /// One artifact to the clipboard. Returns the copied char count for text
 /// (0 for images). Invalid UTF-8 is an error, never a silent empty copy.
+/// Clipboard text omits trailing whitespace; stored artifacts stay exact.
 fn deliver_clipboard(artifact: &Artifact, hold_secs: u64) -> anyhow::Result<usize> {
     match artifact.kind {
         MediaKind::Text => {
@@ -526,7 +527,7 @@ fn temp_suffix() -> u64 {
 /// for an atomic rename. The delivered file's mode follows `mode`;
 /// a failed chmod warns on stderr but never loses the artifact.
 ///
-/// The temp name carries an unguessable suffix and is opened with
+/// The temp name carries a per-attempt suffix and is opened with
 /// `create_new` (O_EXCL) on unix: a leftover temp from a crashed run is
 /// never silently truncated, and a planted symlink at a predictable name
 /// is never followed. A colliding name retries with a fresh suffix.
@@ -1078,7 +1079,7 @@ mod tests {
     fn a_leftover_temp_with_the_old_naming_pattern_does_not_break_the_write() {
         // A crashed run used to leave `{target}.aido-tmp-{pid}` behind; the
         // old create+truncate open would silently reuse it. With O_EXCL and
-        // an unguessable suffix, the leftover is ignored and the write
+        // a per-attempt suffix, the leftover is ignored and the write
         // succeeds with fresh content in the target.
         let dir =
             crate::test_support::run_root().join(format!("aido-out-stale-{}", std::process::id()));
