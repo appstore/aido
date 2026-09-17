@@ -262,15 +262,22 @@ impl Stream {
                 self.finish_reason = choice.finish_reason;
             }
             self.full_message |= choice.message.is_some();
-            if let Some(content) = choice
-                .delta
-                .and_then(|d| d.content)
-                .or_else(|| choice.message.and_then(|m| m.content))
-            {
+            if let Some(content) = choice.delta.and_then(|d| d.content) {
                 self.result.text.push_str(&content);
                 if !content.is_empty() {
                     on_delta(&content);
                 }
+            }
+            if let Some(snapshot) = choice.message.and_then(|m| m.content) {
+                // A full message can repeat prior deltas or snapshots. Only
+                // emit its missing suffix; already emitted text cannot change.
+                let suffix = snapshot
+                    .strip_prefix(&self.result.text)
+                    .context("Chat snapshot disagrees with streamed output")?;
+                if !suffix.is_empty() {
+                    on_delta(suffix);
+                }
+                self.result.text = snapshot;
             }
         }
         Ok(false)
@@ -358,6 +365,122 @@ mod tests {
                 reason: "length".into()
             }
         );
+    }
+
+    #[test]
+    fn stream_snapshots_emit_only_the_missing_suffix() {
+        for (prefix, snapshots, expected_deltas) in [
+            (None, vec!["answer"], vec!["answer"]),
+            (None, vec!["answer", "answer"], vec!["answer"]),
+            (Some("answer"), vec!["answer"], vec!["answer"]),
+            (Some("Hello"), vec!["Hello world"], vec!["Hello", " world"]),
+            (
+                Some("你"),
+                vec!["你好", "你好世界"],
+                vec!["你", "好", "世界"],
+            ),
+        ] {
+            let mut stream = Stream::default();
+            let mut deltas = Vec::new();
+            let mut emit = |delta: &str| deltas.push(delta.to_owned());
+            if let Some(prefix) = prefix {
+                let chunk = serde_json::json!({"choices":[{"delta":{"content":prefix}}]});
+                assert!(!stream.feed(&chunk.to_string(), &mut emit).unwrap());
+            }
+            for snapshot in &snapshots {
+                let chunk = serde_json::json!({"choices":[{"message":{"content":snapshot}}]});
+                assert!(!stream.feed(&chunk.to_string(), &mut emit).unwrap());
+            }
+            // A full message still permits EOF without finish_reason or [DONE].
+            let result = stream.finish().unwrap();
+            assert_eq!(result.text, *snapshots.last().unwrap());
+            assert_eq!(result.status, GenerationStatus::Complete);
+            assert!(result.warnings.is_empty());
+            assert_eq!(deltas, expected_deltas);
+            assert_eq!(deltas.concat(), result.text);
+        }
+    }
+
+    #[test]
+    fn stream_snapshot_mismatch_does_not_emit_or_rewrite_text() {
+        // Changed, shortened, and empty snapshots all disagree with emitted text.
+        for snapshot in ["你们", "你", ""] {
+            let mut stream = Stream::default();
+            let mut deltas = Vec::new();
+            stream
+                .feed(
+                    r#"{"choices":[{"delta":{"content":"你好"}}]}"#,
+                    &mut |delta| deltas.push(delta.to_owned()),
+                )
+                .unwrap();
+            let chunk = serde_json::json!({"choices":[{"message":{"content":snapshot}}]});
+            let err = stream
+                .feed(&chunk.to_string(), &mut |delta| {
+                    deltas.push(delta.to_owned())
+                })
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("Chat snapshot disagrees with streamed output"));
+            assert_eq!(stream.result.text, "你好");
+            assert_eq!(deltas, ["你好"]);
+        }
+    }
+
+    #[test]
+    fn stream_snapshot_in_same_chunk_reconciles_after_delta() {
+        let mut stream = Stream::default();
+        let mut deltas = Vec::new();
+        stream
+            .feed(
+                r#"{"choices":[{"delta":{"content":"你"},"message":{"content":"你好"}}]}"#,
+                &mut |delta| deltas.push(delta.to_owned()),
+            )
+            .unwrap();
+        assert_eq!(stream.finish().unwrap().text, "你好");
+        assert_eq!(deltas, ["你", "好"]);
+    }
+
+    #[test]
+    fn stream_snapshot_preserves_incomplete_status() {
+        for reason in ["length", "content_filter"] {
+            let mut stream = Stream::default();
+            stream
+                .feed(r#"{"choices":[{"delta":{"content":"part"}}]}"#, &mut |_| {})
+                .unwrap();
+            let chunk = serde_json::json!({"choices":[{
+                "message":{"content":"partial"}, "finish_reason":reason
+            }]});
+            stream.feed(&chunk.to_string(), &mut |_| {}).unwrap();
+            assert!(stream.feed("[DONE]", &mut |_| {}).unwrap());
+            let result = stream.finish().unwrap();
+            assert_eq!(result.text, "partial");
+            assert_eq!(
+                result.status,
+                GenerationStatus::Incomplete {
+                    reason: reason.into()
+                }
+            );
+            assert_eq!(result.warnings.len(), 1);
+        }
+    }
+
+    #[test]
+    fn standard_deltas_and_done_still_complete() {
+        let mut stream = Stream::default();
+        let mut deltas = Vec::new();
+        for text in ["", "你", "好"] {
+            let chunk = serde_json::json!({"choices":[{"delta":{"content":text}}]});
+            assert!(!stream
+                .feed(&chunk.to_string(), &mut |delta| deltas
+                    .push(delta.to_owned()))
+                .unwrap());
+        }
+        assert!(stream.feed("[DONE]", &mut |_| {}).unwrap());
+        let result = stream.finish().unwrap();
+        assert_eq!(result.text, "你好");
+        assert_eq!(result.status, GenerationStatus::Complete);
+        assert_eq!(deltas, ["你", "好"]);
     }
 
     #[test]

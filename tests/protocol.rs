@@ -81,6 +81,60 @@ fn stream_flag_prints_deltas_with_one_final_newline() {
 }
 
 #[test]
+fn chat_stream_snapshots_reconcile_without_duplicate_output() {
+    let body = concat!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n",
+        "data: {\"choices\":[{\"message\":{\"content\":\"你好\"}}]}\n\n",
+        "data: {\"choices\":[{\"message\":{\"content\":\"你好\"}}]}\n\n",
+        "data: {\"choices\":[{\"message\":{\"content\":\"你好世界\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    // Exercise both live callbacks and delivery of the accumulated result.
+    for live in [false, true] {
+        let server = SseServer::start(&[body.to_string()]);
+        let cfg = chat_cfg(&server.url());
+        let mut args = vec!["summarize", "--profile", "test"];
+        if live {
+            args.push("--stream");
+        }
+        let out = run(&args, b"hi\n", &[("AIDO_CONFIG", cfg.to_str().unwrap())]);
+        out.assert_code(0);
+        assert_eq!(out.stdout(), "你好世界\n");
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
+fn chat_stream_snapshot_mismatch_fails_without_delivering_rewritten_text() {
+    let body = concat!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n",
+        "data: {\"choices\":[{\"message\":{\"content\":\"再见\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    for live in [false, true] {
+        let server = SseServer::start(&[body.to_string()]);
+        let cfg = chat_cfg(&server.url());
+        let mut args = vec!["summarize", "--profile", "test"];
+        if live {
+            args.push("--stream");
+        }
+        let out = run(&args, b"hi\n", &[("AIDO_CONFIG", cfg.to_str().unwrap())]);
+        out.assert_code(3);
+        assert!(out
+            .stderr()
+            .contains("Chat snapshot disagrees with streamed output"));
+        if live {
+            assert_eq!(out.stdout().trim_end_matches('\n'), "你好");
+        } else {
+            assert_eq!(out.stdout(), "");
+        }
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
 fn stream_error_payload_fails_the_run_with_service_exit_code() {
     let body = concat!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
