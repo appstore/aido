@@ -534,12 +534,12 @@
 
 ## 逐条
 
-- [ ] **F53 · 高 · `src/api/chat.rs:260-276` · 流式最终 message 块会把全文重放一遍**
+- [x] **F53 · 高 · `src/api/chat.rs:260-276` · 流式最终 message 块会把全文重放一遍**（`37f4052`）
   - 问题：`Stream::feed` 里 `self.full_message |= choice.message.is_some()`，content 取值 `delta…or_else(message)`。兼容服务器若在 delta 流完后发一个带完整 `message.content` 的收尾块（不合 OpenAI 规范但真实存在），全文被再次 `push_str` + `on_delta`——终端显示两遍、产物双份。`responses.rs:211-217` 的终态快照做了 `strip_prefix` 去重，chat 编解码器没有对应防线。
   - 方案：`Stream` 记录「已 delta 输出」状态；带 `message` 的块在已有 delta 时跳过其 content（或做后缀去重），`full_message` 判定保持（收尾块仍算完成事件）。
   - 测试：delta 流 + 终块带完整 message → 文本只出现一次；delta 流 + 终块带 message 且无 delta 的既有路径不回归。
 
-- [ ] **F54 · 高 · `src/materialize/pdf.rs:88-110` · 整份文档的提取结果先囤内存，32 MB 文档预算管不住峰值 RSS**
+- [x] **F54 · 高 · `src/materialize/pdf.rs:88-110` · 整份文档的提取结果先囤内存，32 MB 文档预算管不住峰值 RSS**（`f1612ae`）
   - 问题：`expand_pdf` 先把所有页的图片字节（解出的 DCT/重编码 PNG）与文本收进 `pages_items`，push 循环（134-147）才逐条向 `Budget` 计费。30 MB 扫描 PDF（每页接近 16 MiB 上限的 JPEG、4096 页上限）在计费前可占远超 32 MB 内存。同文件 render fallback（197-208）逐页入账、预算到顶即拒——同一文件两种纪律；xlsx 路径已做「先量后分」。
   - 方案：把 budget 的 admit 提进收集循环（像 render 回调那样逐页入账），或收集时随时检查已用量、超限即 bail。注意保留「any_image 决定文档形态」的语义——形态判定需要扫完全部页，但计费可以先行。
   - 测试：多页大图 PDF → 超预算时报 budget 错误而非成功。
