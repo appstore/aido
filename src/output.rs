@@ -497,12 +497,39 @@ fn apply_file_mode(_path: &Path, _mode: FileMode) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Mix clock nanos, pid and a counter for a dependency-free temp suffix.
+/// This is not cryptographic randomness; exclusive creation handles any
+/// collisions without truncating existing files.
+fn temp_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hash =
+        nanos ^ ((std::process::id() as u64) << 32) ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // A cheap avalanche step (splitmix64 finalizer) so a coincidental
+    // equality in one input does not collapse the whole value.
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    hash ^ (hash >> 31)
+}
+
 /// Write bytes via a same-directory temp file, then commit without
 /// clobbering an existing target: the no-clobber commit is a fresh hard
 /// link (it fails atomically when the target exists — no check-then-rename
-/// race), with the temp file unlinked afterwards. `--overwrite` swaps the
-/// commit for an atomic rename. The delivered file's mode follows `mode`;
+/// race), with the temp file unlinked afterwards. Linux falls back to
+/// `renameat2(RENAME_NOREPLACE)` if linking fails; without an atomic
+/// no-clobber fallback we fail closed. `--overwrite` swaps the commit
+/// for an atomic rename. The delivered file's mode follows `mode`;
 /// a failed chmod warns on stderr but never loses the artifact.
+///
+/// The temp name carries an unguessable suffix and is opened with
+/// `create_new` (O_EXCL) on unix: a leftover temp from a crashed run is
+/// never silently truncated, and a planted symlink at a predictable name
+/// is never followed. A colliding name retries with a fresh suffix.
 pub(crate) fn write_file_atomic(
     bytes: &[u8],
     target: &Path,
@@ -514,24 +541,54 @@ pub(crate) fn write_file_atomic(
         std::fs::create_dir_all(dir)
             .map_err(|e| AppError::delivery(format!("cannot create {}: {e}", dir.display())))?;
     }
-    let temp = target.with_extension(format!(
-        "{}.aido-tmp-{}",
-        target
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default(),
-        std::process::id()
-    ));
-    let write_temp = || -> AppResult<()> {
-        let mut file = std::fs::OpenOptions::new()
+    let extension = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    // Exclusive creation (O_EXCL on unix) never follows an existing
+    // symlink or truncates a leftover file. Retry collisions with fresh
+    // suffixes, without removing a file we did not create.
+    let open_temp = |temp: &Path| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp)
-            .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
-        // The temp name is predictable, so the file is made owner-only
-        // right away: no window where partially written bytes are
-        // readable under the open mode's default (a no-op off unix).
+            .create_new(true)
+            .open(temp)
+    };
+    const TEMP_ATTEMPTS: usize = 8;
+    let (temp, file) = {
+        let mut opened = None;
+        for _ in 0..TEMP_ATTEMPTS {
+            let temp = target.with_extension(format!(
+                "{}.aido-tmp-{}-{:016x}",
+                extension,
+                std::process::id(),
+                temp_suffix()
+            ));
+            match open_temp(&temp) {
+                Ok(file) => {
+                    opened = Some((temp, file));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(AppError::delivery(format!(
+                        "cannot write {}: {e}",
+                        temp.display()
+                    )));
+                }
+            }
+        }
+        opened.ok_or_else(|| {
+            AppError::delivery(format!(
+                "cannot write {}: no unique temp file name after {TEMP_ATTEMPTS} attempts",
+                target.display()
+            ))
+        })?
+    };
+    let write_temp = || -> AppResult<()> {
+        let mut file = file;
+        // Apply owner-only permissions before writing any artifact bytes
+        // (a no-op off unix).
         let _ = apply_file_mode(&temp, FileMode::Private);
         file.write_all(bytes)
             .map_err(|e| AppError::delivery(format!("cannot write {}: {e}", temp.display())))?;
@@ -551,12 +608,6 @@ pub(crate) fn write_file_atomic(
         return Err(e);
     }
 
-    let already_exists = || {
-        AppError::delivery(format!(
-            "{} already exists; use --overwrite to replace it",
-            target.display()
-        ))
-    };
     let commit = || -> AppResult<()> {
         if overwrite {
             std::fs::rename(&temp, target).map_err(|e| {
@@ -569,13 +620,7 @@ pub(crate) fn write_file_atomic(
                     let _ = std::fs::remove_file(&temp);
                     Ok(())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(already_exists()),
-                // Filesystems without hard-link support fall back to the
-                // racy check-then-rename (sequential behavior is correct).
-                Err(_) if target.exists() => Err(already_exists()),
-                Err(_) => std::fs::rename(&temp, target).map_err(|e| {
-                    AppError::delivery(format!("cannot write {}: {e}", target.display()))
-                }),
+                Err(e) => commit_after_link_error(&temp, target, e),
             }
         }
     };
@@ -585,6 +630,78 @@ pub(crate) fn write_file_atomic(
             let _ = std::fs::remove_file(&temp);
             Err(e)
         }
+    }
+}
+
+/// Preserve the original hard-link cause under the delivery classification.
+fn link_commit_error(target: &Path, exists: bool, cause: anyhow::Error) -> AppError {
+    let message = if exists {
+        format!(
+            "{} already exists; use --overwrite to replace it",
+            target.display()
+        )
+    } else {
+        format!("cannot write {}", target.display())
+    };
+    let mut error = AppError::delivery(message);
+    error.source = Some(cause.into_boxed_dyn_error());
+    error
+}
+
+/// Keep hard links primary; Linux can atomically rename on filesystems
+/// without hard-link support. If that is unavailable, fail closed: never
+/// replace a concurrent writer's target with a check-then-rename fallback.
+fn commit_after_link_error(
+    temp: &Path,
+    target: &Path,
+    link_error: std::io::Error,
+) -> AppResult<()> {
+    let exists = link_error.kind() == std::io::ErrorKind::AlreadyExists;
+    let cause = anyhow::Error::new(link_error).context("hard_link failed");
+    if exists {
+        return Err(link_commit_error(target, true, cause));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        rename_noreplace(temp, target).map_err(|e| {
+            link_commit_error(
+                target,
+                e.kind() == std::io::ErrorKind::AlreadyExists,
+                cause.context(format!("renameat2(RENAME_NOREPLACE) failed: {e}")),
+            )
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = temp;
+        Err(link_commit_error(target, target.exists(), cause))
+    }
+}
+
+/// Use the syscall so this also builds on musl, where libc does not
+/// expose a renameat2 wrapper. Unsupported kernels/filesystems fail closed.
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both pointers refer to live NUL-terminated strings; the
+    // syscall only reads them, and the remaining arguments match renameat2.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -855,6 +972,84 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn link_collision_preserves_underlying_error_and_message() {
+        let target = Path::new("out.txt");
+        let cause = "original hard-link collision";
+        let error = commit_after_link_error(
+            Path::new("unused-temp"),
+            target,
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, cause),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "out.txt already exists; use --overwrite to replace it"
+        );
+        assert!(error.chain().contains(cause), "{}", error.chain());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_link_fallback_commits_and_refuses_existing_entries() {
+        let dir = crate::test_support::run_root()
+            .join(format!("aido-out-noreplace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join("temp");
+        let target = dir.join("out.txt");
+        // Exercise the fallback directly, without needing a special mount.
+        let unsupported = || std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        std::fs::write(&temp, "original").unwrap();
+        commit_after_link_error(&temp, &target, unsupported()).unwrap();
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        std::fs::write(&temp, "replacement").unwrap();
+        let error = commit_after_link_error(&temp, &target, unsupported()).unwrap_err();
+        assert_eq!(
+            error.message,
+            format!(
+                "{} already exists; use --overwrite to replace it",
+                target.display()
+            )
+        );
+        assert!(error.chain().contains(&unsupported().to_string()));
+        assert!(error.chain().contains("renameat2(RENAME_NOREPLACE)"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), "replacement");
+
+        // A dangling symlink is still an existing directory entry; exists()
+        // would miss it, but RENAME_NOREPLACE must refuse it.
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink("missing", &dangling).unwrap();
+        let error = commit_after_link_error(&temp, &dangling, unsupported()).unwrap_err();
+        assert!(error.message.contains("already exists"));
+        assert_eq!(std::fs::read_link(&dangling).unwrap(), Path::new("missing"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_link_fallback_preserves_permission_cause() {
+        let dir = crate::test_support::run_root()
+            .join(format!("aido-out-link-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cause = "original hard-link permission failure";
+        // A missing source forces Linux's rename fallback to fail as well.
+        let error = commit_after_link_error(
+            &dir.join("missing-temp"),
+            &dir.join("out.txt"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, cause),
+        )
+        .unwrap_err();
+        assert!(error.message.starts_with("cannot write "));
+        assert!(error.chain().contains(cause), "{}", error.chain());
+        #[cfg(target_os = "linux")]
+        assert!(error.chain().contains("renameat2(RENAME_NOREPLACE) failed"));
+        assert!(!dir.join("out.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn written_mode_follows_the_file_mode_policy() {
@@ -876,6 +1071,100 @@ mod tests {
             0o666 & !current_umask(),
             "Default inherits the umask, whatever it is"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_leftover_temp_with_the_old_naming_pattern_does_not_break_the_write() {
+        // A crashed run used to leave `{target}.aido-tmp-{pid}` behind; the
+        // old create+truncate open would silently reuse it. With O_EXCL and
+        // an unguessable suffix, the leftover is ignored and the write
+        // succeeds with fresh content in the target.
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.txt");
+        let stale = target.with_extension(format!("txt.aido-tmp-{}", std::process::id()));
+        std::fs::write(&stale, "stale bytes").unwrap();
+        write_file_atomic(b"fresh", &target, false, FileMode::Default).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
+        assert_eq!(
+            std::fs::read_to_string(&stale).unwrap(),
+            "stale bytes",
+            "the leftover temp is not truncated or consumed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn successful_writes_clean_up_temp_files() {
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-rand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.txt");
+        write_file_atomic(b"1", &target, false, FileMode::Default).unwrap();
+        write_file_atomic(b"2", &target, true, FileMode::Default).unwrap();
+        // No temp file may linger after either write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("aido-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temps: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_concurrent_writes_commit_exactly_one_without_overwrite() {
+        use std::sync::Barrier;
+        let dir =
+            crate::test_support::run_root().join(format!("aido-out-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("race.txt");
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for payload in ["first", "second"] {
+            let barrier = barrier.clone();
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_file_atomic(payload.as_bytes(), &target, false, FileMode::Default)
+                    .map(|_| payload.to_string())
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().map_err(|e| e.chain()))
+            .collect();
+        let committed: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(
+            committed.len(),
+            1,
+            "exactly one writer commits: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| e.contains("already exists")),
+            "every loser must refuse with the no-clobber error: {results:?}"
+        );
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            &content, committed[0],
+            "the target holds the successful writer's payload"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("aido-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file lingers: {leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
