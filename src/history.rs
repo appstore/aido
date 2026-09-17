@@ -474,7 +474,7 @@ fn newest_file_mtime(dir: &Path, depth: u8) -> std::io::Result<Option<SystemTime
 }
 
 /// The mtime `path` would report, for tests that fake age.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_mtime(path: &Path, mtime: SystemTime) {
     use std::fs::FileTimes;
     let file = std::fs::File::open(path).expect("open for set_mtime");
