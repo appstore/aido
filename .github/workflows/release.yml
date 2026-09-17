@@ -73,24 +73,27 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Test musl target
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked --target x86_64-unknown-linux-musl
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # musl 产物必须完全静态；file 对老式静态输出 "statically linked"、
-      # 对 static-pie 输出 "static-pie linked"，两者都算静态，有 interpreter 即失败
+      # 接受静态 ELF 和 static PIE；拒绝解释器和共享库依赖。
       - name: Verify static binary
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           bin="target/${{ matrix.target }}/release/aido"
           file "$bin"
-          if file "$bin" | grep -q "dynamically linked"; then
-            echo "::error::musl binary is dynamically linked"
+          export LC_ALL=C
+          headers=$(readelf --program-headers --wide "$bin")
+          dynamic=$(readelf --dynamic --wide "$bin")
+          if grep -qE '^[[:space:]]*INTERP[[:space:]]' <<< "$headers" ||
+             grep -q '(NEEDED)' <<< "$dynamic"; then
+            echo "::error::musl binary requires an interpreter or shared library"
             exit 1
           fi
-          file "$bin" | grep -qE "statically linked|static-pie linked" || {
-            echo "::error::musl binary is neither statically linked nor static-pie"
-            exit 1
-          }
 
       - name: Get version
         id: ver
