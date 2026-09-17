@@ -44,6 +44,76 @@ echo hello | aido translate
 aido tts --text "你好，世界" -o hello.mp3
 ```
 
+## 常用示例
+
+每个内置任务的典型完整命令；输入与输出去向的完整规则见下文「命令结构」。
+
+### OCR：图片文字识别
+
+```bash
+aido ocr screenshot.png --copy               # 识别截图上的文字，直接进剪贴板
+aido ocr screenshot.png -o text.txt          # 存成文件（目标已存在时加 --overwrite）
+aido ocr shots/ --out-dir out/               # 目录逐张识别：out/a.txt、out/b.txt
+aido ocr "photos/**/*.png" --out-dir out/    # 引号里的 glob 由 aido 自己展开（** 显式递归）
+aido ocr long-shot.png --no-split            # 关闭长图切片，整张发送
+```
+
+### 翻译与摘要
+
+```bash
+echo Hello world | aido translate --to zh-CN    # 管道进，译文出 stdout
+aido translate article.md --to ja -o article.ja.md
+aido translate "docs/*.md" --out-dir out/       # 多文件逐篇翻译，失败互不影响
+aido summarize long-report.md                   # 长文自动分块，汇总成一份整体摘要
+aido summarize notes.md --copy                  # 摘要直接进剪贴板
+```
+
+### 代码审查
+
+```bash
+git diff | aido code-review                     # 审查未提交的改动
+git diff main..feature | aido code-review -o review.md
+```
+
+### TTS：语音合成
+
+```bash
+aido tts article.txt -o article.mp3 --voice zh-CN-YunxiNeural --speed 1.2
+echo 文稿内容 | aido tts -o narration.mp3       # 零配置即用：默认走免费的 Edge TTS
+```
+
+### 音频转写
+
+```bash
+aido transcribe meeting.mp3 -o meeting.txt      # 输入恰好一个音频文件
+aido transcribe voice-note.m4a --copy
+```
+
+### 图片生成
+
+```bash
+aido image --text "一只戴宇航员头盔的柴犬，扁平插画风格" -o dog.png
+aido image --text "水彩风格的猫" --count 2 --size 1024x1024 --out-dir cats/   # 多张产物必须落目录
+```
+
+### ask：临时指令
+
+```bash
+aido ask -p "用一句话解释量子纠缠"               # 只有指令，不需要材料
+aido ask a.png b.png -p "比较两张图的差异"       # 多个材料 + 指令
+git log -5 | aido ask -p "用中文写本周 changelog"
+aido --paste -p "润色这段话"                     # 从剪贴板读材料
+```
+
+### 脚本友好的修饰参数
+
+```bash
+aido ocr shot.png --dry-run                     # 只看执行计划：不发请求、不动剪贴板
+aido summarize big.md --no-stream --quiet       # 缓冲输出 + 静默，适合脚本
+aido ask -p "总结要点" --profile vision -m glm-4.6v   # 临时换 Profile / 模型
+aido translate article.md --to en -o out.md --overwrite   # 允许覆盖已存在的文件
+```
+
 ## 命令结构
 
 ```
