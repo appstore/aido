@@ -508,15 +508,37 @@ fn read_file(path: &Path, max: u64, remaining: u64) -> Result<Vec<u8>> {
     if meta.len() > remaining {
         bail!("inputs exceed the total input limit");
     }
-    std::fs::read(path).with_context(|| format!("cannot read '{}'", path.display()))
+    // The metadata checks above only carry the friendlier messages: a file
+    // grown between the stat and the read, or a special file reporting
+    // len 0 (such as a FIFO or /proc/self/status), is still bounded below.
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot read '{}'", path.display()))?;
+    let bytes =
+        read_take(&mut file, max).with_context(|| format!("cannot read '{}'", path.display()))?;
+    if bytes.len() as u64 > max {
+        bail!(
+            "'{}' is {} MB; refusing input files over {} MB (they are fully loaded into memory)",
+            path.display(),
+            bytes.len() / (1024 * 1024),
+            max / (1024 * 1024)
+        );
+    }
+    if bytes.len() as u64 > remaining {
+        bail!("inputs exceed the total input limit");
+    }
+    Ok(bytes)
+}
+
+/// Read at most `max + 1` bytes, so an over-budget reader is detected by
+/// length instead of by trusting any size metadata.
+fn read_take(reader: &mut dyn Read, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(max + 1).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn read_limited(reader: &mut dyn Read, max: u64, origin: &str) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    reader
-        .take(max + 1)
-        .read_to_end(&mut buf)
-        .with_context(|| format!("failed to read {origin}"))?;
+    let buf = read_take(reader, max).with_context(|| format!("failed to read {origin}"))?;
     if buf.len() as u64 > max {
         bail!("{origin} exceeds the 32 MB input limit");
     }
@@ -1234,5 +1256,64 @@ mod tests {
         let mut e = env(b"");
         let err = gather(&[SourceSpec::File(dir)], true, None, false, &mut e).unwrap_err();
         assert!(err.to_string().contains("expands one level"), "{err}");
+    }
+
+    #[test]
+    fn file_over_single_file_cap_keeps_its_message() {
+        let dir = write_dir("cap-file", &[("big.bin", b"0123456789")]);
+        let path = dir.join("big.bin");
+        // Both budgets are exceeded: the single-file message takes priority.
+        let err = read_file(&path, 4, 4).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'{}' is 0 MB; refusing input files over 0 MB (they are fully loaded into memory)",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn file_over_remaining_budget_keeps_its_message() {
+        let dir = write_dir("cap-remaining", &[("small.bin", b"0123456789")]);
+        let err = read_file(&dir.join("small.bin"), MAX_PART_BYTES, 4).unwrap_err();
+        assert_eq!(err.to_string(), "inputs exceed the total input limit");
+        assert_eq!(
+            read_file(&dir.join("small.bin"), 10, 10).unwrap(),
+            b"0123456789"
+        );
+    }
+
+    #[test]
+    fn stdin_over_cap_keeps_its_message() {
+        let err = read_limited(&mut Cursor::new(vec![0u8; 16]), 8, "stdin").unwrap_err();
+        assert_eq!(err.to_string(), "stdin exceeds the 32 MB input limit");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn size_zero_file_with_real_content_reads_and_stays_capped() {
+        // /proc/self/status reports st_size 0 yet carries real content: the
+        // metadata checks pass on len 0, so only the bounded read can keep
+        // the per-file budget honest.
+        let path = Path::new("/proc/self/status");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        let bytes = read_file(path, MAX_PART_BYTES, u64::MAX).unwrap();
+        assert!(bytes.len() > 8);
+        let err = read_file(path, 8, u64::MAX).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'/proc/self/status' is 0 MB; refusing input files over 0 MB (they are fully loaded into memory)"
+        );
+        let err = read_file(path, MAX_PART_BYTES, 8).unwrap_err();
+        assert_eq!(err.to_string(), "inputs exceed the total input limit");
+    }
+
+    #[test]
+    fn bounded_reader_consumes_only_one_byte_past_the_cap() {
+        let mut reader = Cursor::new(b"0123456789");
+        assert_eq!(read_take(&mut reader, 4).unwrap(), b"01234");
+        assert_eq!(reader.position(), 5);
+        assert_eq!(read_limited(&mut reader, 5, "stdin").unwrap(), b"56789");
     }
 }
