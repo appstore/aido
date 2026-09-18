@@ -43,6 +43,11 @@ pub struct DeliverArgs<'a> {
     /// empty everywhere else. A restored delivery (`last`, `history show`)
     /// passes the recorded run's pairs so its report matches the original.
     pub failed_parts: &'a [(String, String)],
+    /// Chain runs only: the intermediate stages' artifacts. They never
+    /// reach stdout, `-o` or the clipboard — the `--out-dir` manifest is
+    /// the one destination that keeps them, so a chain's full trail lands
+    /// on disk together with the final result. Empty everywhere else.
+    pub dir_extras: &'a [Artifact],
 }
 
 pub struct DeliveryOutcome {
@@ -317,7 +322,11 @@ fn deliver_to_destinations(
 
     // --- directory with manifest
     if let Some(dir) = &dir_dest {
-        match write_directory(delivered, dir, args.run_id, args.overwrite, args.quiet) {
+        // The chain's intermediate artifacts ride along: manifest entries
+        // first (they were produced first), then the final stage's.
+        let mut dir_items: Vec<&Artifact> = args.dir_extras.iter().collect();
+        dir_items.extend(delivered.iter().copied());
+        match write_directory(&dir_items, dir, args.run_id, args.overwrite, args.quiet) {
             Ok(paths) => {
                 for (id, path) in paths {
                     saved.insert(id, path);
@@ -973,6 +982,7 @@ mod tests {
             run_id: "t",
             task: Some("t"),
             failed_parts: &[],
+            dir_extras: &[],
         };
         // Deliver to a real stdout is awkward in-process; the states tell
         // the story.

@@ -48,6 +48,14 @@ struct Manifest {
     parts_total: usize,
     #[serde(default)]
     deliveries: Vec<DeliveryState>,
+    /// Chain runs only: one summary per stage in run order. Defaults keep
+    /// manifests written before this field parsing.
+    #[serde(default)]
+    stages: Vec<RunSummary>,
+    /// Chain runs only: how many artifacts, counting from the end, belong
+    /// to the final stage (the redeliverable slice). 0 = pre-chain shape.
+    #[serde(default)]
+    last_stage_len: usize,
     #[serde(default)]
     artifacts: Vec<ManifestArtifact>,
 }
@@ -174,6 +182,8 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
         failed_parts: record.failed_parts.clone(),
         parts_total: record.parts_total,
         deliveries: Vec::new(),
+        stages: record.stages.clone(),
+        last_stage_len: record.last_stage_len,
         artifacts,
     };
     write_manifest(&run_dir, &manifest)
@@ -268,6 +278,8 @@ pub fn load(run_id: &str) -> Result<Option<RunRecord>> {
         failed_parts: manifest.failed_parts,
         parts_total: manifest.parts_total,
         deliveries: manifest.deliveries,
+        stages: manifest.stages,
+        last_stage_len: manifest.last_stage_len,
     }))
 }
 
@@ -584,6 +596,8 @@ mod tests {
             failed_parts: Vec::new(),
             parts_total: 0,
             deliveries: Vec::new(),
+            stages: Vec::new(),
+            last_stage_len: 0,
             artifacts: vec![ManifestArtifact {
                 id: "text".into(),
                 kind: MediaKind::Text,

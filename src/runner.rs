@@ -234,7 +234,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             .unwrap_or(1)
     };
 
-    let prefix = spinner_prefix(&plan.resolved);
+    let mut prefix = spinner_prefix(&plan.resolved);
+    // A chain stage says which stage of the run is asking: the spinner is
+    // the only per-stage signal a quiet terminal gets.
+    if let Some(label) = &plan.stage_label {
+        prefix = format!("{label} — {prefix}");
+    }
 
     let spinner: SharedSpinner = if plan.quiet {
         Rc::new(RefCell::new(None))

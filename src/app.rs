@@ -5,13 +5,13 @@ use crate::chain;
 use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
 use crate::config;
 use crate::domain::{
-    first_line, AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind,
+    first_line, AppError, AppResult, Artifact, Destination, ErrorKind, GenerationStatus, MediaKind,
     RunRecord, RunSummary,
 };
 use crate::history::{self, civil_from_days};
 use crate::input::InputEnv;
 use crate::output::{self, DeliverArgs};
-use crate::plan::{self, TerminalInfo};
+use crate::plan::{self, ExecutionPlan, TerminalInfo};
 use crate::runner;
 use crate::tasks;
 use anyhow::Result;
@@ -142,6 +142,8 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
                     failed_parts: Vec::new(),
                     parts_total: 0,
                     deliveries: Vec::new(),
+                    stages: Vec::new(),
+                    last_stage_len: 0,
                 };
                 best_effort(
                     history::save_generation(&record, false),
@@ -196,7 +198,7 @@ async fn dispatch(
     // never reached dispatch). Management words can never be chain stages,
     // so the match above could not have fired for one.
     if let Some(chain) = chain {
-        return chain::run(chain).await;
+        return run_chain(chain, state).await;
     }
 
     let (task_name, specs) = match normalized {
@@ -279,11 +281,40 @@ async fn dispatch(
     if let Ok(mut state) = state.lock() {
         state.pending = None;
     }
+    finish_run(
+        &cli,
+        &task.name,
+        &cfg,
+        &plan,
+        output,
+        0,
+        Vec::new(),
+        &run_id,
+    )
+    .await
+}
 
+/// Record, save and deliver a finished generation — the shared tail of
+/// the single-task path and the chain runner. A chain passes which
+/// trailing artifacts are the final stage's deliverables
+/// (`last_stage_len`) and one summary per stage (`stage_summaries`); a
+/// single-task run passes 0 and an empty vec, keeping the pre-chain
+/// record shape.
+#[allow(clippy::too_many_arguments)]
+async fn finish_run(
+    cli: &Cli,
+    task_label: &str,
+    cfg: &config::Config,
+    plan: &ExecutionPlan,
+    output: runner::RunOutput,
+    last_stage_len: usize,
+    stage_summaries: Vec<RunSummary>,
+    run_id: &str,
+) -> AppResult<()> {
     // A generation that finished cleanly but did not satisfy the request
     // (missing kind, short count) is recorded, clearly marked as
     // incomplete, and not delivered.
-    let unsatisfied = output.unsatisfied_reason(&plan);
+    let unsatisfied = output.unsatisfied_reason(plan);
     let unsatisfied = if output.artifacts.is_empty() && !output.failed_parts.is_empty() {
         Some(format!(
             "all {} input part(s) failed — first error: {}",
@@ -311,10 +342,10 @@ async fn dispatch(
     // Truncated or otherwise incomplete generations are recorded but not
     // delivered (what streamed live already cannot be taken back).
     let mut record = RunRecord {
-        run_id: run_id.clone(),
-        task: Some(task.name.clone()),
+        run_id: run_id.to_string(),
+        task: Some(task_label.to_string()),
         created_at: now_iso(),
-        summary: plan::summarize(&plan),
+        summary: plan::summarize(plan),
         generation,
         artifacts: output.artifacts.clone(),
         warnings: output.warnings.clone(),
@@ -325,6 +356,8 @@ async fn dispatch(
             .collect(),
         parts_total: output.parts_total,
         deliveries: Vec::new(),
+        stages: stage_summaries,
+        last_stage_len,
     };
     if !record.generation.is_complete() {
         if plan.record_history {
@@ -388,6 +421,15 @@ async fn dispatch(
         );
     }
 
+    // A chain delivers only its final stage's artifacts; the intermediate
+    // ones ride along into `--out-dir` (and its manifest).
+    let (extras, deliverable): (&[Artifact], &[Artifact]) = if last_stage_len > 0 {
+        output
+            .artifacts
+            .split_at(output.artifacts.len() - last_stage_len)
+    } else {
+        (&[], output.artifacts.as_slice())
+    };
     let hold_secs = cfg.settings.hold_secs.unwrap_or(config::DEFAULT_HOLD_SECS);
     let failed_parts: Vec<(String, String)> = output
         .failed_parts
@@ -395,7 +437,7 @@ async fn dispatch(
         .map(|f| (f.name.clone(), f.error.clone()))
         .collect();
     let deliver_args = DeliverArgs {
-        artifacts: &output.artifacts,
+        artifacts: deliverable,
         produce: &plan.resolved.produce,
         destinations: &plan.destinations,
         overwrite: cli.overwrite,
@@ -403,9 +445,10 @@ async fn dispatch(
         hold_secs,
         quiet: cli.quiet,
         json: cli.json,
-        run_id: &run_id,
-        task: Some(&task.name),
+        run_id,
+        task: Some(task_label),
         failed_parts: &failed_parts,
+        dir_extras: extras,
     };
     // The outcome keeps every destination's real state, on success and on
     // failure alike: partial deliveries are the recoverable path when a
@@ -446,6 +489,65 @@ async fn dispatch(
             Ok(())
         }
     }
+}
+
+/// Run a parsed chain: `--dry-run` previews the per-stage plan, anything
+/// else executes stage by stage and hands the outcome to the shared
+/// record/deliver tail. The run identity exists before the first request,
+/// so a Ctrl+C mid-chain records the cancelled run exactly as a
+/// single-task run does.
+async fn run_chain(
+    chain: chain::PreparedChain,
+    state: Arc<std::sync::Mutex<RunState>>,
+) -> AppResult<()> {
+    if chain.run_cli.dry_run {
+        let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
+        print!("{}", chain::describe_chain(&chain, &cfg)?);
+        return Ok(());
+    }
+    let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
+    let terminal = TerminalInfo::real();
+    let mut env = InputEnv::real();
+    let record_history =
+        !chain.run_cli.no_history && cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP) > 0;
+    let run_id = if record_history {
+        history::new_run_id()
+    } else {
+        history::stamp_now()
+    };
+    let task_label = chain.task_label();
+    let mut on_started = {
+        let state = Arc::clone(&state);
+        let run_id = run_id.clone();
+        let task_label = task_label.clone();
+        move |summary: RunSummary| {
+            if let Ok(mut s) = state.lock() {
+                s.identity = Some((run_id.clone(), Some(task_label.clone())));
+                s.pending = Some(PendingRun {
+                    run_id: run_id.clone(),
+                    task: Some(task_label.clone()),
+                    created_at: now_iso(),
+                    summary,
+                    record_history,
+                });
+            }
+        }
+    };
+    let run = chain::execute(&chain, &cfg, terminal, &mut env, &mut on_started).await?;
+    if let Ok(mut s) = state.lock() {
+        s.pending = None;
+    }
+    finish_run(
+        &chain.run_cli,
+        &task_label,
+        &cfg,
+        &run.plan,
+        run.output,
+        run.last_stage_len,
+        run.stage_summaries,
+        &run_id,
+    )
+    .await
 }
 
 fn best_effort(result: Result<()>, what: &str) {
@@ -632,17 +734,25 @@ fn resolve_run(target: &str) -> AppResult<RunRecord> {
 }
 
 /// Restore delivers through the normal output system without touching the
-/// service (or credentials).
+/// service (or credentials). A chain record redelivers its final stage
+/// through `-o`/`--copy`/stdout and keeps every stage for `--out-dir`.
 async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppResult<()> {
-    let produce: Vec<MediaKind> = record.artifacts.iter().map(|a| a.kind).collect();
-    let destinations = restore_destinations(options, &record)?;
+    let (extras, last): (&[Artifact], &[Artifact]) = if record.last_stage_len > 0 {
+        record
+            .artifacts
+            .split_at(record.artifacts.len() - record.last_stage_len)
+    } else {
+        (&[], record.artifacts.as_slice())
+    };
+    let produce: Vec<MediaKind> = last.iter().map(|a| a.kind).collect();
+    let destinations = restore_destinations(options, last)?;
     output::precheck_file_targets(&destinations, options.overwrite)?;
     let hold_secs = config::load()
         .ok()
         .and_then(|c| c.settings.hold_secs)
         .unwrap_or(config::DEFAULT_HOLD_SECS);
     let args = DeliverArgs {
-        artifacts: &record.artifacts,
+        artifacts: last,
         produce: &produce,
         destinations: &destinations,
         overwrite: options.overwrite,
@@ -655,13 +765,14 @@ async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppRes
         // The restored report describes the run as it was: a partially
         // failed batch must not read as a full success here either.
         failed_parts: &record.failed_parts,
+        dir_extras: extras,
     };
     output::deliver(&args).result().map(|_| ())
 }
 
 fn restore_destinations(
     options: &RestoreOptions,
-    record: &RunRecord,
+    last: &[Artifact],
 ) -> AppResult<Vec<Destination>> {
     let mut destinations: Vec<Destination> = Vec::new();
     if let Some(path) = &options.output {
@@ -678,7 +789,7 @@ fn restore_destinations(
         destinations.push(Destination::Stdout);
     }
     if options.copy {
-        if record.artifacts.len() > 1 {
+        if last.len() > 1 {
             return Err(AppError::usage(
                 "the clipboard takes one artifact; use --out-dir to restore this run",
             ));
@@ -688,7 +799,7 @@ fn restore_destinations(
     if destinations.is_empty() {
         // Default stdout: binary on a terminal is refused, exactly as the
         // live plan refuses it — media goes to -o/--out-dir or a pipe.
-        let binary = record.artifacts.iter().any(|a| a.kind != MediaKind::Text);
+        let binary = last.iter().any(|a| a.kind != MediaKind::Text);
         if binary && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
             return Err(AppError::usage(
                 "this run produced binary artifacts; use -o FILE or --out-dir, or pipe stdout",

@@ -81,6 +81,9 @@ pub struct ExecutionPlan {
     pub param_sources: Vec<(String, String, ParamSource)>,
     pub credentials_available: Option<bool>,
     pub terminal: TerminalInfo,
+    /// Set only on chain stages: `chain 2/3`, shown by the spinner so a
+    /// multi-stage run says which stage is asking.
+    pub stage_label: Option<String>,
 }
 
 /// Old `-o` values that meant modes, not files.
@@ -101,14 +104,10 @@ pub fn build(
     terminal: TerminalInfo,
     env: &mut InputEnv<'_>,
 ) -> AppResult<ExecutionPlan> {
-    // --- task parameters -------------------------------------------------
-    validate_task_params(cli, task)?;
-    let mut resolved =
-        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
-    apply_param_options(cli, task, &mut resolved)?;
-    let instruction = compose_instruction(cli, task)?;
-    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
-
+    // Task parameters and route resolution come FIRST (contract §step 4):
+    // a knowable parameter or capability error must fire before any file
+    // is read, exactly as it always has.
+    let (resolved, instruction, requirement) = resolve_stage(cli, task, cfg)?;
     // --- inputs -----------------------------------------------------------
     let mut notes = Vec::new();
     let inputs = input::gather_with_notes(
@@ -131,6 +130,83 @@ pub fn build(
             eprintln!("note: {note}");
         }
     }
+    plan_from(
+        cli,
+        task,
+        inputs,
+        cfg,
+        terminal,
+        StageRole::Terminal,
+        resolved,
+        instruction,
+        requirement,
+    )
+}
+
+/// How a stage delivers: the last stage of a run owns the destinations
+/// and may stream; a chain's intermediate stages hand their single text
+/// artifact to the next stage and stay silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageRole {
+    Terminal,
+    Intermediate,
+}
+
+/// The planner over material that already exists: the ordinary run path
+/// gathers and lands here; a chain stage lands here with the previous
+/// stage's artifact as its single input.
+pub(crate) fn build_with_inputs(
+    cli: &Cli,
+    task: &Task,
+    inputs: Vec<InputPart>,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    role: StageRole,
+) -> AppResult<ExecutionPlan> {
+    let (resolved, instruction, requirement) = resolve_stage(cli, task, cfg)?;
+    plan_from(
+        cli,
+        task,
+        inputs,
+        cfg,
+        terminal,
+        role,
+        resolved,
+        instruction,
+        requirement,
+    )
+}
+
+/// The pure task-parameters preamble both planner entries share: typed
+/// parameter validation, route resolution, param options and the composed
+/// instruction. No IO.
+fn resolve_stage(
+    cli: &Cli,
+    task: &Task,
+    cfg: &Config,
+) -> AppResult<(Resolved, String, Option<String>)> {
+    validate_task_params(cli, task)?;
+    let mut resolved =
+        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    apply_param_options(cli, task, &mut resolved)?;
+    let instruction = compose_instruction(cli, task)?;
+    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
+    Ok((resolved, instruction, requirement))
+}
+
+#[allow(clippy::too_many_arguments)] // one planner body over two entries
+fn plan_from(
+    cli: &Cli,
+    task: &Task,
+    inputs: Vec<InputPart>,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    role: StageRole,
+    mut resolved: Resolved,
+    instruction: String,
+    requirement: Option<String>,
+) -> AppResult<ExecutionPlan> {
+    // --- inputs -----------------------------------------------------------
     validate_inputs(task, &resolved, &inputs)?;
     // Adapter availability: the EdgeTts variant stays compiled without the
     // feature (so a config naming 'edge-tts' still parses), but no adapter
@@ -199,8 +275,16 @@ pub fn build(
     validate_outputs(cli, &mut resolved, &steps)?;
 
     // --- destinations -------------------------------------------------------
-    let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
-    if batch
+    // An intermediate stage hands its artifact to the next stage: it has
+    // no destinations of its own and never reaches delivery.
+    let intermediate = role == StageRole::Intermediate;
+    let destinations = if intermediate {
+        Vec::new()
+    } else {
+        resolve_destinations(cli, &resolved.produce, terminal)?
+    };
+    if !intermediate
+        && batch
         && (destinations.contains(&Destination::Stdout) && !cli.json
             || destinations.contains(&Destination::Clipboard))
     {
@@ -236,8 +320,10 @@ pub fn build(
         DeliveryMode::Buffered
     };
     // A batch never streams live: replies belong to named artifacts in a
-    // directory, and a failed part must not have already hit stdout.
-    let delivery = if batch {
+    // directory, and a failed part must not have already hit stdout. An
+    // intermediate stage never streams either — only the last stage of a
+    // chain owns stdout.
+    let delivery = if intermediate || batch {
         DeliveryMode::Buffered
     } else {
         delivery
@@ -300,6 +386,7 @@ pub fn build(
         param_sources,
         credentials_available,
         terminal,
+        stage_label: None,
     })
 }
 

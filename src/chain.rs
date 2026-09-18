@@ -12,9 +12,13 @@
 use crate::cli::{Cli, SourceSpec, StageArgv};
 use crate::config::resolve::{self, Resolved};
 use crate::config::Config;
-use crate::domain::{first_line, AppError, AppResult, Destination, MediaKind};
-use crate::input::InputEnv;
-use crate::plan::{self, TerminalInfo};
+use crate::domain::{
+    first_line, AppError, AppResult, Artifact, Destination, GenerationStatus, InputContent,
+    InputPart, InputSource, MediaKind, Provenance, RunSummary,
+};
+use crate::input::{self, InputEnv};
+use crate::plan::{self, StageRole, TerminalInfo};
+use crate::runner::{self, RunOutput};
 use crate::tasks::{self, ProcessorKind, Task};
 use clap::Parser as _;
 use std::ffi::OsString;
@@ -265,19 +269,227 @@ fn processor_name(kind: ProcessorKind) -> &'static str {
     }
 }
 
-/// The chain runner's entry. This milestone lands parsing, the plan-time
-/// contract and the `--dry-run` preview; execution arrives with the chain
-/// runner.
-pub async fn run(chain: PreparedChain) -> AppResult<()> {
-    if chain.run_cli.dry_run {
-        let cfg = crate::config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
-        print!("{}", describe_chain(&chain, &cfg)?);
-        return Ok(());
+/// What a finished chain hands to the recorder: the last executed stage's
+/// plan (the delivery and `unsatisfied` contract), the merged runner
+/// output over every stage, one summary per stage, and how many trailing
+/// artifacts are the final stage's deliverables.
+pub struct ChainRun {
+    pub plan: plan::ExecutionPlan,
+    pub output: RunOutput,
+    pub stage_summaries: Vec<RunSummary>,
+    pub last_stage_len: usize,
+}
+
+/// Run the chain stage by stage. Stage 1 gathers its own material; every
+/// later stage consumes the previous stage's single text artifact. The
+/// first stage that fails ends the chain: artifacts already produced
+/// travel in the returned output (history keeps them), the failure
+/// carries the stage's name, and no later stage sends anything.
+pub async fn execute(
+    chain: &PreparedChain,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    env: &mut InputEnv<'_>,
+    on_started: &mut dyn FnMut(RunSummary),
+) -> AppResult<ChainRun> {
+    let n = chain.stages.len();
+    let mut all_artifacts: Vec<Artifact> = Vec::new();
+    // The stage that just finished: the only artifacts the next junction
+    // may hand off (the run collection keeps everything, the junction
+    // sees one stage).
+    let mut prev_artifacts: Vec<Artifact> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut summaries: Vec<RunSummary> = Vec::new();
+    let mut request_offset = 0usize;
+    let mut last_plan: Option<plan::ExecutionPlan> = None;
+    let mut last_len = 0usize;
+    // The last executed stage's streaming/step facts, for the merged
+    // output: only the final stage can have streamed, and only its step
+    // counts describe "the run".
+    let mut last_meta = (false, 0u64, 0usize, 0usize);
+
+    for k in 0..n {
+        let stage = &chain.stages[k];
+        let is_last = k + 1 == n;
+        let inputs: Vec<InputPart> = if k == 0 {
+            let mut notes = Vec::new();
+            let inputs = input::gather_with_notes(
+                &stage.specs,
+                stage.task.requires_material,
+                cfg.settings.input_bytes,
+                stage.cli.dry_run,
+                env,
+                &mut notes,
+            )
+            .map_err(|e| AppError::usage(format!("{e:#}")))?;
+            if !stage.cli.quiet {
+                for note in &notes {
+                    eprintln!("note: {note}");
+                }
+            }
+            inputs
+        } else {
+            vec![handoff(&prev_artifacts, k, &stage.task.name)?]
+        };
+        let role = if is_last {
+            StageRole::Terminal
+        } else {
+            StageRole::Intermediate
+        };
+        let mut stage_plan =
+            plan::build_with_inputs(&stage.cli, &stage.task, inputs, cfg, terminal, role)?;
+        stage_plan.stage_label = Some(format!("chain {}/{}", k + 1, n));
+        if k == 0 {
+            // The interrupted-run placeholder needs a record of a started
+            // run before the first request goes out.
+            on_started(plan::summarize(&stage_plan));
+        }
+        let mut out = runner::execute(&stage_plan).await?;
+        // Re-base provenance onto the run-global request numbering so a
+        // chain's manifests name every request without collisions.
+        retag(&mut out.artifacts, request_offset);
+        request_offset += stage_plan.steps.len();
+        if !is_last {
+            rename_intermediates(&mut out.artifacts, &stage.task.name);
+            for w in out.warnings.iter_mut() {
+                *w = format!("stage {}: {w}", k + 1);
+            }
+        }
+        let stage_len = out.artifacts.len();
+        let failed = out.status != GenerationStatus::Complete || out.failure.is_some();
+        last_meta = (
+            out.live_stdout,
+            out.live_chars,
+            out.steps_done,
+            out.steps_total,
+        );
+        all_artifacts.append(&mut prev_artifacts);
+        prev_artifacts = out.artifacts;
+        warnings.extend(out.warnings);
+        summaries.push(plan::summarize(&stage_plan));
+        last_plan = Some(stage_plan);
+        let stage_failure = out.failure;
+        last_len = stage_len;
+        if failed {
+            all_artifacts.append(&mut prev_artifacts);
+            // The chain stops here: no later stage runs, the upstream
+            // artifacts stay real and travel as the record, and the exit
+            // code is the failed stage's own classification (a service
+            // error exits 3; a finished-but-truncated generation, 4).
+            let reason = format!("stage {}/{} ({}) failed", k + 1, n, stage.task.name);
+            let failure = match stage_failure {
+                Some(e) => AppError::new(e.kind, format!("{reason}: {}", e.chain())),
+                None => AppError::generation(reason.clone()),
+            };
+            warnings.push(format!(
+                "{reason}; the earlier stages' artifacts are kept in history"
+            ));
+            return Ok(ChainRun {
+                plan: last_plan.expect("the failed stage built a plan"),
+                output: RunOutput {
+                    artifacts: all_artifacts,
+                    status: GenerationStatus::Incomplete {
+                        reason: reason.clone(),
+                    },
+                    warnings,
+                    live_stdout: last_meta.0,
+                    live_chars: last_meta.1,
+                    failed_parts: Vec::new(),
+                    parts_total: 0,
+                    steps_done: last_meta.2,
+                    steps_total: last_meta.3,
+                    failure: Some(failure),
+                },
+                stage_summaries: summaries,
+                last_stage_len: last_len,
+            });
+        }
     }
-    Err(AppError::usage(
-        "chain execution is not wired in this milestone yet; --dry-run previews \
-         the whole plan",
-    ))
+    all_artifacts.append(&mut prev_artifacts);
+    let plan = last_plan.expect("a chain has at least two stages");
+    Ok(ChainRun {
+        plan,
+        output: RunOutput {
+            artifacts: all_artifacts,
+            status: GenerationStatus::Complete,
+            warnings,
+            live_stdout: last_meta.0,
+            live_chars: last_meta.1,
+            failed_parts: Vec::new(),
+            parts_total: 0,
+            steps_done: last_meta.2,
+            steps_total: last_meta.3,
+            // Every stage completed: no failure left to carry.
+            failure: None,
+        },
+        stage_summaries: summaries,
+        last_stage_len: last_len,
+    })
+}
+
+/// The single text artifact crossing a junction, as the next stage's one
+/// input part. The junction type check makes the shape a certainty for a
+/// planned chain; this guards the runtime edge — an upstream stage that
+/// finished with an unexpected artifact set must not hand garbage on.
+fn handoff(artifacts: &[Artifact], k: usize, task_name: &str) -> AppResult<InputPart> {
+    let texts: Vec<&Artifact> = artifacts
+        .iter()
+        .filter(|a| a.kind == MediaKind::Text)
+        .collect();
+    if texts.len() != 1 {
+        return Err(AppError::generation(format!(
+            "stage {} ({}) needs exactly one text artifact from stage {k}; got {}",
+            k + 1,
+            task_name,
+            texts.len()
+        )));
+    }
+    let text = texts[0]
+        .text()
+        .ok_or_else(|| AppError::generation("the previous stage's text is not valid UTF-8"))?;
+    Ok(InputPart {
+        id: 0,
+        source: InputSource::Stage { index: k - 1 },
+        name: format!("stage-{k}-output"),
+        kind: MediaKind::Text,
+        unknown_kind: false,
+        mime: "text/plain".into(),
+        content: InputContent::Text(text.to_string()),
+        unit: None,
+    })
+}
+
+/// Re-base one stage's provenance onto the run-global request numbering,
+/// so a chain record and its manifests name every request without
+/// collisions.
+fn retag(artifacts: &mut [Artifact], offset: usize) {
+    for artifact in artifacts.iter_mut() {
+        artifact.provenance = match &artifact.provenance {
+            Provenance::Request { index } => Provenance::Request {
+                index: index + offset,
+            },
+            Provenance::Merged { requests } => Provenance::Merged {
+                requests: requests.iter().map(|r| r + offset).collect(),
+            },
+            Provenance::Restored => Provenance::Restored,
+        };
+    }
+}
+
+/// Name an intermediate stage's artifacts after the stage (`ocr`,
+/// `translate-2`), so a chain's `--out-dir` manifest and history keep one
+/// readable file per stage without collisions. The last stage keeps the
+/// ordinary naming — its artifacts are the deliverables.
+fn rename_intermediates(artifacts: &mut [Artifact], task_name: &str) {
+    let mut count = 0usize;
+    for artifact in artifacts.iter_mut() {
+        count += 1;
+        artifact.id = if count == 1 {
+            task_name.to_string()
+        } else {
+            format!("{task_name}-{count}")
+        };
+    }
 }
 
 /// The `--dry-run` preview, one block per stage. Stage 1 builds its real

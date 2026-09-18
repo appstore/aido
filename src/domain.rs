@@ -76,6 +76,11 @@ pub enum InputSource {
     Clipboard,
     /// A literal `--text` argument.
     Literal,
+    /// A chain stage's artifact: the previous stage's output feeding this
+    /// one. `index` is the producing stage (0-based).
+    Stage {
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for InputSource {
@@ -85,6 +90,7 @@ impl std::fmt::Display for InputSource {
             Self::Stdin => f.write_str("stdin"),
             Self::Clipboard => f.write_str("clipboard"),
             Self::Literal => f.write_str("--text"),
+            Self::Stage { index } => write!(f, "stage {} output", index + 1),
         }
     }
 }
@@ -282,6 +288,17 @@ pub struct RunRecord {
     pub parts_total: usize,
     #[serde(default)]
     pub deliveries: Vec<DeliveryState>,
+    /// Chain runs only: one summary per stage in run order; empty for a
+    /// single-task run. The defaults keep records written before this
+    /// field parsing.
+    #[serde(default)]
+    pub stages: Vec<RunSummary>,
+    /// Chain runs only: how many of `artifacts`, counting from the end,
+    /// belong to the final stage — the slice `-o`/`--copy`/stdout
+    /// redeliver. 0 keeps the pre-chain shape: every artifact is the
+    /// run's deliverable output.
+    #[serde(default)]
+    pub last_stage_len: usize,
 }
 
 /// The non-sensitive parts of the execution plan a run records.
@@ -609,6 +626,8 @@ mod tests {
                     error: "no display".into(),
                 },
             }],
+            stages: Vec::new(),
+            last_stage_len: 0,
         };
         assert!(record.generation.is_complete());
         assert!(!record.deliveries[0].status.is_succeeded());
