@@ -8,7 +8,9 @@
 //! too: delivery only runs after the generation succeeded, so exit 2
 //! (usage) would claim nothing happened when the model already ran —
 //! and a refusal still reaches the JSON report epilogue, so `--json`
-//! keeps one report on every exit code.
+//! keeps one report on every exit code. The exception is an `-o` target
+//! that already exists: knowable from the plan alone, it is refused
+//! pre-flight by [`precheck_file_targets`] before any request is sent.
 
 use crate::clipboard;
 use crate::domain::{
@@ -61,6 +63,29 @@ impl DeliveryOutcome {
             None => Ok(self),
         }
     }
+}
+
+/// Refuse an existing `-o` target before anything runs: the plan names the
+/// file exactly, so the collision is knowable up front and fails as usage
+/// (exit 2) instead of a paid delivery failure (exit 5). `--out-dir` names
+/// depend on what the generation yields (stems, dedup suffixes), so its
+/// collisions stay delivery-time. A dangling symlink counts as existing —
+/// the commit would refuse it all the same.
+pub fn precheck_file_targets(destinations: &[Destination], overwrite: bool) -> AppResult<()> {
+    if overwrite {
+        return Ok(());
+    }
+    for destination in destinations {
+        if let Destination::File { path } = destination {
+            if path.symlink_metadata().is_ok() {
+                return Err(AppError::usage(format!(
+                    "{} already exists; use --overwrite to replace it",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deliver everywhere the plan says, recording each destination's real
@@ -955,6 +980,46 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(outcome.states.len(), 1);
         assert!(outcome.states[0].status.is_succeeded());
+    }
+
+    #[test]
+    fn precheck_refuses_only_existing_file_targets() {
+        let dir =
+            crate::test_support::run_root().join(format!("aido-precheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.txt");
+        std::fs::write(&target, "original").unwrap();
+        let destinations = vec![
+            Destination::File {
+                path: target.clone(),
+            },
+            Destination::Clipboard,
+        ];
+        let err = precheck_file_targets(&destinations, false).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("already exists"), "{}", err.message);
+        // --overwrite lifts the refusal; stdout/clipboard targets never trip it.
+        assert!(precheck_file_targets(&destinations, true).is_ok());
+        assert!(
+            precheck_file_targets(&[Destination::Stdout, Destination::Clipboard], false).is_ok()
+        );
+        // A missing path is fine.
+        let missing = vec![Destination::File {
+            path: dir.join("nope.txt"),
+        }];
+        assert!(precheck_file_targets(&missing, false).is_ok());
+        // A dangling symlink is not: the commit would refuse it, so the
+        // precheck refuses it early for the same reason.
+        #[cfg(unix)]
+        {
+            let link = dir.join("dangling.txt");
+            std::os::unix::fs::symlink(dir.join("no-target-here"), &link).unwrap();
+            let err =
+                precheck_file_targets(&[Destination::File { path: link }], false).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Usage);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
