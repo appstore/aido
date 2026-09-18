@@ -770,10 +770,12 @@ fn normalize_chain(argv: Vec<OsString>) -> Result<Normalized> {
         // `aido chain --help` (no spec yet): hand the outer flags to clap
         // so help and version keep working — the natural way to discover
         // the chain grammar.
-        if outer
-            .iter()
-            .any(|t| matches!(t.to_str(), Some("--help") | Some("-h") | Some("--version")))
-        {
+        if outer.iter().any(|t| {
+            matches!(
+                t.to_str(),
+                Some("--help") | Some("-h") | Some("--version") | Some("-V")
+            )
+        }) {
             return Ok(Normalized::Single {
                 task: None,
                 specs: Vec::new(),
@@ -856,10 +858,13 @@ fn tokenize_chain_spec(spec: &str) -> Result<Vec<Vec<String>>> {
         }
     }
     if let Some(q) = quote {
+        // `stages.len()` is the 1-based number of the stage being scanned
+        // when the spec ran out of characters.
         bail!(
-            "the chain spec ends inside an unclosed {q} quote; chain specs have no \
-             escapes — when a stage argument needs both quote kinds, use the --then \
-             form, whose arguments are ordinary shell tokens"
+            "chain spec stage {} ends inside an unclosed {q} quote; chain specs have \
+             no escapes — when a stage argument needs both quote kinds, use the \
+             --then form, whose arguments are ordinary shell tokens",
+            stages.len()
         );
     }
     if started {
@@ -1951,6 +1956,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unclosed"), "{msg}");
         assert!(msg.contains("--then"), "{msg}");
+    }
+
+    #[test]
+    fn chain_unclosed_quote_names_the_stage() {
+        // The double-quote variant: the error names the 1-based stage the
+        // spec died in, like the empty-stage error does.
+        let err = tokenize_chain_spec("ocr | translate \"zh").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stage 2"), "{msg}");
+        assert!(msg.contains("unclosed"), "{msg}");
     }
 
     #[test]

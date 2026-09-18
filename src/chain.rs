@@ -119,12 +119,6 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
             )));
         }
         let task = tasks::get(&name).map_err(|e| AppError::usage(format!("{e:#}")))?;
-        // The material-independent plan checks run NOW, per stage: a
-        // stage that cannot work must fail before stage 1's paid request,
-        // not after it (the module contract: exit 2, zero requests).
-        plan::preflight_stage(&cli, &task, cfg).map_err(|e| {
-            AppError::usage(format!("stage {index} ({name}): {}", e.chain_inline()))
-        })?;
         let resolved = resolve::resolve(&cli, cfg, &task)
             .map_err(|e| AppError::usage(format!("stage {index} ({name}): {e:#}")))?;
         parsed.push(StageParsed {
@@ -134,7 +128,31 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
             resolved,
         });
     }
+    // Run-level flags move to the last stage BEFORE the plan checks: the
+    // checks read `-o`/`--out-dir`/`--stream`, so a chain whose delivery
+    // flags sit in the outer argv (or on an earlier `--then` stage) must
+    // be judged on the merged shape — the same shape the run executes.
     merge_run_flags(&mut parsed)?;
+    let n = parsed.len();
+    let (rest, last_stage) = parsed.split_at_mut(n - 1);
+    for (i, stage) in rest.iter_mut().enumerate() {
+        if let Err(e) = plan::preflight_stage(&stage.cli, &stage.task, cfg, false) {
+            let name = stage.task.name.clone();
+            return Err(AppError::usage(format!(
+                "stage {} ({}): {}",
+                i + 1,
+                name,
+                e.chain_inline()
+            )));
+        }
+    }
+    if let Err(e) = plan::preflight_stage(&last_stage[0].cli, &last_stage[0].task, cfg, true) {
+        let name = last_stage[0].task.name.clone();
+        return Err(AppError::usage(format!(
+            "stage {n} ({name}): {}",
+            e.chain_inline()
+        )));
+    }
     validate_chain_types(&parsed)?;
     let run_cli = parsed.last().expect("n >= 2").cli.clone();
     Ok(PreparedChain {
@@ -151,12 +169,20 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
 /// contract, so on a non-last stage they have no legal meaning, and
 /// merging them would silently reshape the last stage's request after
 /// earlier stages paid.
+///
+/// Two shapes of flag, two fates. Delivery choices (`-o`, `--out-dir`,
+/// `--copy`, `--stdout`, `--json`, `--overwrite`) merge into the last
+/// stage and are stripped from the source stage: they must not leak into
+/// an earlier stage's plan (a leftover `--out-dir` would let a real
+/// per-part batch run as an intermediate and pay for results no junction
+/// can hand off). Run-mode choices (`--quiet`, `--dry-run`,
+/// `--no-history`, `--stream`/`--no-stream`, `--total-timeout`) describe
+/// every stage, so the merged value propagates back to all of them.
 fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
     let n = stages.len();
     for k in 0..n - 1 {
         let stage = k + 1;
         let src = stages[k].cli.clone();
-        let dst = &mut stages[n - 1].cli;
         if !src.produce.is_empty() {
             return Err(AppError::usage(format!(
                 "stage {stage}: --produce belongs to a single stage; write it on \
@@ -169,6 +195,7 @@ fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
                  the last stage only"
             )));
         }
+        let dst = &mut stages[n - 1].cli;
         merge_opt(&mut dst.output, &src.output, "--output", stage)?;
         merge_opt(&mut dst.out_dir, &src.out_dir, "--out-dir", stage)?;
         merge_opt(
@@ -192,6 +219,13 @@ fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
         dst.quiet |= src.quiet;
         dst.dry_run |= src.dry_run;
         dst.no_history |= src.no_history;
+        let src_cli = &mut stages[k].cli;
+        src_cli.output = None;
+        src_cli.out_dir = None;
+        src_cli.copy = false;
+        src_cli.stdout = false;
+        src_cli.json = false;
+        src_cli.overwrite = false;
     }
     // Clap only sees conflicts per stage; merging can recombine two
     // stages' choices into a combination the single-run surface refuses.
@@ -205,6 +239,22 @@ fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
         return Err(AppError::usage(
             "--json cannot combine with --stdout (two stdout contracts)",
         ));
+    }
+    // Propagate the run-mode choices to every stage, so both chain
+    // spellings run the same plans: `--quiet` silences each stage's
+    // spinner, `--no-stream` buffers every request, `--no-history`
+    // records nothing even when a mid-chain stage's plan travels into the
+    // failure record, and `--total-timeout` is one budget per stage (each
+    // gets whatever remains).
+    let run = stages[n - 1].cli.clone();
+    for stage in &mut stages[..n - 1] {
+        let cli = &mut stage.cli;
+        cli.quiet |= run.quiet;
+        cli.dry_run |= run.dry_run;
+        cli.no_history |= run.no_history;
+        cli.stream |= run.stream;
+        cli.no_stream |= run.no_stream;
+        cli.total_timeout = run.total_timeout;
     }
     Ok(())
 }
@@ -300,13 +350,14 @@ fn processor_name(kind: ProcessorKind) -> &'static str {
 
 /// What a finished chain hands to the recorder: the last executed stage's
 /// plan (the delivery and `unsatisfied` contract), the merged runner
-/// output over every stage, one summary per stage, and how many trailing
-/// artifacts are the final stage's deliverables.
+/// output over every stage, one summary per stage, and where the final
+/// stage's deliverables begin inside the artifact list (the record's
+/// `last_stage_len` is the artifacts after it).
 pub struct ChainRun {
     pub plan: plan::ExecutionPlan,
     pub output: RunOutput,
     pub stage_summaries: Vec<RunSummary>,
-    pub last_stage_len: usize,
+    pub deliverable_start: usize,
 }
 
 /// Run the chain stage by stage. Stage 1 gathers its own material; every
@@ -331,7 +382,6 @@ pub async fn execute(
     let mut summaries: Vec<RunSummary> = Vec::new();
     let mut request_offset = 0usize;
     let mut last_plan: Option<plan::ExecutionPlan> = None;
-    let mut last_len = 0usize;
     // The last executed stage's streaming/step facts, for the merged
     // output: only the final stage can have streamed, and only its step
     // counts describe "the run".
@@ -361,7 +411,25 @@ pub async fn execute(
             }
             inputs
         } else {
-            vec![handoff(&prev_artifacts, k, &stage.task.name)?]
+            // Defensive: the junction check below stops a mis-shaped
+            // stage before this point. If it ever fires anyway, the
+            // upstream artifacts travel as the record instead of being
+            // lost with a bare error.
+            match handoff(&prev_artifacts, k, &stage.task.name) {
+                Ok(part) => vec![part],
+                Err(e) => {
+                    return Ok(stopped_chain(
+                        last_plan.expect("stage 1 built a plan"),
+                        all_artifacts,
+                        prev_artifacts,
+                        warnings,
+                        last_meta,
+                        summaries,
+                        format!("stage {}/{} handoff failed: {}", k + 1, n, e.chain()),
+                        e,
+                    ));
+                }
+            }
         };
         let role = if is_last {
             StageRole::Terminal
@@ -377,7 +445,13 @@ pub async fn execute(
                 // travel as the record instead of being lost with a bare
                 // error. Stage 1 has nothing paid yet and propagates.
                 Err(e) if k > 0 => {
-                    let reason = format!("stage {}/{} ({}) failed", k + 1, n, stage.task.name);
+                    let detail = format!(
+                        "stage {}/{} ({}) failed: {}",
+                        k + 1,
+                        n,
+                        stage.task.name,
+                        e.chain()
+                    );
                     return Ok(stopped_chain(
                         last_plan.expect("stage 1 built a plan"),
                         all_artifacts,
@@ -385,7 +459,7 @@ pub async fn execute(
                         warnings,
                         last_meta,
                         summaries,
-                        reason,
+                        detail,
                         AppError::new(
                             e.kind,
                             format!("stage {}/{} ({}): {}", k + 1, n, stage.task.name, e.chain()),
@@ -414,7 +488,6 @@ pub async fn execute(
                 *w = format!("stage {}: {w}", k + 1);
             }
         }
-        let stage_len = out.artifacts.len();
         let failed = out.status != GenerationStatus::Complete || out.failure.is_some();
         last_meta = (
             out.live_stdout,
@@ -428,16 +501,25 @@ pub async fn execute(
         summaries.push(plan::summarize(&stage_plan));
         last_plan = Some(stage_plan);
         let stage_failure = out.failure;
-        last_len = stage_len;
         if failed {
             // The chain stops here: no later stage runs, the upstream
             // artifacts stay real and travel as the record, and the exit
             // code is the failed stage's own classification (a service
             // error exits 3; a finished-but-truncated generation, 4).
-            let reason = format!("stage {}/{} ({}) failed", k + 1, n, stage.task.name);
+            // The reason carries the underlying cause (the service
+            // message, the truncation) everywhere the short reason goes —
+            // stderr, --json, and the history record.
+            let base = format!("stage {}/{} ({}) failed", k + 1, n, stage.task.name);
+            let detail = match (&out.status, &stage_failure) {
+                (_, Some(e)) => format!("{base}: {}", e.chain()),
+                (GenerationStatus::Incomplete { reason }, None) => {
+                    format!("{base}: {reason}")
+                }
+                _ => base.clone(),
+            };
             let failure = match stage_failure {
-                Some(e) => AppError::new(e.kind, format!("{reason}: {}", e.chain())),
-                None => AppError::generation(reason.clone()),
+                Some(e) => AppError::new(e.kind, detail.clone()),
+                None => AppError::generation(detail.clone()),
             };
             return Ok(stopped_chain(
                 last_plan.expect("the failed stage built a plan"),
@@ -446,11 +528,47 @@ pub async fn execute(
                 warnings,
                 last_meta,
                 summaries,
-                reason,
+                detail,
                 failure,
             ));
         }
+        if !is_last {
+            // A stage can finish "cleanly" with the wrong shape — an
+            // empty reply produces no artifact at all. The junction needs
+            // exactly one text artifact; stopping here keeps the
+            // upstream artifacts and refuses delivery, instead of letting
+            // an upstream artifact pose as this stage's result (or the
+            // next junction failing with the upstream work dropped).
+            let texts = prev_artifacts
+                .iter()
+                .filter(|a| a.kind == MediaKind::Text)
+                .count();
+            if texts != 1 {
+                let detail = format!(
+                    "stage {}/{} ({}) produced {texts} text artifact(s); a chain \
+                     junction hands off exactly one",
+                    k + 1,
+                    n,
+                    stage.task.name
+                );
+                return Ok(stopped_chain(
+                    last_plan.expect("the stage built a plan"),
+                    all_artifacts,
+                    prev_artifacts,
+                    warnings,
+                    last_meta,
+                    summaries,
+                    detail.clone(),
+                    AppError::generation(detail),
+                ));
+            }
+        }
     }
+    // The final stage's artifacts start here; everything before rides
+    // into --out-dir (and its manifest) only. Recorded even when the last
+    // stage produced nothing (start == len): the empty deliverable then
+    // fails the last stage's own unsatisfied check downstream.
+    let deliverable_start = all_artifacts.len();
     all_artifacts.append(&mut prev_artifacts);
     let plan = last_plan.expect("a chain has at least two stages");
     Ok(ChainRun {
@@ -469,7 +587,7 @@ pub async fn execute(
             failure: None,
         },
         stage_summaries: summaries,
-        last_stage_len: last_len,
+        deliverable_start,
     })
 }
 
@@ -489,10 +607,15 @@ fn stopped_chain(
     reason: String,
     failure: AppError,
 ) -> ChainRun {
+    let stage_len = stage_artifacts.len();
     artifacts.extend(stage_artifacts);
     warnings.push(format!(
         "{reason}; the earlier stages' artifacts are kept in history"
     ));
+    // The failed stage's own artifacts are the trailing slice (empty when
+    // it produced nothing). An incomplete record is never restored for
+    // delivery, so the value only describes the record.
+    let deliverable_start = artifacts.len() - stage_len;
     ChainRun {
         plan,
         output: RunOutput {
@@ -510,10 +633,7 @@ fn stopped_chain(
             failure: Some(failure),
         },
         stage_summaries: summaries,
-        // The failed stage's own artifacts are the trailing slice (0 when
-        // it produced nothing). An incomplete record is never restored
-        // for delivery, so the value only describes the record.
-        last_stage_len: 0,
+        deliverable_start,
     }
 }
 
@@ -598,16 +718,11 @@ pub fn describe_chain(chain: &PreparedChain, cfg: &Config) -> AppResult<String> 
     let first = &chain.stages[0];
     let mut cli1 = first.cli.clone();
     cli1.dry_run = true; // never read the clipboard for a preview
+
+    // Stage 1's real plan build doubles as the batch gate: an
+    // intermediate stage that would run a per-part batch is refused at
+    // plan time (plan_from), zero requests, before anything is previewed.
     let plan1 = plan::build(&cli1, &first.task, &first.specs, cfg, terminal, &mut env)?;
-    if plan1.per_part && real_batch(&plan1) {
-        return Err(AppError::usage(format!(
-            "stage 1 ({}) would process {} unit(s) one request each; a chain stage \
-             hands off a single result — run the batch form on its own (v1 keeps \
-             chains and per-part batches apart)",
-            first.task.name,
-            batch_units(&plan1)
-        )));
-    }
     let n = chain.stages.len();
     let mut out = format!("chain: {}\n", chain.task_label());
     for (k, stage) in chain.stages.iter().enumerate() {
@@ -765,20 +880,6 @@ pub fn describe_chain(chain: &PreparedChain, cfg: &Config) -> AppResult<String> 
     Ok(out)
 }
 
-/// Whether stage 1's plan is a real per-part batch (more than one unit):
-/// single-file inputs of per-part tasks are ordinary runs and fine in a
-/// chain; a directory, glob or multi-page document is not.
-fn real_batch(plan: &plan::ExecutionPlan) -> bool {
-    batch_units(plan) > 1
-}
-
-fn batch_units(plan: &plan::ExecutionPlan) -> usize {
-    let mut ids: Vec<usize> = plan.steps.iter().filter_map(|s| s.part).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,5 +1008,30 @@ mod tests {
         let last = &stages[1].cli;
         assert!(last.json && last.quiet);
         assert_eq!(last.total_timeout, Some(30));
+    }
+
+    #[test]
+    fn delivery_flags_leave_the_source_stage_and_mode_flags_reach_every_stage() {
+        let mut stages = vec![
+            stage("ocr", vec![MediaKind::Text], None),
+            stage("summarize", vec![MediaKind::Text], None),
+            stage("tts", vec![MediaKind::Audio], Some(vec![MediaKind::Text])),
+        ];
+        // A delivery flag and a run-mode flag on stage 1 (the --then
+        // shape): the delivery flag belongs to the last stage alone — a
+        // leftover --out-dir would let a real per-part batch run as an
+        // intermediate — while the run-mode flag describes every stage.
+        stages[0].cli.out_dir = Some("/tmp/x".into());
+        stages[0].cli.no_stream = true;
+        merge_run_flags(&mut stages).unwrap();
+        assert!(
+            stages[0].cli.out_dir.is_none() && stages[1].cli.out_dir.is_none(),
+            "delivery flags stripped from non-last stages"
+        );
+        assert_eq!(stages[2].cli.out_dir.as_deref(), Some("/tmp/x".as_ref()));
+        assert!(
+            stages[0].cli.no_stream && stages[1].cli.no_stream && stages[2].cli.no_stream,
+            "run-mode flags propagate to every stage"
+        );
     }
 }

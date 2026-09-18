@@ -697,3 +697,332 @@ fn repeated_task_names_keep_distinct_artifacts() {
     assert!(dir.join("summarize.txt").exists());
     assert!(dir.join("summarize-2.txt").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Review regressions, round two: merged run-level flags must be visible to
+// the last stage's plan checks, and a mis-shaped stage must fail the chain
+// instead of impersonating its result.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn then_form_outer_outdir_reaches_the_last_stage_preflight() {
+    // The run-level --out-dir sits in stage 1's argv in the --then form;
+    // after the merge it satisfies image's multi-count delivery rule.
+    // Both spellings must plan identically (this used to hard-reject).
+    let cfg = dead_cfg();
+    let out = run_with(
+        &[
+            "summarize",
+            "--text",
+            "hi",
+            "--out-dir",
+            "imgs",
+            "--then",
+            "image",
+            "--count",
+            "5",
+            "--dry-run",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert!(
+        out.stdout().contains("stage 2/2: image"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[test]
+fn merged_minus_o_encoding_conflict_fails_at_parse_zero_requests() {
+    let cfg = dead_cfg();
+    // `-o out.png` rides in stage 1's argv; merged onto the tts stage it
+    // contradicts the mp3 encoding. The conflict must die at parse time —
+    // stage 1's request used to fire first (a paid request before a
+    // usage error). Exit 2 against a dead endpoint proves no request.
+    let out = run_with(
+        &[
+            "summarize",
+            "--text",
+            "hi",
+            "-o",
+            "out.png",
+            "--then",
+            "tts",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("output encoding"),
+        "stderr: {}",
+        out.stderr()
+    );
+    // The sugar spelling converges to the same parse-time rejection.
+    let out = run_with(
+        &["chain", "summarize|tts", "--text", "hi", "-o", "out.png"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("output encoding"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn stream_on_a_nonspeaking_last_stage_fails_at_parse() {
+    let cfg = dead_cfg();
+    // --stream merges onto the edge-tts stage, whose adapter cannot
+    // stream: refused at parse (exit 2), not after stage 1 paid.
+    let out = run_with(
+        &["chain", "summarize|tts", "--text", "hi", "--stream"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("does not support --stream"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn chain_short_version_flag_prints_the_version() {
+    let cfg = dead_cfg();
+    let out = run_with(
+        &["chain", "-V"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("aido"), "{}", out.stdout());
+}
+
+#[test]
+fn empty_last_stage_reply_is_a_failure_not_a_delivery() {
+    // Stage 2 answers 200 with empty content: it completes with no
+    // artifact. The chain must refuse delivery of stage 1's artifact and
+    // record an incomplete generation — not hand "OK1" to -o with exit 0.
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("OK1")),
+        (
+            "200 OK",
+            "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}",
+        ),
+    ]);
+    let cfg = live_cfg(&server.url());
+    let hist = temp_dir("chain-empty-last");
+    let file = temp_dir("chain-empty-last-o").join("out.txt");
+    let out = run_with(
+        &[
+            "chain",
+            "summarize|translate",
+            "--text",
+            "hi",
+            "-o",
+            file.to_str().unwrap(),
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(4);
+    assert_eq!(out.stdout(), "", "nothing is delivered");
+    assert!(!file.exists(), "stage 1's artifact must not pose as -o");
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1, "only stage 1 produced anything");
+}
+
+#[test]
+fn empty_middle_stage_stops_the_chain_and_keeps_upstream() {
+    // Stage 2 finishes with no artifact: the junction stops the chain as
+    // a stage failure (exit 4), stage 3 sends nothing, and stage 1's
+    // paid artifact stays in history instead of being lost with a bare
+    // error.
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("OK1")),
+        (
+            "200 OK",
+            "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}",
+        ),
+    ]);
+    let cfg = live_cfg(&server.url());
+    let hist = temp_dir("chain-empty-mid");
+    let out = run_with(
+        &["chain", "summarize|translate|code-review", "--text", "hi"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(4);
+    assert!(
+        out.stderr()
+            .contains("stage 2/3 (translate) produced 0 text artifact(s)"),
+        "stderr: {}",
+        out.stderr()
+    );
+    assert_eq!(server.requests().len(), 2, "stage 3 sent no request");
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "incomplete");
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 1, "stage 1's artifact is kept");
+    assert_eq!(
+        std::fs::read_to_string(runs[0].join("summarize.txt")).unwrap(),
+        "OK1"
+    );
+}
+
+#[test]
+fn failed_stage_cause_reaches_stderr_and_the_record() {
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("OK1")),
+        (
+            "500 Internal Server Error",
+            "{\"error\":{\"message\":\"boom the service exploded\"}}",
+        ),
+    ]);
+    let cfg = live_cfg(&server.url());
+    let hist = temp_dir("chain-cause");
+    let out = run_with(
+        &["chain", "summarize|translate|code-review", "--text", "hi"],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(3);
+    assert!(
+        out.stderr().contains("boom the service exploded"),
+        "stderr: {}",
+        out.stderr()
+    );
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    let reason = manifest["generation"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("boom the service exploded"),
+        "record reason: {reason}"
+    );
+}
+
+#[test]
+fn no_history_records_nothing_even_when_a_chain_stage_fails() {
+    // Success and mid-chain failure alike: --no-history on the run leaves
+    // no record, even though the failure record's plan travels from an
+    // earlier stage.
+    let server = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("OK1")),
+        ("200 OK", chat_body("OK2")),
+        (
+            "500 Internal Server Error",
+            "{\"error\":{\"message\":\"boom\"}}",
+        ),
+        ("200 OK", chat_body("OK1")),
+        ("200 OK", chat_body("OK2")),
+    ]);
+    let cfg = live_cfg(&server.url());
+    let hist = temp_dir("chain-no-history");
+    let out = run_with(
+        &[
+            "chain",
+            "summarize|translate|code-review",
+            "--text",
+            "hi",
+            "--no-history",
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(3);
+    assert!(run_dirs(&hist).is_empty(), "a failed chain keeps no record");
+    let out = run_with(
+        &[
+            "chain",
+            "summarize|translate",
+            "--text",
+            "hi",
+            "--no-history",
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert!(
+        run_dirs(&hist).is_empty(),
+        "a successful chain keeps no record"
+    );
+}
+
+#[test]
+fn then_form_stage1_batch_with_outer_outdir_is_refused_without_paying() {
+    // A real per-part batch as stage 1 used to run and pay when --out-dir
+    // sat on stage 1 in the --then form, failing only at the junction.
+    // The delivery flag now merges to the last stage, and the batch gate
+    // refuses before any request (dead endpoint: exit 2, not exit 3).
+    let cfg = dead_cfg();
+    let png = solid_png(8, 8);
+    let a = temp_file("ba.png", &png);
+    let b = temp_file("bb.png", &png);
+    let out = run_with(
+        &[
+            "ocr",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--out-dir",
+            "pages",
+            "--then",
+            "translate",
+            "--to",
+            "zh-CN",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("hand off a single result"),
+        "stderr: {}",
+        out.stderr()
+    );
+}

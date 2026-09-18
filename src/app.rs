@@ -287,7 +287,7 @@ async fn dispatch(
         &cfg,
         &plan,
         output,
-        0,
+        None,
         Vec::new(),
         &run_id,
     )
@@ -295,11 +295,10 @@ async fn dispatch(
 }
 
 /// Record, save and deliver a finished generation — the shared tail of
-/// the single-task path and the chain runner. A chain passes which
-/// trailing artifacts are the final stage's deliverables
-/// (`last_stage_len`) and one summary per stage (`stage_summaries`); a
-/// single-task run passes 0 and an empty vec, keeping the pre-chain
-/// record shape.
+/// the single-task path and the chain runner. A chain passes where its
+/// final stage's deliverables begin (`deliverable_start`) and one summary
+/// per stage (`stage_summaries`); a single-task run passes `None` and an
+/// empty vec, keeping the pre-chain record shape.
 #[allow(clippy::too_many_arguments)]
 async fn finish_run(
     cli: &Cli,
@@ -307,14 +306,20 @@ async fn finish_run(
     cfg: &config::Config,
     plan: &ExecutionPlan,
     output: runner::RunOutput,
-    last_stage_len: usize,
+    deliverable_start: Option<usize>,
     stage_summaries: Vec<RunSummary>,
     run_id: &str,
 ) -> AppResult<()> {
     // A generation that finished cleanly but did not satisfy the request
     // (missing kind, short count) is recorded, clearly marked as
-    // incomplete, and not delivered.
-    let unsatisfied = output.unsatisfied_reason(plan);
+    // incomplete, and not delivered. A chain judges its final stage's
+    // deliverables only — an upstream artifact must never stand in for
+    // what the last stage did not produce.
+    let deliverable = match deliverable_start {
+        Some(start) => &output.artifacts[start.min(output.artifacts.len())..],
+        None => output.artifacts.as_slice(),
+    };
+    let unsatisfied = output.unsatisfied_reason_in(plan, deliverable);
     let unsatisfied = if output.artifacts.is_empty() && !output.failed_parts.is_empty() {
         Some(format!(
             "all {} input part(s) failed — first error: {}",
@@ -357,7 +362,11 @@ async fn finish_run(
         parts_total: output.parts_total,
         deliveries: Vec::new(),
         stages: stage_summaries,
-        last_stage_len,
+        // Single-run records keep the 0 = "one stage" shape; a chain
+        // records how many trailing artifacts are its deliverables.
+        last_stage_len: deliverable_start
+            .map(|start| output.artifacts.len().saturating_sub(start))
+            .unwrap_or(0),
     };
     if !record.generation.is_complete() {
         if plan.record_history {
@@ -423,12 +432,9 @@ async fn finish_run(
 
     // A chain delivers only its final stage's artifacts; the intermediate
     // ones ride along into `--out-dir` (and its manifest).
-    let (extras, deliverable): (&[Artifact], &[Artifact]) = if last_stage_len > 0 {
-        output
-            .artifacts
-            .split_at(output.artifacts.len() - last_stage_len)
-    } else {
-        (&[], output.artifacts.as_slice())
+    let (extras, deliverable): (&[Artifact], &[Artifact]) = match deliverable_start {
+        Some(start) => output.artifacts.split_at(start.min(output.artifacts.len())),
+        None => (&[], output.artifacts.as_slice()),
     };
     let hold_secs = cfg.settings.hold_secs.unwrap_or(config::DEFAULT_HOLD_SECS);
     let failed_parts: Vec<(String, String)> = output
@@ -557,7 +563,7 @@ async fn run_chain(
         &cfg,
         &run.plan,
         run.output,
-        run.last_stage_len,
+        Some(run.deliverable_start),
         run.stage_summaries,
         &run_id,
     )

@@ -234,6 +234,19 @@ fn plan_from(
     part_ids.sort_unstable();
     part_ids.dedup();
     let batch = part_ids.len() > 1;
+    // An intermediate stage hands its artifact to the next stage: a real
+    // per-part batch has no single result to hand off, whatever delivery
+    // flags say. Refused before the batch-delivery checks so the message
+    // names the chain contract, not a missing --out-dir.
+    let intermediate = role == StageRole::Intermediate;
+    if intermediate && batch {
+        return Err(AppError::usage(format!(
+            "an intermediate chain stage must hand off a single result, but {} unit(s) \
+             would run one request each; run the batch form on its own (v1 keeps \
+             chains and per-part batches apart)",
+            part_ids.len()
+        )));
+    }
     // Delivery-target rules bind a --dry-run too: they are pure prechecks
     // with no side effects, and a plan the real run would reject must not
     // be shown as if it were deliverable.
@@ -258,7 +271,6 @@ fn plan_from(
     // --- destinations -------------------------------------------------------
     // An intermediate stage hands its artifact to the next stage: it has
     // no destinations of its own and never reaches delivery.
-    let intermediate = role == StageRole::Intermediate;
     let destinations = if intermediate {
         Vec::new()
     } else {
@@ -429,10 +441,16 @@ fn edge_tts_instruction_check(
 
 /// The material-independent plan checks, run per stage at chain parse
 /// time: typed parameters, adapter option validation, the edge-tts
-/// instruction channel and the output/encoding rules. A stage that
-/// cannot work must fail before stage 1's paid request, not after it.
-/// Pure computation — no gather, no IO.
-pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config) -> AppResult<()> {
+/// instruction channel, the stream capability and the output/encoding
+/// rules. A stage that cannot work must fail before stage 1's paid
+/// request, not after it. Pure computation — no gather, no IO.
+///
+/// `last` gates the delivery-shaped output rules: they read the
+/// run-level `-o`/`--out-dir`, which a chain merges into its final stage
+/// — an earlier stage has no delivery of its own, and judging it against
+/// those flags would reject chains whose delivery flags sit in the outer
+/// argv.
+pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config, last: bool) -> AppResult<()> {
     validate_task_params(cli, task)?;
     let mut resolved =
         resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
@@ -440,7 +458,19 @@ pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config) -> AppResult
     let instruction = compose_instruction(cli, task)?;
     let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
     edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
-    validate_outputs(cli, &mut resolved, &[])?;
+    // `--stream` demands a streaming adapter — the same judgment
+    // `plan_from` applies, pulled forward to parse time so a merged
+    // run-level `--stream` cannot surface only after stage 1 paid.
+    if cli.stream && !resolved.adapter.streams() {
+        return Err(AppError::usage(format!(
+            "adapter '{}' does not support --stream; use --no-stream or omit the flag",
+            resolved.adapter
+        )));
+    }
+    validate_format_outputs(cli, &mut resolved)?;
+    if last {
+        validate_delivery_outputs(cli, &mut resolved)?;
+    }
     Ok(())
 }
 
@@ -672,6 +702,17 @@ fn select_processor(cli: &Cli, task: &Task) -> ProcessorKind {
 }
 
 fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -> AppResult<()> {
+    validate_format_outputs(cli, resolved)?;
+    validate_delivery_outputs(cli, resolved)?;
+    // Slice runs produce one text artifact from several requests: that is
+    // fine, the merge gate handles it.
+    let _ = steps;
+    Ok(())
+}
+
+/// The `--format` half of the output rules: one encoding across the
+/// produced kinds, and the resolved option that carries it.
+fn validate_format_outputs(cli: &Cli, resolved: &mut Resolved) -> AppResult<()> {
     let media_kinds: Vec<MediaKind> = resolved
         .produce
         .iter()
@@ -718,6 +759,19 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
             serde_json::Value::String(format.to_string()),
         );
     }
+    Ok(())
+}
+
+/// The delivery-shaped half of the output rules: they read the run-level
+/// `-o`/`--out-dir`, so a chain runs them against the merged last stage
+/// only (an intermediate stage has no delivery of its own).
+fn validate_delivery_outputs(cli: &Cli, resolved: &mut Resolved) -> AppResult<()> {
+    let media_kinds: Vec<MediaKind> = resolved
+        .produce
+        .iter()
+        .copied()
+        .filter(|k| *k != MediaKind::Text)
+        .collect();
     // Media output needs somewhere to go — a judgment made on the
     // resolved destinations in `resolve_destinations`, where every
     // possible target (file, directory, clipboard, stdout pipe) is known.
@@ -765,9 +819,6 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
             }
         }
     }
-    // Slice runs produce one text artifact from several requests: that is
-    // fine, the merge gate handles it.
-    let _ = steps;
     Ok(())
 }
 
