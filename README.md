@@ -360,7 +360,7 @@ aido ocr screenshot.png --dry-run
 
 ```bash
 aido tasks list / tasks show ocr
-aido profiles list
+aido profiles
 aido config init / config check
 ```
 
