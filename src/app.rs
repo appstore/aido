@@ -507,6 +507,20 @@ async fn run_chain(
     }
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo::real();
+    // The knowable `-o` collision check the single run path does before
+    // any request: the last stage's plan names its file exactly, so the
+    // collision is usage (exit 2), not a paid delivery failure (exit 5).
+    let destinations = plan::resolve_destinations(
+        &chain.run_cli,
+        &chain
+            .stages
+            .last()
+            .expect("a chain has stages")
+            .resolved
+            .produce,
+        terminal,
+    )?;
+    output::precheck_file_targets(&destinations, chain.run_cli.overwrite)?;
     let mut env = InputEnv::real();
     let record_history =
         !chain.run_cli.no_history && cfg.settings.history_keep.unwrap_or(history::DEFAULT_KEEP) > 0;
@@ -738,9 +752,11 @@ fn resolve_run(target: &str) -> AppResult<RunRecord> {
 /// through `-o`/`--copy`/stdout and keeps every stage for `--out-dir`.
 async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppResult<()> {
     let (extras, last): (&[Artifact], &[Artifact]) = if record.last_stage_len > 0 {
-        record
-            .artifacts
-            .split_at(record.artifacts.len() - record.last_stage_len)
+        // A hand-edited manifest could claim more than there is; degrade
+        // to the pre-chain shape (everything deliverable) instead of
+        // panicking on the subtraction.
+        let split = record.artifacts.len().saturating_sub(record.last_stage_len);
+        record.artifacts.split_at(split)
     } else {
         (&[], record.artifacts.as_slice())
     };

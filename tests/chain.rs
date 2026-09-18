@@ -298,7 +298,8 @@ fn single_history_record_lists_stages_and_global_provenance() {
         .iter()
         .map(|a| a["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["summarize", "translate", "text"]);
+    // Intermediate stages carry their ordinal so repeated tasks stay distinct.
+    assert_eq!(ids, ["summarize", "translate-2", "text"]);
     let indices: Vec<usize> = artifacts
         .iter()
         .map(|a| a["provenance"]["index"].as_u64().unwrap() as usize)
@@ -555,4 +556,144 @@ fn long_stage1_reply_chunks_inside_stage2() {
         find_sub(&requests[2], "第19".as_bytes()).is_some(),
         "second chunk carries the tail"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review regressions: the plan-time contract holds under adversarial flags
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stage2_param_error_fires_before_any_request() {
+    // `--count` belongs to image generation, not translate: the chain
+    // must die at parse time, not after stage 1 paid its request.
+    let cfg = dead_cfg();
+    let out = run_with(
+        &["chain", "summarize | translate --count 3", "--text", "hi"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("does not accept --count"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn produce_on_a_non_last_stage_is_refused() {
+    // A stage's outputs are fixed by the junction contract; merging
+    // --produce across stages would reshape the last stage's request
+    // after earlier stages paid.
+    let cfg = dead_cfg();
+    let out = run_with(
+        &["chain", "summarize --produce text | tts", "--text", "hi"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("belongs to a single stage"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn cross_stage_output_and_outdir_conflict_is_usage() {
+    // Clap only sees conflicts per stage; the merged run-level surface
+    // must refuse the combination the single-run surface refuses.
+    let cfg = dead_cfg();
+    let out = run_with(
+        &[
+            "chain",
+            "summarize -o somewhere.md | translate",
+            "--text",
+            "hi",
+            "--out-dir",
+            "somewhere-else",
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("two delivery contracts"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn chain_help_prints_usage_without_a_spec() {
+    let cfg = dead_cfg();
+    let out = run_with(
+        &["chain", "--help"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    assert!(out.stdout().contains("Usage"), "{}", out.stdout());
+    assert!(out.stdout().contains("chain"), "{}", out.stdout());
+}
+
+#[test]
+fn o_target_collision_fails_before_requests() {
+    let cfg = dead_cfg();
+    let existing = temp_file("chain-collision.txt", b"occupied");
+    let out = run_with(
+        &[
+            "chain",
+            "summarize|translate",
+            "--text",
+            "hi",
+            "-o",
+            existing.to_str().unwrap(),
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("already exists"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn repeated_task_names_keep_distinct_artifacts() {
+    let server = MultiServer::start(&[chat_body("A"), chat_body("B"), chat_body("C")]);
+    let cfg = live_cfg(&server.url());
+    let dir = temp_dir("chain-dupe");
+    let out = run_with(
+        &[
+            "chain",
+            "summarize|summarize|summarize",
+            "--text",
+            "hi",
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(0);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let ids: Vec<&str> = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["summarize", "summarize-2", "text"], "no collisions");
+    assert!(dir.join("summarize.txt").exists());
+    assert!(dir.join("summarize-2.txt").exists());
 }

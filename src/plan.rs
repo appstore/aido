@@ -218,26 +218,7 @@ fn plan_from(
             crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
         ));
     }
-    // Adapter capability: the edge-tts protocol has no instruction channel.
-    // Refusing at plan time (not just at send time) keeps --dry-run honest
-    // about a plan that could never execute.
-    if resolved.adapter == crate::api::Adapter::EdgeTts {
-        let from_task = !instruction.trim().is_empty();
-        let from_prompt = requirement.as_deref().is_some_and(|p| !p.trim().is_empty());
-        if from_task || from_prompt {
-            let source = match (from_task, from_prompt) {
-                (true, true) => "the task's fixed instruction and -p",
-                (true, false) => "the task's fixed instruction",
-                _ => "-p",
-            };
-            return Err(AppError::usage(format!(
-                "{}; {} would have nowhere to go — drop it, or use a provider \
-                 whose speech route has one",
-                crate::api::EDGE_NO_INSTRUCTION_CHANNEL,
-                source
-            )));
-        }
-    }
+    edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
     let processor = select_processor(cli, task);
     let steps = if task.per_part {
         processors::perpart::plan_steps(&inputs, processor, cli.quiet)
@@ -414,6 +395,52 @@ fn assert_parts_contiguous(steps: &[RequestStep]) -> AppResult<()> {
         }
         last = Some(id);
     }
+    Ok(())
+}
+
+/// The edge-tts protocol has no instruction channel: an instruction that
+/// would go nowhere is a usage error at plan time (and at chain parse
+/// time) rather than at send time.
+fn edge_tts_instruction_check(
+    resolved: &Resolved,
+    instruction: &str,
+    requirement: Option<&str>,
+) -> AppResult<()> {
+    if resolved.adapter != crate::api::Adapter::EdgeTts {
+        return Ok(());
+    }
+    let from_task = !instruction.trim().is_empty();
+    let from_prompt = requirement.is_some_and(|p| !p.trim().is_empty());
+    if from_task || from_prompt {
+        let source = match (from_task, from_prompt) {
+            (true, true) => "the task's fixed instruction and -p",
+            (true, false) => "the task's fixed instruction",
+            _ => "-p",
+        };
+        return Err(AppError::usage(format!(
+            "{}; {} would have nowhere to go — drop it, or use a provider \
+             whose speech route has one",
+            crate::api::EDGE_NO_INSTRUCTION_CHANNEL,
+            source
+        )));
+    }
+    Ok(())
+}
+
+/// The material-independent plan checks, run per stage at chain parse
+/// time: typed parameters, adapter option validation, the edge-tts
+/// instruction channel and the output/encoding rules. A stage that
+/// cannot work must fail before stage 1's paid request, not after it.
+/// Pure computation — no gather, no IO.
+pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config) -> AppResult<()> {
+    validate_task_params(cli, task)?;
+    let mut resolved =
+        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    apply_param_options(cli, task, &mut resolved)?;
+    let instruction = compose_instruction(cli, task)?;
+    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
+    edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
+    validate_outputs(cli, &mut resolved, &[])?;
     Ok(())
 }
 

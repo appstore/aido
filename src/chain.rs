@@ -83,7 +83,14 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
                 | "chain"
         ) || name == crate::cli::LAST_TASK
         {
-            return Err(AppError::usage(format!("'{name}' cannot be a chain stage")));
+            let shown = if name == crate::cli::LAST_TASK {
+                "last"
+            } else {
+                name.as_str()
+            };
+            return Err(AppError::usage(format!(
+                "'{shown}' cannot be a chain stage"
+            )));
         }
         let cli = match Cli::try_parse_from(
             std::iter::once(OsString::from("aido")).chain(stage.argv.iter().cloned()),
@@ -112,6 +119,12 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
             )));
         }
         let task = tasks::get(&name).map_err(|e| AppError::usage(format!("{e:#}")))?;
+        // The material-independent plan checks run NOW, per stage: a
+        // stage that cannot work must fail before stage 1's paid request,
+        // not after it (the module contract: exit 2, zero requests).
+        plan::preflight_stage(&cli, &task, cfg).map_err(|e| {
+            AppError::usage(format!("stage {index} ({name}): {}", e.chain_inline()))
+        })?;
         let resolved = resolve::resolve(&cli, cfg, &task)
             .map_err(|e| AppError::usage(format!("stage {index} ({name}): {e:#}")))?;
         parsed.push(StageParsed {
@@ -133,13 +146,29 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
 /// Run-level flags found on a non-last stage address the run as a whole:
 /// merge them into the last stage's surface. Equal values pass; a
 /// conflicting value is a usage error — one run has one destination set,
-/// one report format, one time budget.
+/// one report format, one time budget. `--produce`/`--format` are
+/// refused outright: a stage's outputs are fixed by the junction
+/// contract, so on a non-last stage they have no legal meaning, and
+/// merging them would silently reshape the last stage's request after
+/// earlier stages paid.
 fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
     let n = stages.len();
     for k in 0..n - 1 {
         let stage = k + 1;
         let src = stages[k].cli.clone();
         let dst = &mut stages[n - 1].cli;
+        if !src.produce.is_empty() {
+            return Err(AppError::usage(format!(
+                "stage {stage}: --produce belongs to a single stage; write it on \
+                 the last stage only"
+            )));
+        }
+        if src.format.is_some() {
+            return Err(AppError::usage(format!(
+                "stage {stage}: --format belongs to a single stage; write it on \
+                 the last stage only"
+            )));
+        }
         merge_opt(&mut dst.output, &src.output, "--output", stage)?;
         merge_opt(&mut dst.out_dir, &src.out_dir, "--out-dir", stage)?;
         merge_opt(
@@ -148,20 +177,6 @@ fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
             "--total-timeout",
             stage,
         )?;
-        merge_opt(&mut dst.format, &src.format, "--format", stage)?;
-        if !src.produce.is_empty() {
-            match dst.produce.is_empty() {
-                true => dst.produce = src.produce.clone(),
-                false => {
-                    if dst.produce != src.produce {
-                        return Err(AppError::usage(format!(
-                            "run-level flag --produce is given twice with different \
-                             values (stage {stage} vs the last stage)"
-                        )));
-                    }
-                }
-            }
-        }
         if (src.stream && dst.no_stream) || (src.no_stream && dst.stream) {
             return Err(AppError::usage(format!(
                 "--stream and --no-stream conflict across stages (stage {stage} vs \
@@ -177,6 +192,19 @@ fn merge_run_flags(stages: &mut [StageParsed]) -> AppResult<()> {
         dst.quiet |= src.quiet;
         dst.dry_run |= src.dry_run;
         dst.no_history |= src.no_history;
+    }
+    // Clap only sees conflicts per stage; merging can recombine two
+    // stages' choices into a combination the single-run surface refuses.
+    let last = &stages[n - 1].cli;
+    if last.output.is_some() && last.out_dir.is_some() {
+        return Err(AppError::usage(
+            "-o FILE and --out-dir are two delivery contracts for one run; pick one",
+        ));
+    }
+    if last.stdout && last.json {
+        return Err(AppError::usage(
+            "--json cannot combine with --stdout (two stdout contracts)",
+        ));
     }
     Ok(())
 }
@@ -308,6 +336,9 @@ pub async fn execute(
     // output: only the final stage can have streamed, and only its step
     // counts describe "the run".
     let mut last_meta = (false, 0u64, 0usize, 0usize);
+    // The chain's own clock: `--total-timeout` caps the whole run, so
+    // every stage gets whatever remains of the budget, not a fresh one.
+    let started = std::time::Instant::now();
 
     for k in 0..n {
         let stage = &chain.stages[k];
@@ -338,8 +369,35 @@ pub async fn execute(
             StageRole::Intermediate
         };
         let mut stage_plan =
-            plan::build_with_inputs(&stage.cli, &stage.task, inputs, cfg, terminal, role)?;
+            match plan::build_with_inputs(&stage.cli, &stage.task, inputs, cfg, terminal, role) {
+                Ok(plan) => plan,
+                // A later stage's plan can depend on the previous stage's
+                // real output (chunk sizes, artifact counts): failing here
+                // is a chain failure — the upstream artifacts stay real and
+                // travel as the record instead of being lost with a bare
+                // error. Stage 1 has nothing paid yet and propagates.
+                Err(e) if k > 0 => {
+                    let reason = format!("stage {}/{} ({}) failed", k + 1, n, stage.task.name);
+                    return Ok(stopped_chain(
+                        last_plan.expect("stage 1 built a plan"),
+                        all_artifacts,
+                        prev_artifacts,
+                        warnings,
+                        last_meta,
+                        summaries,
+                        reason,
+                        AppError::new(
+                            e.kind,
+                            format!("stage {}/{} ({}): {}", k + 1, n, stage.task.name, e.chain()),
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
         stage_plan.stage_label = Some(format!("chain {}/{}", k + 1, n));
+        if let Some(budget) = stage_plan.total_timeout {
+            stage_plan.total_timeout = Some(budget.saturating_sub(started.elapsed()));
+        }
         if k == 0 {
             // The interrupted-run placeholder needs a record of a started
             // run before the first request goes out.
@@ -351,7 +409,7 @@ pub async fn execute(
         retag(&mut out.artifacts, request_offset);
         request_offset += stage_plan.steps.len();
         if !is_last {
-            rename_intermediates(&mut out.artifacts, &stage.task.name);
+            rename_intermediates(&mut out.artifacts, &stage.task.name, k);
             for w in out.warnings.iter_mut() {
                 *w = format!("stage {}: {w}", k + 1);
             }
@@ -372,7 +430,6 @@ pub async fn execute(
         let stage_failure = out.failure;
         last_len = stage_len;
         if failed {
-            all_artifacts.append(&mut prev_artifacts);
             // The chain stops here: no later stage runs, the upstream
             // artifacts stay real and travel as the record, and the exit
             // code is the failed stage's own classification (a service
@@ -382,28 +439,16 @@ pub async fn execute(
                 Some(e) => AppError::new(e.kind, format!("{reason}: {}", e.chain())),
                 None => AppError::generation(reason.clone()),
             };
-            warnings.push(format!(
-                "{reason}; the earlier stages' artifacts are kept in history"
+            return Ok(stopped_chain(
+                last_plan.expect("the failed stage built a plan"),
+                all_artifacts,
+                prev_artifacts,
+                warnings,
+                last_meta,
+                summaries,
+                reason,
+                failure,
             ));
-            return Ok(ChainRun {
-                plan: last_plan.expect("the failed stage built a plan"),
-                output: RunOutput {
-                    artifacts: all_artifacts,
-                    status: GenerationStatus::Incomplete {
-                        reason: reason.clone(),
-                    },
-                    warnings,
-                    live_stdout: last_meta.0,
-                    live_chars: last_meta.1,
-                    failed_parts: Vec::new(),
-                    parts_total: 0,
-                    steps_done: last_meta.2,
-                    steps_total: last_meta.3,
-                    failure: Some(failure),
-                },
-                stage_summaries: summaries,
-                last_stage_len: last_len,
-            });
         }
     }
     all_artifacts.append(&mut prev_artifacts);
@@ -426,6 +471,50 @@ pub async fn execute(
         stage_summaries: summaries,
         last_stage_len: last_len,
     })
+}
+
+/// The chain-stopped-here outcome, shared by "a stage's run failed" and
+/// "a later stage's plan failed": the reason names the stage, the failure
+/// keeps its own class (the exit code), and the upstream artifacts —
+/// including whatever the failed stage produced — travel as the record
+/// for history to keep.
+#[allow(clippy::too_many_arguments)]
+fn stopped_chain(
+    plan: plan::ExecutionPlan,
+    mut artifacts: Vec<Artifact>,
+    stage_artifacts: Vec<Artifact>,
+    mut warnings: Vec<String>,
+    meta: (bool, u64, usize, usize),
+    summaries: Vec<RunSummary>,
+    reason: String,
+    failure: AppError,
+) -> ChainRun {
+    artifacts.extend(stage_artifacts);
+    warnings.push(format!(
+        "{reason}; the earlier stages' artifacts are kept in history"
+    ));
+    ChainRun {
+        plan,
+        output: RunOutput {
+            artifacts,
+            status: GenerationStatus::Incomplete {
+                reason: reason.clone(),
+            },
+            warnings,
+            live_stdout: meta.0,
+            live_chars: meta.1,
+            failed_parts: Vec::new(),
+            parts_total: 0,
+            steps_done: meta.2,
+            steps_total: meta.3,
+            failure: Some(failure),
+        },
+        stage_summaries: summaries,
+        // The failed stage's own artifacts are the trailing slice (0 when
+        // it produced nothing). An incomplete record is never restored
+        // for delivery, so the value only describes the record.
+        last_stage_len: 0,
+    }
 }
 
 /// The single text artifact crossing a junction, as the next stage's one
@@ -477,18 +566,24 @@ fn retag(artifacts: &mut [Artifact], offset: usize) {
     }
 }
 
-/// Name an intermediate stage's artifacts after the stage (`ocr`,
-/// `translate-2`), so a chain's `--out-dir` manifest and history keep one
+/// Name an intermediate stage's artifacts after the stage, with the
+/// stage's ordinal so repeated tasks stay distinct (`summarize`,
+/// `summarize-3`): a chain record and its `--out-dir` manifest keep one
 /// readable file per stage without collisions. The last stage keeps the
 /// ordinary naming — its artifacts are the deliverables.
-fn rename_intermediates(artifacts: &mut [Artifact], task_name: &str) {
+fn rename_intermediates(artifacts: &mut [Artifact], task_name: &str, stage: usize) {
+    let base = if stage == 0 {
+        task_name.to_string()
+    } else {
+        format!("{task_name}-{}", stage + 1)
+    };
     let mut count = 0usize;
     for artifact in artifacts.iter_mut() {
         count += 1;
         artifact.id = if count == 1 {
-            task_name.to_string()
+            base.clone()
         } else {
-            format!("{task_name}-{count}")
+            format!("{base}-{count}")
         };
     }
 }
@@ -594,10 +689,14 @@ pub fn describe_chain(chain: &PreparedChain, cfg: &Config) -> AppResult<String> 
                 if plan1.steps.len() == 1 { "" } else { "s" }
             ));
         } else {
-            out.push_str(&format!(
-                "processing:  {}\n",
-                processor_name(stage.task.processor)
-            ));
+            // Mirror the plan's processor selection: --no-split on the
+            // stage forces Single there too.
+            let processor = if stage.cli.no_split {
+                ProcessorKind::Single
+            } else {
+                stage.task.processor
+            };
+            out.push_str(&format!("processing:  {}\n", processor_name(processor)));
         }
         out.push_str(&format!("produce:     {}\n", kinds(&r.produce)));
         out.push_str("parameters:\n");

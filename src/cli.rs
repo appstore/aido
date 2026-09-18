@@ -747,7 +747,18 @@ fn normalize_chain(argv: Vec<OsString>) -> Result<Normalized> {
         // A free token: the chain word, the spec, or material.
         free_seen += 1;
         match free_seen {
-            1 => {} // "chain", verified by first_free_is_chain
+            1 => {
+                // first_free_is_chain skips tokens it cannot read as
+                // UTF-8, so a non-UTF-8 entry can occupy this slot. It is
+                // a file the user meant to run a task on — say so instead
+                // of silently swallowing it and misreading the spec.
+                if text.as_deref() != Some("chain") {
+                    bail!(
+                        "file input requires a task or -p, e.g. \
+                         `aido ocr <FILE> --then <TASK>` (see `aido tasks list`)"
+                    );
+                }
+            }
             2 => {
                 spec =
                     Some(text.ok_or_else(|| anyhow!("the chain spec must be valid UTF-8 text"))?);
@@ -756,6 +767,19 @@ fn normalize_chain(argv: Vec<OsString>) -> Result<Normalized> {
         }
     }
     let Some(spec) = spec else {
+        // `aido chain --help` (no spec yet): hand the outer flags to clap
+        // so help and version keep working — the natural way to discover
+        // the chain grammar.
+        if outer
+            .iter()
+            .any(|t| matches!(t.to_str(), Some("--help") | Some("-h") | Some("--version")))
+        {
+            return Ok(Normalized::Single {
+                task: None,
+                specs: Vec::new(),
+                argv: outer,
+            });
+        }
         bail!(
             "chain requires a spec string: aido chain \"TASK [FLAGS] | TASK [FLAGS]\" \
              [INPUT...] [OPTIONS]"
@@ -1957,6 +1981,19 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown task 'transalte'"), "{msg}");
         assert!(msg.contains("translate"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_token_before_the_chain_word_is_not_swallowed() {
+        use std::os::unix::ffi::OsStringExt;
+        // A non-UTF-8 free token ahead of "chain" means the chain word
+        // was never first: refuse as file-without-task instead of
+        // silently eating the bytes and misreading the spec.
+        let bad = OsString::from_vec(vec![0xff, 0xfe]);
+        let argv = vec![bad, OsString::from("chain"), OsString::from("ocr|tts")];
+        let err = super::normalize(argv).unwrap_err();
+        assert!(err.to_string().contains("requires a task"), "{err}");
     }
 
     #[test]
