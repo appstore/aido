@@ -1,7 +1,8 @@
 //! Execution: carry out an [`ExecutionPlan`], consume the model's output
 //! and assemble the run's artifacts.
 
-use crate::api::{Client, Connection, GenerateRequest, GenerateResult};
+use crate::api::{Adapter, Client, Connection, GenerateRequest, GenerateResult};
+use crate::config::resolve::Resolved;
 use crate::domain::{
     AppError, AppResult, Artifact, Destination, GenerationStatus, InputPart, MediaKind, Provenance,
 };
@@ -161,6 +162,20 @@ impl SliceMerger {
     }
 }
 
+/// The spinner's opening phrase for a run: "asking <model>", except for
+/// speech, which is synthesized rather than asked for. The edge-tts
+/// adapter owns its endpoint — the profile's model never enters the
+/// request, so naming it would report a party that does nothing (issue
+/// #72: "asking deepseek-flash" while edge-tts speaks) — while the
+/// OpenAI speech adapter does send the model, so it stays in the line.
+fn spinner_prefix(resolved: &Resolved) -> String {
+    match resolved.adapter {
+        Adapter::EdgeTts => "synthesizing speech (edge-tts)".into(),
+        Adapter::Speech => format!("synthesizing speech ({})", resolved.model),
+        _ => format!("asking {}", resolved.model),
+    }
+}
+
 /// Run every step of the plan. Text deltas stream live when the plan says
 /// so; slice replies merge through the strategy's gate so live and
 /// buffered delivery end up byte-identical.
@@ -219,13 +234,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             .unwrap_or(1)
     };
 
+    let prefix = spinner_prefix(&plan.resolved);
+
     let spinner: SharedSpinner = if plan.quiet {
         Rc::new(RefCell::new(None))
     } else {
-        Rc::new(RefCell::new(Some(Spinner::start(&format!(
-            "asking {}...",
-            plan.resolved.model
-        )))))
+        Rc::new(RefCell::new(Some(Spinner::start(&format!("{prefix}...")))))
     };
 
     let mut media_artifacts: Vec<Artifact> = Vec::new();
@@ -390,14 +404,14 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         if !plan.quiet {
             let label = if plan.steps.len() > 1 {
                 format!(
-                    "asking {} ({}/{}) — {}...",
-                    plan.resolved.model,
+                    "{} ({}/{}) — {}...",
+                    prefix,
                     step.index + 1,
                     plan.steps.len(),
                     step.label
                 )
             } else {
-                format!("asking {}...", plan.resolved.model)
+                format!("{prefix}...")
             };
             // The cell may already be empty: a live sink retired the
             // spinner at its first delta, and later steps stay quiet so
@@ -681,6 +695,48 @@ fn absorb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved(adapter: Adapter, model: &str) -> Resolved {
+        Resolved {
+            profile_name: "default".into(),
+            provider_name: "deepseek".into(),
+            adapter,
+            base_url: None,
+            api_key_env: None,
+            model: model.into(),
+            model_source: crate::config::resolve::ParamSource::Profile,
+            max_tokens: None,
+            max_tokens_source: crate::config::resolve::ParamSource::Default,
+            temperature: None,
+            temperature_source: crate::config::resolve::ParamSource::Default,
+            options: Default::default(),
+            allowed_inputs: None,
+            required_inputs: Vec::new(),
+            produce: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spinner_prefix_names_the_model_except_when_the_adapter_owns_the_endpoint() {
+        // A chat run's spinner asks the model that answers.
+        assert_eq!(
+            spinner_prefix(&resolved(Adapter::Chat, "glm-4.6")),
+            "asking glm-4.6"
+        );
+        // Speech is synthesized, not asked for — both speech adapters say
+        // so. The OpenAI adapter sends the model, so it stays in the line.
+        assert_eq!(
+            spinner_prefix(&resolved(Adapter::Speech, "tts-1")),
+            "synthesizing speech (tts-1)"
+        );
+        // A speech run routed to edge-tts never sends the profile's model:
+        // the spinner names the engine that actually serves the request
+        // (issue #72), not the idle model string.
+        assert_eq!(
+            spinner_prefix(&resolved(Adapter::EdgeTts, "deepseek-flash")),
+            "synthesizing speech (edge-tts)"
+        );
+    }
 
     #[test]
     fn live_chars_counts_only_what_was_printed_live() {
