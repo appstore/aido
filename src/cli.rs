@@ -8,7 +8,7 @@
 //! `--text`) in argv order, then hands clap an argv containing only flags.
 
 use crate::domain::MediaKind;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ impl clap::ValueEnum for MediaKind {
 /// (`aido run NAME` reaches a custom task with such a name).
 pub const RESERVED_WORDS: &[&str] = &[
     "tasks", "profiles", "config", "history", "run", "ask", "last", "help", "version", "__hold",
+    "chain",
 ];
 
 /// The recovery pseudo-task behind `aido last`.
@@ -44,13 +45,29 @@ pub enum SourceSpec {
     Text(String),
 }
 
-/// argv after normalization: a task (or the recovery pseudo-task), the
-/// ordered input specs, and the remaining flags for clap.
-#[derive(Debug)]
-pub struct Normalized {
+/// One chain stage's argv after normalization: the stage's task, its
+/// ordered input specs (stage 1 only — later stages read the previous
+/// stage's output), and the flags left for clap.
+#[derive(Debug, Clone)]
+pub struct StageArgv {
     pub task: Option<String>,
     pub specs: Vec<SourceSpec>,
     pub argv: Vec<OsString>,
+}
+
+/// argv after normalization: either one task run, or a task chain already
+/// split into per-stage argv (`--then` markers, or the `chain "a | b"`
+/// sugar, both reduced to the same stage list here).
+#[derive(Debug)]
+pub enum Normalized {
+    Single {
+        task: Option<String>,
+        specs: Vec<SourceSpec>,
+        argv: Vec<OsString>,
+    },
+    Chain {
+        stages: Vec<StageArgv>,
+    },
 }
 
 /// Flags and their value arity — the normalizer's single source of truth.
@@ -214,19 +231,49 @@ fn value_attached(t: &str) -> bool {
     t.contains('=') || short_attached(t).is_some()
 }
 
-/// Rewrite argv into its normalized form.
+/// Rewrite argv into its normalized form: a single task run, or a task
+/// chain — `--then` markers, or the `chain "a | b"` sugar — already split
+/// into per-stage argv. Both chain spellings reduce to the same stage
+/// list here, so the rest of the program sees one shape.
 pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     // The clipboard holder child is spawned as `aido __hold SECS [--image]`:
     // already clap-shaped, and never a task run — pass it straight through so
     // the normalizer's task discovery cannot reject it (RESERVED_WORDS lists
     // it precisely so it can never be a task name).
     if argv.first().and_then(|t| t.to_str()) == Some("__hold") {
-        return Ok(Normalized {
+        return Ok(Normalized::Single {
             task: None,
             specs: Vec::new(),
             argv,
         });
     }
+    if first_free_is_chain(&argv) {
+        return normalize_chain(argv);
+    }
+    if let Some(segments) = split_on_then(&argv) {
+        let mut stages = Vec::new();
+        for segment in segments {
+            stages.push(normalize_stage(segment)?);
+        }
+        if stages[0].task.is_none() {
+            bail!(
+                "a chain must start with a task: aido <TASK> [INPUT...] --then <TASK> \
+                 [...] (a leading -p selects ask)"
+            );
+        }
+        return Ok(Normalized::Chain { stages });
+    }
+    normalize_stage(argv).map(|s| Normalized::Single {
+        task: s.task,
+        specs: s.specs,
+        argv: s.argv,
+    })
+}
+
+/// Rewrite one stage's argv — a complete single-run command line — into
+/// its normalized form. The chain paths call this per stage; the body is
+/// the historical single-run normalizer, unchanged.
+fn normalize_stage(argv: Vec<OsString>) -> Result<StageArgv> {
     let mut slots: Vec<Slot> = Vec::new();
     let mut rest: Vec<OsString> = Vec::new();
     let mut prompt_seen = false;
@@ -378,7 +425,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         } else {
             "--version"
         };
-        return Ok(Normalized {
+        return Ok(StageArgv {
             task: None,
             specs: Vec::new(),
             argv: vec![OsString::from(flag)],
@@ -404,7 +451,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
             }
             rest.extend(free_pre.clone());
             rest.extend(post_separator);
-            return Ok(Normalized {
+            return Ok(StageArgv {
                 task: None,
                 specs,
                 argv: rest,
@@ -419,7 +466,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
                  completed run (output flags like -o/--out-dir still apply)"
             );
         }
-        return Ok(Normalized {
+        return Ok(StageArgv {
             task: Some(LAST_TASK.to_string()),
             specs: Vec::new(),
             argv: {
@@ -438,7 +485,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         };
         let mut argv = vec![OsString::from("--__task"), OsString::from(name)];
         argv.extend(rest);
-        return Ok(Normalized {
+        return Ok(StageArgv {
             task: Some(name.to_string()),
             specs: specs_from(slots, 2),
             argv,
@@ -496,7 +543,7 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         );
     }
     if task.is_none() && prompt_seen {
-        return Ok(Normalized {
+        return Ok(StageArgv {
             task: Some("ask".to_string()),
             specs: specs_from(slots, 0),
             argv: {
@@ -511,18 +558,317 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
         Some(t) => {
             let mut argv = vec![OsString::from("--__task"), OsString::from(t)];
             argv.extend(rest);
-            Ok(Normalized {
+            Ok(StageArgv {
                 specs: specs_from(slots, 1),
                 task,
                 argv,
             })
         }
-        None => Ok(Normalized {
+        None => Ok(StageArgv {
             task: None,
             specs: specs_from(slots, 0),
             argv: rest,
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task chains (`--then`, and the `chain "a | b"` sugar)
+// ---------------------------------------------------------------------------
+
+/// Flags that may appear OUTSIDE the chain spec string: they address the
+/// run as a whole and merge into the last stage (the chain module's
+/// `merge_run_flags`). `--produce`/`--format` are deliberately absent —
+/// outside the last stage they are rejected, because every junction hands
+/// off exactly one text artifact and no stage before the last may reshape
+/// what it produces.
+const CHAIN_OUTER_FLAGS: &[&str] = &[
+    "--output",
+    "--out-dir",
+    "--copy",
+    "--stdout",
+    "--json",
+    "--overwrite",
+    "--quiet",
+    "--stream",
+    "--no-stream",
+    "--dry-run",
+    "--no-history",
+    "--total-timeout",
+    "--help",
+    "--version",
+];
+
+/// Whether argv's first free token — the normalizer's notion: arity-aware,
+/// `--`-terminated — is the chain word.
+fn first_free_is_chain(argv: &[OsString]) -> bool {
+    let mut iter = argv.iter();
+    while let Some(token) = iter.next() {
+        let Some(t) = token.to_str() else { continue };
+        if t == "--" {
+            // Past the separator everything is literal material.
+            return false;
+        }
+        match flag_arity(t) {
+            Some(true) if !value_attached(t) => {
+                iter.next(); // the flag's value can never be the chain word
+            }
+            Some(_) => {}
+            None => return t == "chain",
+        }
+    }
+    false
+}
+
+/// Split argv on top-level `--then` markers; None when none is present.
+/// The scan mirrors the normalizer's grammar: a value flag swallows its
+/// value (the `--then` in `-p --then x` is a prompt, not a marker), and
+/// everything after `--` is literal material that never splits.
+fn split_on_then(argv: &[OsString]) -> Option<Vec<Vec<OsString>>> {
+    let mut segments: Vec<Vec<OsString>> = vec![Vec::new()];
+    let mut after_separator = false;
+    let mut iter = argv.iter();
+    while let Some(token) = iter.next() {
+        let text = token.to_str();
+        if !after_separator {
+            match text {
+                Some("--") => {
+                    after_separator = true;
+                    segments
+                        .last_mut()
+                        .expect("segments never empty")
+                        .push(token.clone());
+                    continue;
+                }
+                Some("--then") => {
+                    segments.push(Vec::new());
+                    continue;
+                }
+                // A value flag swallows its value: the `--then` in
+                // `-p --then x` is a prompt, not a marker.
+                Some(t) if flag_arity(t) == Some(true) && !value_attached(t) => {
+                    segments
+                        .last_mut()
+                        .expect("segments never empty")
+                        .push(token.clone());
+                    if let Some(value) = iter.next() {
+                        segments
+                            .last_mut()
+                            .expect("segments never empty")
+                            .push(value.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        segments
+            .last_mut()
+            .expect("segments never empty")
+            .push(token.clone());
+    }
+    (segments.len() > 1).then_some(segments)
+}
+
+/// `aido chain "SPEC" [INPUT...] [OUTER_FLAGS...]`: split the spec into
+/// stages, attach material to stage 1 and outer flags to the last stage
+/// (position-independently — both address the run, not a stage), and
+/// normalize each stage exactly as a standalone command line.
+fn normalize_chain(argv: Vec<OsString>) -> Result<Normalized> {
+    let mut spec: Option<String> = None;
+    let mut material: Vec<OsString> = Vec::new();
+    let mut outer: Vec<OsString> = Vec::new();
+    let mut after_separator = false;
+    let mut free_seen = 0usize;
+    let mut iter = argv.into_iter().peekable();
+    while let Some(token) = iter.next() {
+        let text = token.to_str().map(|s| s.to_string());
+        if after_separator {
+            material.push(token);
+            continue;
+        }
+        if let Some(t) = &text {
+            if t == "--" {
+                after_separator = true;
+                material.push(token);
+                continue;
+            }
+            if t == "--then" {
+                bail!("--then and chain cannot mix: pick one spelling");
+            }
+            if let Some((flag, guidance)) = REMOVED_FLAGS
+                .iter()
+                .find(|(f, _)| t == *f || t.starts_with(&format!("{f}=")))
+            {
+                bail!("'{flag}' is no longer accepted: {guidance}");
+            }
+            // Material flags feed stage 1 wherever they appear.
+            if t == "--text" || t.starts_with("--text=") {
+                material.push(token.clone());
+                if t == "--text" {
+                    let value = take_value("--text", &mut iter)?;
+                    material.push(OsString::from(value));
+                }
+                continue;
+            }
+            if t == "--paste" {
+                material.push(token);
+                continue;
+            }
+            // A flag token: run-level flags ride to the last stage; a
+            // stage-level one outside the spec has no home.
+            if t.starts_with('-') && t != "-" {
+                let Some(long) = flag_long_name(t) else {
+                    // Unknown flags reach clap through the last stage, so a
+                    // typo keeps its usual "unexpected argument" treatment.
+                    outer.push(token);
+                    continue;
+                };
+                if CHAIN_OUTER_FLAGS.contains(&long) {
+                    outer.push(token.clone());
+                    if flag_arity(t) == Some(true) && !value_attached(t) {
+                        let value = iter
+                            .next()
+                            .ok_or_else(|| anyhow!("{long} requires a value"))?;
+                        outer.push(value);
+                    }
+                } else {
+                    bail!(
+                        "'{long}' configures one stage, not the run: put it inside the \
+                         chain spec string, on the stage it configures (or use the \
+                         --then form)"
+                    );
+                }
+                continue;
+            }
+        } else if let Some(flag) = text_flag_shape(token.as_encoded_bytes()) {
+            return Err(invalid_text_value(flag));
+        }
+        // A free token: the chain word, the spec, or material.
+        free_seen += 1;
+        match free_seen {
+            1 => {} // "chain", verified by first_free_is_chain
+            2 => {
+                spec =
+                    Some(text.ok_or_else(|| anyhow!("the chain spec must be valid UTF-8 text"))?);
+            }
+            _ => material.push(token),
+        }
+    }
+    let Some(spec) = spec else {
+        bail!(
+            "chain requires a spec string: aido chain \"TASK [FLAGS] | TASK [FLAGS]\" \
+             [INPUT...] [OPTIONS]"
+        )
+    };
+    let mut stages_tokens = tokenize_chain_spec(&spec)?;
+    if stages_tokens.len() < 2 {
+        let single = stages_tokens.pop().unwrap_or_default().join(" ");
+        bail!("a chain needs at least two stages; run this task directly: aido {single}");
+    }
+    let n = stages_tokens.len();
+    let mut stages = Vec::new();
+    for (i, tokens) in stages_tokens.into_iter().enumerate() {
+        let mut segment: Vec<OsString> = tokens.into_iter().map(OsString::from).collect();
+        if i == 0 {
+            segment.extend(material.iter().cloned());
+        }
+        if i + 1 == n {
+            segment.extend(outer.iter().cloned());
+        }
+        stages.push(normalize_stage(segment)?);
+    }
+    Ok(Normalized::Chain { stages })
+}
+
+/// Split a chain spec into stages of shell-like tokens. One scan makes
+/// both cuts: `|` (outside quotes) ends a stage, whitespace (outside
+/// quotes) ends a token. Quotes are `'...'` and `"..."`; there are no
+/// escapes — inside quotes every character is literal, which is what
+/// keeps one spelling valid on every platform. `''` contributes an empty
+/// argument, as in a shell.
+fn tokenize_chain_spec(spec: &str) -> Result<Vec<Vec<String>>> {
+    let mut stages: Vec<Vec<String>> = vec![Vec::new()];
+    let mut token = String::new();
+    let mut started = false; // the token holds content or a quoted empty
+    let mut quote: Option<char> = None;
+    for ch in spec.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '|' => {
+                if started {
+                    stages
+                        .last_mut()
+                        .expect("stages never empty")
+                        .push(std::mem::take(&mut token));
+                }
+                started = false;
+                stages.push(Vec::new());
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    stages
+                        .last_mut()
+                        .expect("stages never empty")
+                        .push(std::mem::take(&mut token));
+                    started = false;
+                }
+            }
+            c => {
+                token.push(c);
+                started = true;
+            }
+        }
+    }
+    if let Some(q) = quote {
+        bail!(
+            "the chain spec ends inside an unclosed {q} quote; chain specs have no \
+             escapes — when a stage argument needs both quote kinds, use the --then \
+             form, whose arguments are ordinary shell tokens"
+        );
+    }
+    if started {
+        stages.last_mut().expect("stages never empty").push(token);
+    }
+    for (i, stage) in stages.iter().enumerate() {
+        if stage.is_empty() {
+            bail!("chain spec stage {} is empty", i + 1);
+        }
+    }
+    Ok(stages)
+}
+
+/// The canonical long form of a flag token, for chain classification:
+/// `--out-dir`, `-o`, `-ofile`, `-o=file` and `--flag=v` all resolve to
+/// their FLAGS-table name. None for non-flags and unknown flags.
+fn flag_long_name(token: &str) -> Option<&'static str> {
+    let bare = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
+    if let Some(("__task", _)) = FLAGS.iter().find(|(f, _)| *f == bare) {
+        return None; // internal flag, never user-writable
+    }
+    if let Some((name, _)) = FLAGS.iter().find(|(f, _)| *f == bare) {
+        return Some(name);
+    }
+    for (short, long) in SHORT_VALUE_FLAGS {
+        if bare == *short {
+            return Some(long);
+        }
+        if bare.starts_with(short) && bare.len() > 2 && short_attached(token).is_some() {
+            return Some(long);
+        }
+    }
+    None
 }
 
 /// A word that names no task but looks like a file path is input rather
@@ -679,7 +1025,7 @@ impl std::fmt::Display for OutputFormat {
 }
 
 /// Run a task over material and deliver the result.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "aido",
     version,
@@ -804,7 +1150,7 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     /// List available tasks
     Tasks {
@@ -833,7 +1179,7 @@ pub enum Commands {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum TasksCmd {
     /// List all tasks
     List,
@@ -841,7 +1187,7 @@ pub enum TasksCmd {
     Show { task: String },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ConfigCmd {
     /// Write a sample config file
     Init,
@@ -849,7 +1195,7 @@ pub enum ConfigCmd {
     Check,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum HistoryCmd {
     /// List recorded runs, oldest first (newest last); the index
     /// addresses `show` (1 = newest)
@@ -877,6 +1223,25 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    /// The single-run view the historical tests are written against:
+    /// unwraps [`Normalized::Single`]. A chain invocation panics here —
+    /// chain tests use [`stages_of`].
+    fn normalize(args: Vec<OsString>) -> Result<StageArgv> {
+        match super::normalize(args) {
+            Ok(Normalized::Single { task, specs, argv }) => Ok(StageArgv { task, specs, argv }),
+            Ok(Normalized::Chain { .. }) => panic!("expected a single-run normalization"),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The chain view: unwraps [`Normalized::Chain`] into its stages.
+    fn stages_of(args: &[&str]) -> Vec<StageArgv> {
+        match super::normalize(os(args)).unwrap() {
+            Normalized::Chain { stages } => stages,
+            Normalized::Single { .. } => panic!("expected a chain normalization"),
+        }
     }
 
     fn task_of(args: &[&str]) -> String {
@@ -1411,5 +1776,220 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(n.specs[0], SourceSpec::File(PathBuf::from(&token)));
+    }
+
+    #[test]
+    fn then_form_splits_into_stages() {
+        let stages = stages_of(&[
+            "ocr",
+            "a.png",
+            "--then",
+            "translate",
+            "--to",
+            "zh-CN",
+            "--then",
+            "tts",
+            "-o",
+            "out.mp3",
+        ]);
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].task.as_deref(), Some("ocr"));
+        assert_eq!(
+            stages[0].specs,
+            vec![SourceSpec::File(PathBuf::from("a.png"))]
+        );
+        assert_eq!(stages[1].task.as_deref(), Some("translate"));
+        assert!(stages[1]
+            .argv
+            .windows(2)
+            .any(|w| w == [OsString::from("--to"), OsString::from("zh-CN")]));
+        assert_eq!(stages[2].task.as_deref(), Some("tts"));
+        assert!(stages[2].argv.contains(&OsString::from("-o")));
+    }
+
+    #[test]
+    fn then_prompt_value_swallows_the_marker() {
+        // `-p --then` is a prompt of "--then", not a stage boundary; the
+        // next real marker splits.
+        let stages = stages_of(&["ask", "-p", "--then", "--then", "tts"]);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].task.as_deref(), Some("ask"));
+        let argv = stages[0]
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            argv.iter().any(|a| a.contains("--then")),
+            "the prompt's value must survive: {argv:?}"
+        );
+        assert_eq!(stages[1].task.as_deref(), Some("tts"));
+    }
+
+    #[test]
+    fn then_after_separator_is_literal() {
+        // After `--` nothing splits: a file literally named "--then" is
+        // material, and the separator's stage simply ends the argv's
+        // marker interpretation (put later stages before `--`).
+        let n = normalize(os(&["ocr", "--", "--then", "f.png", "--then", "tts"])).unwrap();
+        assert_eq!(
+            n.specs,
+            vec![
+                SourceSpec::File(PathBuf::from("--then")),
+                SourceSpec::File(PathBuf::from("f.png")),
+                SourceSpec::File(PathBuf::from("--then")),
+                SourceSpec::File(PathBuf::from("tts")),
+            ]
+        );
+        // A separator inside the last stage is fine: its material stays
+        // literal while the marker before it still split.
+        let stages = stages_of(&["ocr", "a.png", "--then", "tts", "--", "--then"]);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(
+            stages[1].specs,
+            vec![SourceSpec::File(PathBuf::from("--then"))]
+        );
+    }
+
+    #[test]
+    fn then_first_stage_without_a_task_is_rejected() {
+        let err = super::normalize(os(&["--then", "tts"])).unwrap_err();
+        assert!(err.to_string().contains("must start with a task"), "{err}");
+    }
+
+    #[test]
+    fn chain_sugar_desugars_material_and_outer_flags() {
+        let stages = stages_of(&[
+            "chain",
+            "ocr | translate --to zh-CN | tts",
+            "shot.png",
+            "-o",
+            "brief.mp3",
+        ]);
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].task.as_deref(), Some("ocr"));
+        assert_eq!(
+            stages[0].specs,
+            vec![SourceSpec::File(PathBuf::from("shot.png"))]
+        );
+        assert_eq!(stages[1].task.as_deref(), Some("translate"));
+        assert!(stages[1]
+            .argv
+            .windows(2)
+            .any(|w| w == [OsString::from("--to"), OsString::from("zh-CN")]));
+        assert_eq!(stages[2].task.as_deref(), Some("tts"));
+        let argv = stages[2]
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(argv.contains(&"-o".to_string()) && argv.contains(&"brief.mp3".to_string()));
+    }
+
+    #[test]
+    fn chain_outer_flags_are_position_independent() {
+        // Flags before the chain word land on the last stage too.
+        let stages = stages_of(&["--json", "chain", "ocr|tts", "shot.png", "--copy"]);
+        assert_eq!(stages.len(), 2);
+        for flag in ["--json", "--copy"] {
+            assert!(
+                stages[1].argv.contains(&OsString::from(flag)),
+                "last stage missing {flag}: {:?}",
+                stages[1].argv
+            );
+        }
+        assert!(stages[0].specs.len() == 1);
+    }
+
+    #[test]
+    fn chain_stage_level_flag_outside_the_spec_is_rejected() {
+        let err = super::normalize(os(&["chain", "ocr|tts", "--to", "zh-CN"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--to"), "{msg}");
+        assert!(msg.contains("inside the chain spec"), "{msg}");
+    }
+
+    #[test]
+    fn chain_needs_two_stages() {
+        let err = super::normalize(os(&["chain", "ocr", "shot.png"])).unwrap_err();
+        assert!(err.to_string().contains("at least two stages"), "{err}");
+    }
+
+    #[test]
+    fn chain_empty_stage_is_named() {
+        let err = super::normalize(os(&["chain", "ocr || tts"])).unwrap_err();
+        assert!(err.to_string().contains("stage 2 is empty"), "{err}");
+    }
+
+    #[test]
+    fn chain_unclosed_quote_points_at_then() {
+        let err = super::normalize(os(&["chain", "ocr | 'tts"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unclosed"), "{msg}");
+        assert!(msg.contains("--then"), "{msg}");
+    }
+
+    #[test]
+    fn chain_and_then_cannot_mix() {
+        let err = super::normalize(os(&["chain", "ocr|tts", "--then", "ask"])).unwrap_err();
+        assert!(err.to_string().contains("cannot mix"), "{err}");
+    }
+
+    #[test]
+    fn chain_material_flags_reach_stage1() {
+        let stages = stages_of(&["chain", "ask -p '总结' | tts", "--text", "你好"]);
+        assert_eq!(stages[0].task.as_deref(), Some("ask"));
+        assert!(stages[0].specs.contains(&SourceSpec::Text("你好".into())));
+    }
+
+    #[test]
+    fn chain_material_after_separator_stays_literal() {
+        let stages = stages_of(&["chain", "ocr|tts", "--", "shots/*.png"]);
+        assert_eq!(
+            stages[0].specs,
+            vec![SourceSpec::File(PathBuf::from("shots/*.png"))]
+        );
+    }
+
+    #[test]
+    fn chain_spec_unknown_task_gets_did_you_mean() {
+        let err = super::normalize(os(&["chain", "ocr|transalte"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown task 'transalte'"), "{msg}");
+        assert!(msg.contains("translate"), "{msg}");
+    }
+
+    #[test]
+    fn tokenizer_cuts_segments_and_tokens_quote_aware() {
+        let stages = tokenize_chain_spec("ocr |  translate  --to 'zh-CN' |tts").unwrap();
+        assert_eq!(
+            stages,
+            vec![
+                vec!["ocr".to_string()],
+                vec![
+                    "translate".to_string(),
+                    "--to".to_string(),
+                    "zh-CN".to_string()
+                ],
+                vec!["tts".to_string()],
+            ]
+        );
+        // `|` inside quotes is literal; a quoted empty is an argument.
+        let stages = tokenize_chain_spec("ask -p 'a|b' ''|tts").unwrap();
+        assert_eq!(
+            stages,
+            vec![
+                vec![
+                    "ask".to_string(),
+                    "-p".to_string(),
+                    "a|b".to_string(),
+                    "".to_string(),
+                ],
+                vec!["tts".to_string()],
+            ]
+        );
+        // Double quotes survive into the token for clap to see verbatim.
+        let stages = tokenize_chain_spec("ask -p \"总结 这页\"|tts").unwrap();
+        assert_eq!(stages[0][2], "总结 这页");
     }
 }

@@ -1,6 +1,7 @@
 //! Application orchestration: dispatch a normalized invocation, run one
 //! task end to end, and map outcomes to exit codes.
 
+use crate::chain;
 use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
 use crate::config;
 use crate::domain::{
@@ -54,25 +55,46 @@ pub async fn run() -> i32 {
         Ok(n) => n,
         Err(e) => return fail(&AppError::usage(format!("{e:#}")), wants_json, None, None),
     };
-    let cli = match Cli::try_parse_from(
-        std::iter::once(std::ffi::OsString::from("aido")).chain(normalized.argv.clone()),
-    ) {
-        Ok(cli) => cli,
-        Err(e) => {
-            // A parse error exits here without ever reaching fail(), so
-            // the --json contract needs the report emitted by hand; the
-            // argv scan is the only signal available (clap never
-            // produced a Cli). Help and version print to stdout and exit
-            // 0 — no report for those.
-            if e.use_stderr() && wants_json {
-                let report = output::error_report(ErrorKind::Usage, &e.to_string(), None, None);
-                let mut out = std::io::stdout().lock();
-                let _ = serde_json::to_writer_pretty(&mut out, &report);
-                let _ = out.write_all(b"\n");
-                let _ = out.flush();
-            }
-            let _ = e.print();
-            return if e.use_stderr() { 2 } else { 0 };
+    // A chain never clap-parses the whole argv (`--then` markers and the
+    // spec string are not part of its grammar): the stages parse in
+    // chain::parse, and the run-level surface is the last stage's, with
+    // the outer run-level flags merged in.
+    let (cli, chain) = match &normalized {
+        cli::Normalized::Chain { stages } => {
+            let cfg = match config::load() {
+                Ok(cfg) => cfg,
+                Err(e) => return fail(&AppError::usage(format!("{e:#}")), wants_json, None, None),
+            };
+            let prepared = match chain::parse(stages.clone(), &cfg) {
+                Ok(prepared) => prepared,
+                Err(e) => return fail(&e, wants_json, None, None),
+            };
+            (prepared.run_cli.clone(), Some(prepared))
+        }
+        cli::Normalized::Single { argv, .. } => {
+            let cli = match Cli::try_parse_from(
+                std::iter::once(std::ffi::OsString::from("aido")).chain(argv.clone()),
+            ) {
+                Ok(cli) => cli,
+                Err(e) => {
+                    // A parse error exits here without ever reaching fail(), so
+                    // the --json contract needs the report emitted by hand; the
+                    // argv scan is the only signal available (clap never
+                    // produced a Cli). Help and version print to stdout and exit
+                    // 0 — no report for those.
+                    if e.use_stderr() && wants_json {
+                        let report =
+                            output::error_report(ErrorKind::Usage, &e.to_string(), None, None);
+                        let mut out = std::io::stdout().lock();
+                        let _ = serde_json::to_writer_pretty(&mut out, &report);
+                        let _ = out.write_all(b"\n");
+                        let _ = out.flush();
+                    }
+                    let _ = e.print();
+                    return if e.use_stderr() { 2 } else { 0 };
+                }
+            };
+            (cli, None)
         }
     };
     let wants_json = cli.json;
@@ -86,7 +108,7 @@ pub async fn run() -> i32 {
             record_cancelled(&state);
             return EXIT_CANCEL;
         }
-        result = dispatch(cli, normalized, state.clone()) => result,
+        result = dispatch(cli, normalized, chain, state.clone()) => result,
     };
     match result {
         Ok(()) => 0,
@@ -157,6 +179,7 @@ fn fail(e: &AppError, json: bool, run_id: Option<&str>, task: Option<&str>) -> i
 async fn dispatch(
     cli: Cli,
     normalized: Normalized,
+    chain: Option<chain::PreparedChain>,
     state: Arc<std::sync::Mutex<RunState>>,
 ) -> AppResult<()> {
     // Management subcommands.
@@ -169,7 +192,18 @@ async fn dispatch(
         None => {}
     }
 
-    let Some(task_name) = normalized.task.or_else(|| cli.task.clone()) else {
+    // A task chain: already parsed and checked (a chain that cannot work
+    // never reached dispatch). Management words can never be chain stages,
+    // so the match above could not have fired for one.
+    if let Some(chain) = chain {
+        return chain::run(chain).await;
+    }
+
+    let (task_name, specs) = match normalized {
+        Normalized::Single { task, specs, .. } => (task, specs),
+        Normalized::Chain { .. } => unreachable!("chain handled above"),
+    };
+    let Some(task_name) = task_name.or_else(|| cli.task.clone()) else {
         print_help();
         return Err(AppError::usage(
             "nothing to do: name a task (aido <TASK>), or ask with -p (see --help)",
@@ -202,7 +236,7 @@ async fn dispatch(
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo::real();
     let mut env = InputEnv::real();
-    let specs = normalized.specs.clone();
+    let specs = specs.clone();
 
     let plan = plan::build(&cli, &task, &specs, &cfg, terminal, &mut env)?;
 

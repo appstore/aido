@@ -428,7 +428,7 @@ fn param_value(cli: &Cli, task: &Task, param: TaskParam) -> Option<serde_json::V
 }
 
 /// The fixed instruction with typed parameter effects folded in.
-fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
+pub(crate) fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
     let mut instruction = task.instruction.trim().to_string();
     if task.accepts_param("to") {
         let to = cli
@@ -450,6 +450,18 @@ fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
         instruction.push_str(&format!("Target language: {target}."));
     }
     Ok(instruction)
+}
+
+/// Whether one input kind is acceptable to this stage: the task∩profile
+/// allow-list when one exists, else the adapter's accepted set. The
+/// shared predicate behind [`validate_inputs`] and the chain's junction
+/// type check.
+pub(crate) fn kind_accepted(resolved: &Resolved, kind: MediaKind) -> bool {
+    if let Some(allowed) = &resolved.allowed_inputs {
+        allowed.contains(&kind)
+    } else {
+        resolved.adapter.inputs().contains(&kind)
+    }
 }
 
 fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> AppResult<()> {
@@ -645,7 +657,7 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
     Ok(())
 }
 
-fn resolve_destinations(
+pub(crate) fn resolve_destinations(
     cli: &Cli,
     produce: &[MediaKind],
     terminal: TerminalInfo,
@@ -733,7 +745,7 @@ fn resolve_destinations(
 /// the task that declares them. The CLI flag wins, then the task's
 /// default (`to` and `voice` are the only ones a task may default), else
 /// nothing is sent for it.
-fn describe_param_sources(
+pub(crate) fn describe_param_sources(
     cli: &Cli,
     task: &Task,
     resolved: &Resolved,
@@ -987,17 +999,17 @@ pub fn describe(plan: &ExecutionPlan) -> String {
 
 /// How many chars of the instruction/requirement the dry-run report shows:
 /// a conventional full terminal line's worth of text, elided past that.
-const DRY_RUN_LINE_MAX: usize = 72;
+pub(crate) const DRY_RUN_LINE_MAX: usize = 72;
 
 /// Whether the run would actually carry a key — by the shared judgment
 /// (`config::effective_key_env`) the runner's send-time resolution also
 /// uses, so the cleartext warning fires under exactly the conditions a
 /// real request would see a key.
-fn api_key_present(resolved: &Resolved) -> bool {
+pub(crate) fn api_key_present(resolved: &Resolved) -> bool {
     crate::config::effective_key_env(resolved.api_key_env.as_deref()).is_some()
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
     } else if n < 1024 * 1024 {
@@ -1009,7 +1021,7 @@ fn human_bytes(n: u64) -> String {
 
 /// Strip credentials and potentially sensitive query values from URLs
 /// shown in reports.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut u) => {
             if !u.username().is_empty() {
