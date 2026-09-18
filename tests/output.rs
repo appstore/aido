@@ -61,11 +61,13 @@ fn output_file_takes_the_body_instead_of_stdout() {
 
 #[test]
 fn existing_output_file_refuses_without_overwrite() {
-    let server = Server::json(chat_body("new"));
     let dir = temp_dir("out-exists");
     let file = dir.join("summary.txt");
     std::fs::write(&file, "original").unwrap();
-    let cfg = chat_cfg(&server.url());
+    // Nothing listens on port 1: if the request went out, the run would
+    // exit 3 — the usage refusal (2) also proves the collision is caught
+    // before anything is sent.
+    let cfg = chat_cfg("http://127.0.0.1:1");
     let out = run(
         &[
             "summarize",
@@ -77,7 +79,12 @@ fn existing_output_file_refuses_without_overwrite() {
         b"hi\n",
         &[("AIDO_CONFIG", cfg.to_str().unwrap())],
     );
-    out.assert_code(5);
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("already exists"),
+        "stderr: {}",
+        out.stderr()
+    );
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "original",
@@ -883,14 +890,12 @@ fn two_images_to_one_file_fail_delivery_but_stay_recoverable() {
 
 #[test]
 fn last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_file() {
-    // The restore path (`aido last` → deliver_restored → output::deliver)
-    // runs the same JSON epilogue as a live run. Here the -o target already
-    // exists and no --overwrite is given, so the refusal happens inside
-    // deliver_to_destinations (the no-clobber commit fails): the run must
-    // exit 5 with stdout still carrying exactly one JSON report — the
-    // recorded artifact, the stdout delivery (this report), the refused
-    // file destination, and the delivery error — while the existing file
-    // keeps its original bytes.
+    // The restore path (`aido last` → deliver_restored) pre-checks the -o
+    // target: an existing file without --overwrite is a usage refusal
+    // (exit 2) that fires before any destination runs. With --json, the
+    // shared error epilogue must still put exactly one report on stdout
+    // — no deliveries, nothing written — while the existing file keeps
+    // its original bytes.
     let server = Server::json(chat_body("kept in history"));
     let history = temp_dir("restore-refusal-hist");
     let cfg = settings_config(&format!(
@@ -920,38 +925,16 @@ fn last_json_report_still_prints_when_a_restored_delivery_refuses_an_existing_fi
             ("AIDO_HISTORY_DIR", history.to_str().unwrap()),
         ],
     );
-    out.assert_code(5);
+    out.assert_code(2);
     let report: serde_json::Value = serde_json::from_str(&out.stdout())
         .unwrap_or_else(|e| panic!("stdout must hold one JSON report: {e}\n{}", out.stdout()));
     assert_eq!(report["version"], 1, "report: {report}");
-    assert_eq!(report["error"]["kind"], "delivery", "report: {report}");
+    assert_eq!(report["error"]["kind"], "usage", "report: {report}");
     let message = report["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("summary.txt"), "report: {report}");
     assert!(message.contains("--overwrite"), "report: {report}");
-    // The restored report describes the recorded run, not a new one.
-    assert!(report["run_id"].is_string(), "report: {report}");
-    assert_eq!(report["task"], "summarize", "report: {report}");
-    assert_eq!(report["artifacts"].as_array().unwrap().len(), 1);
-    let deliveries = report["deliveries"].as_array().unwrap();
-    // stdout (this very report) and the refused file
-    assert_eq!(deliveries.len(), 2, "deliveries: {deliveries:?}");
-    assert!(
-        deliveries
-            .iter()
-            .any(|d| d["destination"] == "stdout" && d["status"] == "succeeded"),
-        "deliveries: {deliveries:?}"
-    );
-    assert!(
-        deliveries.iter().any(|d| d["destination"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("summary.txt")
-            && d["status"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("failed")),
-        "deliveries: {deliveries:?}"
-    );
+    // The refusal precedes every destination: nothing was delivered.
+    assert_eq!(report["deliveries"].as_array().unwrap().len(), 0);
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "original bytes",

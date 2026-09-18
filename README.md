@@ -166,7 +166,7 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 | `--json` | stdout 输出版本化运行报告（替代正文） |
 | `--overwrite` | 允许替换已存在的目标文件 |
 
-指定了显式去向后只执行指定去向。已存在的目标文件默认报错；写入走"同目录临时文件 + 原子提交"。`--json` 与 `--stdout` / `-o -` 互斥；报告只含产物的路径与大小、不携带字节，所以二进制产物任务（tts / image）与 `--json` 组合时，终端上必须另给 `-o` 或 `--out-dir`，否则预检即报错。stdout 接管道时放行，产物不写向 stdout、只存历史，可凭报告中的 `run_id` 用 `aido history show <RUN_ID> --out-dir` 恢复。
+指定了显式去向后只执行指定去向。已存在的 `-o` 目标文件在发送请求前即报错（退出码 2）；`--out-dir` 的产物名依赖生成结果，撞名在交付期报错（退出码 5）。写入走"同目录临时文件 + 原子提交"。`--json` 与 `--stdout` / `-o -` 互斥；报告只含产物的路径与大小、不携带字节，所以二进制产物任务（tts / image）与 `--json` 组合时，终端上必须另给 `-o` 或 `--out-dir`，否则预检即报错。stdout 接管道时放行，产物不写向 stdout、只存历史，可凭报告中的 `run_id` 用 `aido history show <RUN_ID> --out-dir` 恢复。
 
 `--out-dir` 写出的 `manifest.json` 记录本次交付：顶层 `version` 恒为 `1`（另有 `run_id` 与 `artifacts`），每个产物条目列出 `id` / `kind` / `mime` / `file` / `size`；自 0.3.0 起产物条目追加 `provenance` 字段（`{"type":"request","index":N}` 或 `{"type":"merged","requests":[…]}`，标明产物来自该次运行的哪个请求）——老读者应允许其缺省。
 

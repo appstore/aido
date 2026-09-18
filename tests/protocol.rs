@@ -167,6 +167,9 @@ fn truncated_reply_is_not_delivered_and_exits_four() {
     ));
     let file = temp_file("out.txt", b"original");
     let dir = temp_dir("hist-truncated");
+    // --overwrite lets the run pass the output pre-check (the target
+    // exists) so the test exercises the truncation gate; the file
+    // assertion below still proves nothing was delivered.
     let out = run_with(
         &[
             "summarize",
@@ -174,6 +177,7 @@ fn truncated_reply_is_not_delivered_and_exits_four() {
             "test",
             "-o",
             file.to_str().unwrap(),
+            "--overwrite",
         ],
         b"hi\n",
         &[

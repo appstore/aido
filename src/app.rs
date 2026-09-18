@@ -211,6 +211,11 @@ async fn dispatch(
         return Ok(());
     }
 
+    // A knowable `-o` collision fails before the request: the plan names
+    // the file exactly, so this is usage (exit 2), not a paid delivery
+    // failure (exit 5).
+    output::precheck_file_targets(&plan.destinations, cli.overwrite)?;
+
     // The run id exists before the request so a Ctrl+C mid-flight can be
     // recorded. With history on the run dir is created exclusively here;
     // with history off nothing is created.
@@ -597,6 +602,7 @@ fn resolve_run(target: &str) -> AppResult<RunRecord> {
 async fn deliver_restored(options: &RestoreOptions, record: RunRecord) -> AppResult<()> {
     let produce: Vec<MediaKind> = record.artifacts.iter().map(|a| a.kind).collect();
     let destinations = restore_destinations(options, &record)?;
+    output::precheck_file_targets(&destinations, options.overwrite)?;
     let hold_secs = config::load()
         .ok()
         .and_then(|c| c.settings.hold_secs)
