@@ -114,6 +114,49 @@ aido ask -p "总结要点" --profile vision -m glm-4.6v   # 临时换 Profile / 
 aido translate article.md --to en -o out.md --overwrite   # 允许覆盖已存在的文件
 ```
 
+## 任务链：一次运行，多段任务
+
+多任务串联不必再靠 shell 管道。两种等价写法，链跑完只留一条 history 记录、一份完整清单，中间产物随时可恢复：
+
+```bash
+aido ocr shot.png --then translate --to zh-CN --then tts -o brief.mp3 --copy   # 原语：每个 --then 开启下一段
+aido chain "ocr | translate --to zh-CN | tts" shot.png -o brief.mp3 --copy     # 糖衣：规格串写阶段，材料与交付写在串外
+```
+
+规则一目了然：
+
+- 材料流自动接线：首环吃命令行材料，后续环吃上一环的产物；stdout 只有末环正文；
+- 一条链一条记录：各环产物同落一份 manifest/history（provenance 记录每环的全局请求号），`history show <RUN> --out-dir` 可整链恢复；
+- 交付只看末环：`-o` / `--copy` / stdout 作用在最后一环，`--out-dir` 则收全环；
+- 计划期类型检查：上一环产物类型 → 下一环输入类型，不匹配 exit 2，一个请求都不发；任何一环失败，后续环不再执行，退出码取失败环的分类（3/4），已产出的上游产物照常入历史；
+- 旗标归属：阶段参数（`--to`、`--voice`、`-p`、`--profile` …）写在自己那一段；run 级参数（`-o`、`--json`、`--dry-run` …）写在整条链上，`chain` 形式下位置随意。
+
+直接解锁的场景：
+
+```bash
+aido chain "ocr | translate | tts" shot.png -o brief.mp3      # 截图 → 翻译 → 配音
+aido chain "transcribe | translate --to en | tts" talk.m4a    # 语音同传
+aido chain "summarize | tts" daily.md -o brief.mp3            # 配 cron 即每日简报
+aido chain "ocr | ask -p '这页在讲什么？'" page.png           # 长图 → 提问
+```
+
+### 何时用 --then
+
+`chain` 的规格字符串刻意保持简单：引号只用来包裹空格和 `|`，**没有转义、没有变量展开**。跨平台约定是外层双引号给 shell、内层单引号给 aido——cmd 与 PowerShell 不把单引号当特殊字符，同一拼写在 zsh / bash / cmd / PowerShell 全部成立：
+
+```bash
+aido chain "ocr | ask -p '这页在讲什么？'" page.png
+```
+
+需要 shell 展开、或一段文本里同时出现单双引号时，改用 `--then`——它的参数就是普通 shell token，语义与其它任何 aido 命令相同：
+
+```bash
+aido ask -p "总结 $TOPIC 的要点" --then tts -o brief.mp3   # $TOPIC 由 shell 展开
+aido ocr page.png --then ask -p "他说\"行\"了吗"           # 双引号内嵌双引号
+```
+
+v1 的边界：链是线性的（分支/汇合不支持）；per-part 批处理（目录、多页 PDF）不与链组合，遇到会明确报错；管理命令（`history`、`tasks` …）不能作为链的一环。
+
 ## 命令结构
 
 ```

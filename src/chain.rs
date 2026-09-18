@@ -2,9 +2,10 @@
 //! and the `chain "a | b"` sugar, which [`crate::cli`] reduces to the same
 //! stage list.
 //!
-//! This module turns per-stage argv into real plans and runs the
-//! plan-time contract: a chain that cannot work fails here, before any
-//! request is sent (exit 2, zero requests). Every junction hands off
+//! This module owns the whole chain lifecycle: per-stage clap parsing and
+//! the plan-time contract (a chain that cannot work fails here, before
+//! any request is sent — exit 2, zero requests), the stage-by-stage
+//! executor, and the `--dry-run` preview. Every junction hands off
 //! exactly one text artifact, so every stage before the last must produce
 //! exactly text; only the last stage owns destinations, the JSON report
 //! and live stdout.
