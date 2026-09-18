@@ -1,6 +1,6 @@
 [package]
 name = "aido"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # 依赖下限：image 0.25 与 reqwest 传递引入的 icu_* 系列声明 1.88；CI 的 msrv job 验证
 rust-version = "1.88"
