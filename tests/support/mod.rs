@@ -434,6 +434,22 @@ pub fn run(args: &[&str], stdin_data: &[u8], envs: &[(&str, &str)]) -> RunOutcom
     run_with(args, stdin_data, envs, empty_config())
 }
 
+/// Spawn aido without waiting for it — for tests that observe or signal
+/// the child while it runs (SIGINT, …). Stdout/stderr stay piped: read
+/// them from the returned `Child`.
+pub fn spawn(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    config: impl AsRef<std::ffi::OsStr>,
+) -> std::process::Child {
+    let mut cmd = base_command(args, config);
+    cmd.stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn aido")
+}
+
 /// Like [`run`] but with an explicit config path.
 pub fn run_with(
     args: &[&str],

@@ -399,6 +399,111 @@ fn stage2_truncated_generation_exits_4() {
     );
 }
 
+/// Ctrl+C mid-chain: the completed upstream stages' paid-for artifacts
+/// must land in the cancelled record instead of dying with the run. The
+/// stage-1 reply answers instantly and the server then writes a marker
+/// file the test waits for; the stage-2 reply is held until a gate file
+/// appears (it never does), so the client sits mid-chain until the SIGINT
+/// drops its connection. Unix-only: it needs kill(2).
+#[cfg(unix)]
+#[test]
+fn ctrl_c_mid_chain_keeps_completed_stages_in_history() {
+    use std::io::Write as _;
+
+    let hist = temp_dir("chain-cancel-history");
+    let marks = temp_dir("chain-cancel");
+    let answered = marks.join("stage1.answered");
+    let gate = marks.join("stage2.hold");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Detached on purpose: the held stage-2 reply's write fails once the
+    // cancelled client hangs up (that is the point), and the thread ends
+    // on its own — joining would wait out the hold instead.
+    {
+        let answered = answered.clone();
+        let gate = gate.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut stream = accept(&listener, deadline);
+            stream.set_nonblocking(false).unwrap();
+            let _ = read_request(&mut stream);
+            write_response(&mut stream, "200 OK", chat_body("stage one text"));
+            std::fs::write(&answered, b"1").unwrap();
+            let mut stream = accept(&listener, deadline);
+            stream.set_nonblocking(false).unwrap();
+            let _ = read_request(&mut stream);
+            let hold = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !gate.exists() && std::time::Instant::now() < hold {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let body = chat_body("stage two");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+    }
+
+    let cfg = live_cfg(&format!("http://127.0.0.1:{port}"));
+    let child = spawn(
+        &["chain", "summarize|translate", "--text", "hi"],
+        &[("AIDO_HISTORY_DIR", hist.to_str().unwrap())],
+        &cfg,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !answered.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stage 1 never completed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Grace for the client to finish parsing stage 1 and snapshot its
+    // artifact into the cancelled-run placeholder.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0,
+        "kill(SIGINT) failed"
+    );
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(130), "exit code after Ctrl+C");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("kept in history"), "stderr: {stderr}");
+
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["generation"]["status"], "cancelled", "{manifest}");
+    assert_eq!(manifest["task"], "summarize|translate");
+    assert!(
+        manifest["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("kept in this record"),
+        "{manifest}"
+    );
+    // One summary per completed stage: only stage 1 finished.
+    assert_eq!(manifest["stages"].as_array().unwrap().len(), 1);
+    // The paid-for artifact is on disk next to the manifest.
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "stage 1's artifact is kept: {artifacts:?}"
+    );
+    assert_eq!(artifacts[0]["id"], "summarize");
+    assert_eq!(
+        std::fs::read_to_string(runs[0].join("summarize.txt")).unwrap(),
+        "stage one text"
+    );
+}
+
 #[test]
 fn sugar_and_then_forms_produce_identical_delivery() {
     let bodies = &[chat_body("ONE"), chat_body("TWO")];

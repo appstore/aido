@@ -32,6 +32,13 @@ struct PendingRun {
     created_at: String,
     summary: RunSummary,
     record_history: bool,
+    /// A chain's completed upstream stages: their artifacts (retagged and
+    /// renamed, exactly as they would ride into the final record) and one
+    /// summary per completed stage. A Ctrl+C during a later stage must
+    /// keep what the earlier stages paid for; a single-task run leaves
+    /// both empty.
+    chain_artifacts: Vec<Artifact>,
+    chain_stages: Vec<RunSummary>,
 }
 
 /// Shared run state. The interrupted-run placeholder is claimed once the
@@ -129,29 +136,58 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
     let claimed = state.lock().ok().and_then(|mut s| s.pending.take());
     match claimed {
         Some(p) => {
-            eprintln!("interrupted — the run was cancelled, nothing was delivered");
+            let kept = p.chain_artifacts.len();
+            if p.record_history && kept > 0 {
+                eprintln!(
+                    "interrupted — the run was cancelled, nothing was delivered; \
+                     the completed stages' {kept} artifact(s) are kept in history \
+                     (`aido history show {}`)",
+                    p.run_id
+                );
+            } else {
+                eprintln!("interrupted — the run was cancelled, nothing was delivered");
+            }
             if p.record_history {
-                let record = RunRecord {
-                    run_id: p.run_id,
-                    task: p.task,
-                    created_at: p.created_at,
-                    summary: p.summary,
-                    generation: GenerationStatus::Cancelled,
-                    artifacts: Vec::new(),
-                    warnings: vec!["interrupted by Ctrl+C".into()],
-                    failed_parts: Vec::new(),
-                    parts_total: 0,
-                    deliveries: Vec::new(),
-                    stages: Vec::new(),
-                    last_stage_len: 0,
-                };
+                // A cancelled chain's upstream artifacts were already paid
+                // for, so their bytes travel into the record exactly like
+                // the failure path's — `keep_artifacts` is what makes
+                // save_generation write them at all.
                 best_effort(
-                    history::save_generation(&record, false),
+                    history::save_generation(&cancelled_record(&p), kept > 0),
                     "failed to record the interrupted run",
                 );
             }
         }
         None => eprintln!("interrupted"),
+    }
+}
+
+/// The cancelled-run record. A chain's completed upstream stages travel in
+/// it; the interrupted stage contributed nothing, so `last_stage_len`
+/// stays 0 — and stays meaningless, since a cancelled record is never
+/// redelivered (`aido last` and `history show` restore complete
+/// generations only).
+fn cancelled_record(p: &PendingRun) -> RunRecord {
+    let kept = !p.chain_artifacts.is_empty();
+    RunRecord {
+        run_id: p.run_id.clone(),
+        task: p.task.clone(),
+        created_at: p.created_at.clone(),
+        summary: p.summary.clone(),
+        generation: GenerationStatus::Cancelled,
+        artifacts: p.chain_artifacts.clone(),
+        warnings: vec![if kept {
+            "interrupted by Ctrl+C; the completed stages' artifacts are kept \
+             in this record"
+                .into()
+        } else {
+            "interrupted by Ctrl+C".into()
+        }],
+        failed_parts: Vec::new(),
+        parts_total: 0,
+        deliveries: Vec::new(),
+        stages: p.chain_stages.clone(),
+        last_stage_len: 0,
     }
 }
 
@@ -269,6 +305,8 @@ async fn dispatch(
             created_at: now_iso(),
             summary: plan::summarize(&plan),
             record_history,
+            chain_artifacts: Vec::new(),
+            chain_stages: Vec::new(),
         });
     }
 
@@ -549,11 +587,36 @@ async fn run_chain(
                     created_at: now_iso(),
                     summary,
                     record_history,
+                    chain_artifacts: Vec::new(),
+                    chain_stages: Vec::new(),
                 });
             }
         }
     };
-    let run = chain::execute(&chain, &cfg, terminal, &mut env, &mut on_started).await?;
+    // After each completed upstream stage, snapshot what the chain has
+    // paid for into the pending placeholder: a Ctrl+C during a later
+    // stage's request then records those artifacts instead of losing them
+    // with the dispatched future (which is dropped where it awaits).
+    let mut on_progress = {
+        let state = Arc::clone(&state);
+        move |artifacts: &[Artifact], stages: &[RunSummary]| {
+            if let Ok(mut s) = state.lock() {
+                if let Some(p) = s.pending.as_mut() {
+                    p.chain_artifacts = artifacts.to_vec();
+                    p.chain_stages = stages.to_vec();
+                }
+            }
+        }
+    };
+    let run = chain::execute(
+        &chain,
+        &cfg,
+        terminal,
+        &mut env,
+        &mut on_started,
+        &mut on_progress,
+    )
+    .await?;
     if let Ok(mut s) = state.lock() {
         s.pending = None;
     }
@@ -1047,5 +1110,59 @@ mod tests {
     fn iso_dates_match_calendar() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20705), (2026, 9, 9));
+    }
+
+    fn pending_with_chain() -> PendingRun {
+        PendingRun {
+            run_id: "20260919-120000.000".into(),
+            task: Some("summarize|translate".into()),
+            created_at: "2026-09-19T12:00:00Z".into(),
+            summary: RunSummary::default(),
+            record_history: true,
+            chain_artifacts: vec![Artifact {
+                id: "summarize".into(),
+                kind: MediaKind::Text,
+                mime: "text/plain".into(),
+                format: "text".into(),
+                bytes: b"stage one".to_vec(),
+                provenance: crate::domain::Provenance::Request { index: 0 },
+            }],
+            chain_stages: vec![RunSummary {
+                task: Some("summarize".into()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn cancelled_record_keeps_completed_chain_stages() {
+        let record = cancelled_record(&pending_with_chain());
+        assert_eq!(record.generation, GenerationStatus::Cancelled);
+        // The paid-for upstream artifact travels with its bytes, and the
+        // stage list describes the run; the interrupted final stage owns
+        // none of it (last_stage_len 0 — cancelled never redelivers).
+        assert_eq!(record.artifacts.len(), 1);
+        assert_eq!(record.artifacts[0].text(), Some("stage one"));
+        assert_eq!(record.stages.len(), 1);
+        assert_eq!(record.stages[0].task.as_deref(), Some("summarize"));
+        assert_eq!(record.last_stage_len, 0);
+        assert!(
+            record.warnings[0].contains("kept in this record"),
+            "{:?}",
+            record.warnings
+        );
+    }
+
+    #[test]
+    fn cancelled_record_without_chain_progress_keeps_the_bare_shape() {
+        let pending = PendingRun {
+            chain_artifacts: Vec::new(),
+            chain_stages: Vec::new(),
+            ..pending_with_chain()
+        };
+        let record = cancelled_record(&pending);
+        assert_eq!(record.generation, GenerationStatus::Cancelled);
+        assert!(record.artifacts.is_empty() && record.stages.is_empty());
+        assert_eq!(record.warnings, vec!["interrupted by Ctrl+C"]);
     }
 }

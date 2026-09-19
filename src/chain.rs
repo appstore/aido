@@ -365,12 +365,18 @@ pub struct ChainRun {
 /// first stage that fails ends the chain: artifacts already produced
 /// travel in the returned output (history keeps them), the failure
 /// carries the stage's name, and no later stage sends anything.
+///
+/// `on_started` fires once before the first request (the interrupted-run
+/// placeholder); `on_progress` fires after each completed upstream stage
+/// with everything paid for so far, so a Ctrl+C mid-chain can record the
+/// earlier stages' artifacts instead of dropping them with the future.
 pub async fn execute(
     chain: &PreparedChain,
     cfg: &Config,
     terminal: TerminalInfo,
     env: &mut InputEnv<'_>,
     on_started: &mut dyn FnMut(RunSummary),
+    on_progress: &mut dyn FnMut(&[Artifact], &[RunSummary]),
 ) -> AppResult<ChainRun> {
     let n = chain.stages.len();
     let mut all_artifacts: Vec<Artifact> = Vec::new();
@@ -532,6 +538,15 @@ pub async fn execute(
                 failure,
             ));
         }
+        // Snapshot for the Ctrl+C placeholder: every stage up to here
+        // completed, so its artifacts are paid for. Only upstream stages
+        // snapshot — after the final stage there is no await point left
+        // inside the chain, so a cancel can no longer land there.
+        if !is_last {
+            let mut kept = all_artifacts.clone();
+            kept.extend(prev_artifacts.iter().cloned());
+            on_progress(&kept, &summaries);
+        }
         if !is_last {
             // A stage can finish "cleanly" with the wrong shape — an
             // empty reply produces no artifact at all. The junction needs
@@ -609,9 +624,13 @@ fn stopped_chain(
 ) -> ChainRun {
     let stage_len = stage_artifacts.len();
     artifacts.extend(stage_artifacts);
-    warnings.push(format!(
-        "{reason}; the earlier stages' artifacts are kept in history"
-    ));
+    // The promise needs history to be on: with --no-history (or a zero
+    // keep budget) nothing is written, and the warning must not claim it.
+    if plan.record_history {
+        warnings.push(format!(
+            "{reason}; the earlier stages' artifacts are kept in history"
+        ));
+    }
     // The failed stage's own artifacts are the trailing slice (empty when
     // it produced nothing). An incomplete record is never restored for
     // delivery, so the value only describes the record.
