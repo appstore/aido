@@ -7,8 +7,12 @@ mod support;
 
 use support::*;
 
+// The daemon harness (spawn, signal, stderr reading) is Unix-only; on
+// Windows the cross-platform tests below still compile and run.
+#[cfg(unix)]
 use std::io::{BufRead as _, Read as _};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -978,9 +982,15 @@ fn watch_task_resolution_matches_a_plain_run() {
             outcome.stdout()
         );
     }
+}
 
-    // The clipboard needs a terminal; with one, even the flag-first
-    // spelling with --copy passes the precheck.
+/// The clipboard needs a terminal, so the `--copy` spelling of the
+/// flag-first form is a Unix pty case (the PTY helpers are Unix-only).
+#[cfg(unix)]
+#[test]
+fn watch_flag_first_copy_resolution_matches_plain_run() {
+    let cfg = watch_config(1);
+    let guard = temp_dir("watch-resolution-copy");
     let outcome = run_full_tty(
         &[
             "watch",
@@ -993,7 +1003,7 @@ fn watch_task_resolution_matches_a_plain_run() {
             "test",
         ],
         &[],
-        cfg.clone(),
+        cfg,
     );
     outcome.assert_code(0);
     assert!(

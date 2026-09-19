@@ -961,7 +961,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    // Linux only: macOS filesystems reject raw non-UTF-8 name bytes
+    // outright ("Illegal byte sequence"), so the fixture cannot exist
+    // there — the behavior under test is a raw-bytes property, not a
+    // scan_dir bug to work around.
+    #[cfg(target_os = "linux")]
     #[test]
     fn scan_dir_keeps_non_utf8_names_sorted_by_raw_bytes() {
         use std::os::unix::ffi::OsStrExt as _;
