@@ -613,20 +613,31 @@ fn queued_file_is_rechecked_after_the_previous_run() {
     let out = temp_dir("watch-queue-out");
     let history = temp_dir("watch-queue-hist");
     let cfg = watch_config(port);
+
+    // Both files exist before the daemon starts. --include-existing keeps
+    // them eligible, so the first scan sees both together and gives them
+    // the same pending timestamp: after the 800 ms window both are ready
+    // in the same listing — the exact condition the old queued-ready
+    // TOCTOU needed. Files written after `ready()` could land in
+    // different listings (a scan between the two writes), and then b
+    // would not be ready when a fired, so the bug under test would not
+    // deterministically reproduce.
+    std::fs::write(guard.join("a.txt"), b"one").unwrap();
+    std::fs::write(guard.join("b.txt"), b"two").unwrap();
+
     let mut watch = spawn_watch(
-        &args_of(&watch_args(&guard, &out, &["--stable-ms", "800"])),
+        &args_of(&watch_args(
+            &guard,
+            &out,
+            &["--stable-ms", "800", "--include-existing"],
+        )),
         &cfg,
         &history,
     );
     watch.ready();
 
-    // Both files are on disk before either settles, so one listing makes
-    // them ready together: a (lexically first) fires, and while its run
-    // blocks the daemon, b keeps growing.
-    std::fs::write(guard.join("a.txt"), b"one").unwrap();
-    std::fs::write(guard.join("b.txt"), b"two").unwrap();
-
-    // a's request is in flight; hold it unanswered.
+    // a is lexically first, so it is the ready file that fires; hold its
+    // request unanswered.
     let mut first = accept(&listener, Instant::now() + Duration::from_secs(15));
     first.set_nonblocking(false).unwrap();
     let raw1 = read_request(&mut first);
