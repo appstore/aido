@@ -213,7 +213,61 @@ fn flag_arity(token: &str) -> Option<bool> {
 /// truth, and this scan mirrors exactly which tokens the normalizer
 /// consumes as values.
 pub(crate) fn argv_wants_json() -> bool {
-    wants_json_in(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    wants_json_before_normalize(&std::env::args_os().skip(1).collect::<Vec<_>>())
+}
+
+/// The pre-normalize `--json` judgment: the top-level argv scan, plus the
+/// chain spec string — a single shell token whose inside only the chain
+/// tokenizer can see. `normalize` itself can fail while parsing that spec
+/// (an unknown task, a bad stage), and its error must honor the same JSON
+/// contract the run would have had. Normalize success re-judges on the
+/// normalized stage lists ([`Normalized::wants_json`]), which stays the
+/// authority.
+fn wants_json_before_normalize(argv: &[OsString]) -> bool {
+    wants_json_in(argv) || chain_spec_wants_json(argv)
+}
+
+/// Whether a `chain "<spec>"` sugar argv carries a real `--json` flag
+/// inside its spec string. The sugar shape is found with the same
+/// arity-aware walk the normalizer uses (first free token `chain`, second
+/// free token the spec), the spec goes through the real tokenizer, and
+/// each stage's tokens get the ordinary flag scan. Never a substring
+/// check: in `summarize -p --json` the flag is a prompt, not a request
+/// for JSON.
+fn chain_spec_wants_json(argv: &[OsString]) -> bool {
+    if !first_free_is_chain(argv) {
+        return false;
+    }
+    let mut free_seen = 0usize;
+    let mut iter = argv.iter();
+    while let Some(token) = iter.next() {
+        let Some(t) = token.to_str() else { continue };
+        if t == "--" {
+            // Past the separator everything is literal material.
+            return false;
+        }
+        match flag_arity(t) {
+            Some(true) if !value_attached(t) => {
+                iter.next(); // the flag's value can never be the spec
+                continue;
+            }
+            Some(_) => continue,
+            None => {}
+        }
+        free_seen += 1;
+        if free_seen == 2 {
+            // The spec string, in the position the normalizer reads it.
+            return match tokenize_chain_spec(t) {
+                Ok(stages) => stages.iter().any(|tokens| {
+                    wants_json_in(&tokens.iter().map(OsString::from).collect::<Vec<_>>())
+                }),
+                // A spec that cannot tokenize gets its plain error; the
+                // scan only decides the error's format.
+                Err(_) => false,
+            };
+        }
+    }
+    false
 }
 
 /// The argv scan behind [`argv_wants_json`], over an explicit slice so
@@ -1724,6 +1778,58 @@ mod tests {
         // `-p` swallows the separator as its value, so a later --json
         // still parses as the flag — the normalizer consumes it too.
         assert!(wants_json_in(&os(&["-p", "--", "--json"])));
+    }
+
+    /// The pre-normalize scan sees `--json` inside the chain spec — one
+    /// shell token — so a normalize-time error (an unknown task) still
+    /// prints the JSON envelope. The judgment goes through the real
+    /// tokenizer and the arity-aware flag scan, never a substring check.
+    #[test]
+    fn raw_json_scan_sees_json_inside_chain_spec() {
+        assert!(wants_json_before_normalize(&os(&[
+            "chain",
+            "summarize --json | transalte",
+            "--text",
+            "hi",
+        ])));
+        // The --then form is top-level tokens; the plain scan covers it.
+        assert!(wants_json_before_normalize(&os(&[
+            "summarize",
+            "--then",
+            "translate",
+            "--json",
+        ])));
+        // A flag outside the spec still counts, spec or not.
+        assert!(wants_json_before_normalize(&os(&[
+            "chain",
+            "summarize | translate",
+            "--json",
+        ])));
+    }
+
+    #[test]
+    fn raw_json_scan_ignores_json_used_as_stage_flag_value() {
+        // `-p` swallows "--json" as its prompt, inside the spec or out.
+        assert!(!wants_json_before_normalize(&os(&[
+            "chain",
+            "summarize -p --json | transalte",
+            "--text",
+            "hi",
+        ])));
+        assert!(!wants_json_before_normalize(&os(&[
+            "chain",
+            "summarize | translate -p --json",
+            "--text",
+            "hi",
+        ])));
+        // No chain sugar, no spec to look into.
+        assert!(!wants_json_before_normalize(&os(&[
+            "summarize",
+            "--text",
+            "hi"
+        ])));
+        // The chain word without a spec never reaches the tokenizer.
+        assert!(!wants_json_before_normalize(&os(&["chain", "--help"])));
     }
 
     #[cfg(unix)]

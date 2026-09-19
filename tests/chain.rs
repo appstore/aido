@@ -1389,3 +1389,50 @@ fn chain_help_and_version_need_no_config() {
         out.stderr()
     );
 }
+
+/// A normalize-time error (an unknown task, found while walking the
+/// stages) happens before `Normalized::wants_json()` can run, so the raw
+/// argv scan must see the spec's `--json` itself — the error envelope,
+/// not plain text.
+#[test]
+fn chain_json_inside_spec_formats_normalize_errors_as_json() {
+    let out = run_with(
+        &["chain", "summarize --json | transalte", "--text", "hi"],
+        b"",
+        &[],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}; stdout: {}", out.stdout()));
+    assert_eq!(report["error"]["kind"], "usage", "{report}");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown task 'transalte'")),
+        "{report}"
+    );
+}
+
+/// A `--json` that is a stage's prompt value is not a request for JSON:
+/// the normalize error stays plain text.
+#[test]
+fn json_used_as_prompt_does_not_format_normalize_errors_as_json() {
+    let out = run_with(
+        &["chain", "summarize -p --json | transalte", "--text", "hi"],
+        b"",
+        &[],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&out.stdout()).is_err(),
+        "stdout must not be JSON: {}",
+        out.stdout()
+    );
+    assert!(
+        out.stderr().contains("unknown task 'transalte'"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
