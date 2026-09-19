@@ -256,6 +256,8 @@ fn args_of(parts: &[String]) -> Vec<&str> {
 /// after the sanitized input file name plus a short hash of the raw name,
 /// so a test matches on the readable prefix. (`a.b` and `a-b` share a
 /// prefix — that is the collision case; count or read contents there.)
+/// Unix-only: only the daemon tests assert on artifact names.
+#[cfg(unix)]
 fn watch_artifacts(out: &std::path::Path, input: &str) -> Vec<std::path::PathBuf> {
     let readable: String = input
         .chars()
