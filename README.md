@@ -193,7 +193,7 @@ aido watch DIR -- <TASK> [FLAGS]     # 目录守护：新文件自动执行任�
 
 ```bash
 aido watch ~/shots -- ocr --copy                # 截图收件箱：OCR 文字自动进剪贴板
-aido watch recordings --out-dir trans/ -- transcribe   # 录音收件箱：转写自动归档
+aido watch recordings -- transcribe --out-dir trans/   # 录音收件箱：转写自动归档
 aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素材流水线前置
 ```
 
@@ -211,12 +211,12 @@ aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素
 
 - **启动即预检**：任务解析、能力交集、交付目标、凭据在进入守护前全部校验，任何一项失败 exit 2，不守护。
 - **交付去向必须显式**：任务调用必须带 `--copy` 或 `--out-dir`（守护模式下 stdout 无人看）；`-o` 不允许（一个固定文件接不住不断到来的结果）；任务调用也不能依赖 stdin。`--out-dir` 不得就是守护目录本身（产物会再次触发守护）。
-- **产物按输入文件命名**：`shots/a.png` 的结果落在 `--out-dir` 里叫 `a.txt`（与逐文件批处理的命名一致），不同文件互不覆盖；守护交付恒为覆盖写——`manifest.json` 只记录最近一次运行，同名输入重复到达（如重启守护后）以最新结果为准。
+- **产物按输入文件命名且互不覆盖**：`shots/a.png` 的结果落在 `--out-dir` 里叫 `a-png--<hash>.txt`（完整文件名经 sanitize 后再加一段由原始文件名算出的短哈希），任何两个不同输入都不会静默写到同一个文件；守护交付恒为覆盖写——`manifest.json` 只记录最近一次运行，同一输入重复到达（如重启守护后）以最新结果为准。
 - **任务 flags 只能在 `--` 之后**：出现在 `--` 之前直接报错——任务调用按文件逐次重放解析，位置决定含义的写法是个坑；`--dry-run`/`--help`/`--version` 同理只能用在 `--` 之前（逐文件执行它们等于什么都没交付就标记完成）。
 - **去抖**：编辑器、scp 等增量写入按「大小稳定 N ms」去抖，写完只触发一次；点文件与子目录不触发（与目录输入的展开规则一致）。
 - **失败不重试**：单个文件失败（类型不符、服务 5xx 等）stderr 记一行后守护继续；已处理文件被原地修改或同名重建不会重新处理（重启守护即重置）。
 - **每文件一行结果**：`[watch] shot.png → ocr: done` / `[watch] … → ocr: failed (not retried; still watching): …`，stderr 为终端时附加一声响铃（`--quiet` 关闭全部提示）。
-- **退出**：Ctrl+C / SIGTERM → exit 130，在途文件按取消记入历史；守护目录暂时不可读只警告一次，恢复后继续。
+- **退出**：Ctrl+C / SIGTERM → exit 130，在途文件按取消记入历史（history 的 warning 写明实际信号）；守护目录暂时不可读只警告一次，恢复后继续（启动时建立初始文件清单失败则 exit 2，不守护）。
 
 ## 配置：Provider / Profile / Task 三层
 

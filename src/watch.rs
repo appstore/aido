@@ -67,9 +67,16 @@ pub(crate) async fn run(
 
     // Startup inventory is seeded before the banner goes out: the banner
     // is the deterministic "now everything already on disk counts as
-    // history, everything arriving next is a fresh file" mark.
+    // history, everything arriving next is a fresh file" mark. The
+    // baseline must be real: treating a failed scan as an empty directory
+    // would replay every old file once the directory is readable again.
     let bell = bell_enabled(cli.quiet, std::io::stderr().is_terminal());
-    let existing = scan_dir(&guard).unwrap_or_default();
+    let existing = scan_dir(&guard).map_err(|e| {
+        AppError::usage(format!(
+            "cannot read watch directory '{}': {e}",
+            args.dir.display()
+        ))
+    })?;
     let mut watched = WatchState::new(stable, existing, args.include_existing);
     let mut unreadable = false;
 
@@ -92,7 +99,7 @@ pub(crate) async fn run(
                         eprintln!("watch: '{}' is readable again", args.dir.display());
                     }
                 }
-                for path in watched.scan(std::time::Instant::now(), &files) {
+                if let Some(path) = watched.next_ready(std::time::Instant::now(), &files) {
                     let outcome = run_one(cli, &args, &path, &state).await;
                     // Failed or not, the file is done: a watch never
                     // retries (a broken input stays broken), it keeps
@@ -103,6 +110,11 @@ pub(crate) async fn run(
                     };
                     announce(&path, &probe.task_name, failure, cli.quiet, bell);
                     watched.mark_done(&path);
+                    // No sleep before the next verdict: the loop folds a
+                    // fresh listing in immediately, so a file that grew
+                    // while this one ran is re-debounced on new stats
+                    // instead of riding an older listing's ready verdict.
+                    continue;
                 }
             }
             Err(e) => {
@@ -128,22 +140,52 @@ pub(crate) async fn run(
 /// file appended (after `--`, so no glob expansion and no flag confusion)
 /// and hand it to the shared pipeline. The parent's `--quiet`/`--json`
 /// ride along; `--dry-run` never reaches a file (it exits before the loop).
-/// The artifacts are named after the file (shot.png → shot.txt) so one
-/// `--out-dir` collects a stream of results instead of one `text.txt`.
+/// The artifacts are named after the file (shot.png →
+/// shot-txt--<hash>.txt) so one `--out-dir` collects a stream of results
+/// instead of one `text.txt`.
 async fn run_one(
     cli: &Cli,
     args: &WatchArgs,
     path: &Path,
     state: &Arc<std::sync::Mutex<RunState>>,
 ) -> AppResult<()> {
-    let (mut file_cli, task_name, specs) = build_invocation(&args.task_argv, path)?;
-    file_cli.quiet |= cli.quiet;
-    file_cli.json |= cli.json;
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_string);
-    run_task(&file_cli, task_name, specs, state, stem.as_deref()).await
+    let mut invocation = build_invocation(&args.task_argv, path)?;
+    invocation.cli.quiet |= cli.quiet;
+    invocation.cli.json |= cli.json;
+    let stem = watch_artifact_stem(path);
+    run_task(
+        &invocation.cli,
+        invocation.task_name,
+        invocation.specs,
+        state,
+        stem.as_deref(),
+    )
+    .await
+}
+
+/// The artifact stem for one watched file: the sanitized full file name
+/// plus a short hash of the raw name (`report.png` →
+/// `report-png--31bd41af`). Two inputs must never land on one artifact:
+/// bare stems collide (`report.png`/`report.jpg` share `report`), and even
+/// full names collide once sanitized (`a.b` and `a-b` both become `a-b`),
+/// so the raw bytes go into a stable FNV-1a suffix. The hash identifies,
+/// it does not protect — no crate, no secrets.
+fn watch_artifact_stem(path: &Path) -> Option<String> {
+    let name = path.file_name()?;
+    let readable = crate::output::sanitize_stem(&name.to_string_lossy());
+    let hash = fnv1a64(name.as_encoded_bytes());
+    Some(format!("{readable}--{:08x}", (hash & 0xffff_ffff) as u32))
+}
+
+/// FNV-1a 64-bit, hand-rolled: the std hashers are keyed and deliberately
+/// not stable across releases, and this hash only has to be stable.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// The one-line outcome of one watched file, plus a terminal bell: in the
@@ -210,15 +252,11 @@ struct Probe {
 /// credentials are all validated before the daemon settles in. The probe
 /// is a placeholder input standing in for each arriving file.
 fn probe(cli: &Cli, args: &WatchArgs, guard: &Path) -> AppResult<Probe> {
-    // The task name is the invocation's first word — resolve it early to
-    // pick probe content the task would accept. A non-UTF-8 word cannot
-    // be a task name; tasks::get then says so instead of this function.
-    let first = args
-        .task_argv
-        .first()
-        .map(|t| t.to_string_lossy().into_owned())
-        .ok_or_else(|| AppError::usage("watch needs a task after the `--` separator"))?;
-    let task = tasks::get(&first).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    // The task is whoever the normalizer says it is — the same parse the
+    // per-file runs go through, so a form a plain run accepts (`--copy
+    // ocr`, `run ocr`, an implicit `-p` ask) cannot be refused here.
+    let invocation = parse_task_invocation(args.task_argv.clone())?;
+    let task = tasks::get(&invocation.task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
 
     // Try the task's own input kinds first, then every kind: the probe
     // content must classify as something the task (and its profile) takes,
@@ -260,36 +298,40 @@ fn probe_plan(
     guard: &Path,
     probe_path: &Path,
 ) -> AppResult<plan::ExecutionPlan> {
-    let (mut file_cli, task_name, specs) = build_invocation(&args.task_argv, probe_path)?;
-    file_cli.quiet |= cli.quiet;
-    file_cli.json |= cli.json;
+    let mut invocation = build_invocation(&args.task_argv, probe_path)?;
+    invocation.cli.quiet |= cli.quiet;
+    invocation.cli.json |= cli.json;
 
     // Task-level shape the plan build does not check: `ask` without -p
     // would start a watch that fails every file.
-    crate::app::require_ask_prompt(&file_cli, &task_name)?;
+    crate::app::require_ask_prompt(&invocation.cli, &invocation.task_name)?;
 
     // Delivery must be explicit: a watched task's stdout has no audience,
     // and `-o` names one fixed file that every arrival would fight over.
-    if file_cli.output.is_some() {
+    if invocation.cli.output.is_some() {
         return Err(AppError::usage(
             "a watched task cannot use -o (one fixed file cannot take a result per \
              arriving file); use --out-dir",
         ));
     }
-    if !file_cli.copy && file_cli.out_dir.is_none() {
+    if !invocation.cli.copy && invocation.cli.out_dir.is_none() {
         return Err(AppError::usage(
             "watch needs an explicit delivery destination: pass --copy or --out-dir \
              to the task after the `--` separator",
         ));
     }
-    if specs.iter().any(|s| matches!(s, SourceSpec::Stdin)) {
+    if invocation
+        .specs
+        .iter()
+        .any(|s| matches!(s, SourceSpec::Stdin))
+    {
         return Err(AppError::usage(
             "a watched task cannot read stdin; drop the `-` input",
         ));
     }
     // Artifacts landing in the guarded directory itself would re-trigger
     // the watch; a subdirectory of it is fine (the scan never descends).
-    if let Some(out_dir) = &file_cli.out_dir {
+    if let Some(out_dir) = &invocation.cli.out_dir {
         if absolute(out_dir) == guard {
             return Err(AppError::usage(format!(
                 "--out-dir '{}' is the watched directory; the outputs would \
@@ -299,11 +341,18 @@ fn probe_plan(
         }
     }
 
-    let task = tasks::get(&task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    let task = tasks::get(&invocation.task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo::real();
     let mut env = InputEnv::real();
-    let plan = plan::build(&file_cli, &task, &specs, &cfg, terminal, &mut env)?;
+    let plan = plan::build(
+        &invocation.cli,
+        &task,
+        &invocation.specs,
+        &cfg,
+        terminal,
+        &mut env,
+    )?;
 
     if plan.credentials_available == Some(false) {
         let env_var = plan
@@ -319,35 +368,54 @@ fn probe_plan(
     Ok(plan)
 }
 
-/// Normalize and clap-parse the per-file invocation with `file` appended:
-/// the exact parse a real run will do, so the precheck cannot bless
-/// something the loop would reject. Watched deliveries always overwrite:
-/// the daemon reuses one `--out-dir` across runs, and the ordinary
-/// no-clobber preflights (an existing `manifest.json`, an existing
-/// artifact) would refuse every arrival after the first.
-fn build_invocation(
-    task_argv: &[OsString],
-    file: &Path,
-) -> AppResult<(Cli, String, Vec<SourceSpec>)> {
-    let mut argv: Vec<OsString> = task_argv.to_vec();
-    argv.push(OsString::from("--"));
-    argv.push(file.as_os_str().to_os_string());
+/// A fully parsed task invocation: the clap `Cli` a run will use, the task
+/// name the normalizer resolved, and the input specs.
+struct TaskInvocation {
+    cli: Cli,
+    task_name: String,
+    specs: Vec<SourceSpec>,
+}
+
+/// Parse a task invocation exactly the way a plain run parses it: the
+/// normalizer decides which token names the task (so `--copy ocr`, `run
+/// ocr` and an implicit `-p` ask all work), then clap parses the flags.
+/// The watch layer adds no parsing rules of its own — the startup precheck
+/// and the per-file runs must never disagree about what an invocation
+/// means.
+fn parse_task_invocation(argv: Vec<OsString>) -> AppResult<TaskInvocation> {
     let normalized = cli::normalize(argv).map_err(|e| AppError::usage(format!("{e:#}")))?;
-    let mut file_cli =
+    let cli =
         Cli::try_parse_from(std::iter::once(OsString::from("aido")).chain(normalized.argv.clone()))
             .map_err(|e| AppError::usage(e.to_string()))?;
-    file_cli.overwrite = true;
     if normalized.watch.is_some() {
         return Err(AppError::usage("a watched task cannot be another watch"));
     }
     let task_name = normalized
         .task
         .clone()
-        .or_else(|| file_cli.task.clone())
+        .or_else(|| cli.task.clone())
         .ok_or_else(|| {
             AppError::usage("the word after `watch DIR --` must be a task (see `aido tasks list`)")
         })?;
-    Ok((file_cli, task_name, normalized.specs))
+    Ok(TaskInvocation {
+        cli,
+        task_name,
+        specs: normalized.specs,
+    })
+}
+
+/// The per-file invocation: the task argv with `file` appended after `--`,
+/// parsed by [`parse_task_invocation`]. Watched deliveries always
+/// overwrite: the daemon reuses one `--out-dir` across runs, and the
+/// ordinary no-clobber preflights (an existing `manifest.json`, an
+/// existing artifact) would refuse every arrival after the first.
+fn build_invocation(task_argv: &[OsString], file: &Path) -> AppResult<TaskInvocation> {
+    let mut argv: Vec<OsString> = task_argv.to_vec();
+    argv.push(OsString::from("--"));
+    argv.push(file.as_os_str().to_os_string());
+    let mut invocation = parse_task_invocation(argv)?;
+    invocation.cli.overwrite = true;
+    Ok(invocation)
 }
 
 /// Probe content for each kind — magic bytes only: the gather-time
@@ -488,7 +556,7 @@ fn scan_dir(dir: &Path) -> std::io::Result<Vec<(PathBuf, u64)>> {
 }
 
 /// Debounce bookkeeping for one guarded directory. Pure state over an
-/// injected clock: `scan` decides which files are ready to run, and the
+/// injected clock: `next_ready` decides which file runs next, and the
 /// daemon only executes what it returns — so timing behavior is unit-test
 /// territory, not daemon-loop territory.
 struct WatchState {
@@ -524,14 +592,17 @@ impl WatchState {
         state
     }
 
-    /// Fold one directory listing in and return the files that just
-    /// became ready: new files start pending, a size change resets the
-    /// stability clock, a file that held still long enough fires once.
+    /// Fold one directory listing in and return the one file to run next,
+    /// if any: new files start pending, a size change resets the stability
+    /// clock, a file that held still long enough fires. At most one file
+    /// leaves per call — the daemon runs it, marks it done and folds the
+    /// next listing in, so a file that changed while an earlier file ran
+    /// is judged on fresh stats, never on an older listing's verdict.
     /// Pending files that vanished are dropped silently.
-    fn scan(&mut self, now: std::time::Instant, files: &[(PathBuf, u64)]) -> Vec<PathBuf> {
+    fn next_ready(&mut self, now: std::time::Instant, files: &[(PathBuf, u64)]) -> Option<PathBuf> {
         let seen: HashSet<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
         self.pending.retain(|p, _| seen.contains(p.as_path()));
-        let mut ready = Vec::new();
+        let mut ready: Option<PathBuf> = None;
         for (path, size) in files {
             if self.done.contains(path) {
                 continue;
@@ -542,8 +613,15 @@ impl WatchState {
                         pending.size = *size;
                         pending.changed = now;
                     }
-                    if now.duration_since(pending.changed) >= self.stable {
-                        ready.push(path.clone());
+                    // Lexically smallest first, so processing order never
+                    // depends on the caller's listing order (scan_dir
+                    // sorts; the state machine does not trust that).
+                    if now.duration_since(pending.changed) >= self.stable
+                        && ready
+                            .as_ref()
+                            .is_none_or(|current| path.as_path() < current.as_path())
+                    {
+                        ready = Some(path.clone());
                     }
                 }
                 None => {
@@ -557,9 +635,6 @@ impl WatchState {
                 }
             }
         }
-        // Sorted so processing order never depends on the caller's listing
-        // order (scan_dir sorts; the state machine does not trust that).
-        ready.sort();
         ready
     }
 
@@ -584,20 +659,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         // First sighting only starts the clock; the daemon's mark_done
         // models the run that follows a ready file.
-        assert!(state.scan(t0, &entries(&["a.png"])).is_empty());
+        assert!(state.next_ready(t0, &entries(&["a.png"])).is_none());
         // Still inside the window.
         assert!(state
-            .scan(t0 + Duration::from_millis(499), &entries(&["a.png"]))
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(499), &entries(&["a.png"]))
+            .is_none());
         // Window elapsed: exactly once.
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(500), &entries(&["a.png"])),
-            vec![PathBuf::from("a.png")]
+            state.next_ready(t0 + Duration::from_millis(500), &entries(&["a.png"])),
+            Some(PathBuf::from("a.png"))
         );
         state.mark_done(Path::new("a.png"));
         assert!(state
-            .scan(t0 + Duration::from_millis(600), &entries(&["a.png"]))
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(600), &entries(&["a.png"]))
+            .is_none());
     }
 
     #[test]
@@ -607,18 +682,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         let one = vec![(PathBuf::from("a.png"), 1)];
         let two = vec![(PathBuf::from("a.png"), 2)];
-        assert!(state.scan(t0, &one).is_empty());
+        assert!(state.next_ready(t0, &one).is_none());
         // Growing every 300 ms keeps it pending forever.
-        assert!(state.scan(t0 + Duration::from_millis(300), &two).is_empty());
         assert!(state
-            .scan(t0 + Duration::from_millis(600), &entries(&["a.png"]))
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(300), &two)
+            .is_none());
         assert!(state
-            .scan(t0 + Duration::from_millis(899), &entries(&["a.png"]))
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(600), &entries(&["a.png"]))
+            .is_none());
+        assert!(state
+            .next_ready(t0 + Duration::from_millis(899), &entries(&["a.png"]))
+            .is_none());
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(1100), &entries(&["a.png"])),
-            vec![PathBuf::from("a.png")]
+            state.next_ready(t0 + Duration::from_millis(1100), &entries(&["a.png"])),
+            Some(PathBuf::from("a.png"))
         );
     }
 
@@ -627,16 +704,18 @@ mod tests {
         let stable = Duration::from_millis(100);
         let mut state = WatchState::new(stable, Vec::new(), false);
         let t0 = std::time::Instant::now();
-        assert!(state.scan(t0, &entries(&["a.png"])).is_empty());
+        assert!(state.next_ready(t0, &entries(&["a.png"])).is_none());
         // Gone before it settled: no trigger either way.
-        assert!(state.scan(t0 + Duration::from_millis(50), &[]).is_empty());
+        assert!(state
+            .next_ready(t0 + Duration::from_millis(50), &[])
+            .is_none());
         // Back again: a fresh file with a fresh clock.
         assert!(state
-            .scan(t0 + Duration::from_millis(60), &entries(&["a.png"]))
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(60), &entries(&["a.png"]))
+            .is_none());
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(200), &entries(&["a.png"])),
-            vec![PathBuf::from("a.png")]
+            state.next_ready(t0 + Duration::from_millis(200), &entries(&["a.png"])),
+            Some(PathBuf::from("a.png"))
         );
     }
 
@@ -646,16 +725,16 @@ mod tests {
         let existing = entries(&["old.txt"]);
         let mut state = WatchState::new(stable, existing.clone(), false);
         let t0 = std::time::Instant::now();
-        assert!(state.scan(t0, &existing).is_empty());
+        assert!(state.next_ready(t0, &existing).is_none());
         assert!(state
-            .scan(t0 + Duration::from_millis(1), &existing)
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(1), &existing)
+            .is_none());
 
         let mut state = WatchState::new(stable, existing.clone(), true);
-        assert!(state.scan(t0, &existing).is_empty());
+        assert!(state.next_ready(t0, &existing).is_none());
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(1), &existing),
-            vec![PathBuf::from("old.txt")]
+            state.next_ready(t0 + Duration::from_millis(1), &existing),
+            Some(PathBuf::from("old.txt"))
         );
     }
 
@@ -667,34 +746,108 @@ mod tests {
         let mut state = WatchState::new(stable, Vec::new(), false);
         let t0 = std::time::Instant::now();
         let files = entries(&["a.png"]);
-        assert!(state.scan(t0, &files).is_empty());
+        assert!(state.next_ready(t0, &files).is_none());
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(1), &files),
-            vec![PathBuf::from("a.png")]
+            state.next_ready(t0 + Duration::from_millis(1), &files),
+            Some(PathBuf::from("a.png"))
         );
         state.mark_done(Path::new("a.png"));
         let bigger = vec![(PathBuf::from("a.png"), 99)];
         assert!(state
-            .scan(t0 + Duration::from_millis(2), &bigger)
-            .is_empty());
+            .next_ready(t0 + Duration::from_millis(2), &bigger)
+            .is_none());
     }
 
     #[test]
-    fn two_files_fire_in_sorted_order_and_independently() {
+    fn two_ready_files_fire_one_per_listing_in_sorted_order() {
         let stable = Duration::from_millis(0);
         let mut state = WatchState::new(stable, Vec::new(), false);
         let t0 = std::time::Instant::now();
         let both = entries(&["b.png", "a.png"]);
-        assert!(state.scan(t0, &both).is_empty());
+        assert!(state.next_ready(t0, &both).is_none());
+        // One verdict per listing: the smallest ready path first...
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(1), &both),
-            vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
+            state.next_ready(t0 + Duration::from_millis(1), &both),
+            Some(PathBuf::from("a.png"))
         );
         state.mark_done(Path::new("a.png"));
+        // ...then the next one, judged on the same listing shape.
         assert_eq!(
-            state.scan(t0 + Duration::from_millis(2), &both),
-            vec![PathBuf::from("b.png")]
+            state.next_ready(t0 + Duration::from_millis(2), &both),
+            Some(PathBuf::from("b.png"))
         );
+    }
+
+    #[test]
+    fn a_file_that_grew_while_another_ran_redebounces() {
+        // a and b are ready in the same listing; a runs (the daemon is
+        // busy), b grows meanwhile. The next verdict must come from fresh
+        // stats: b re-waits its stability window instead of riding the old
+        // listing's ready verdict.
+        let stable = Duration::from_millis(500);
+        let mut state = WatchState::new(stable, Vec::new(), false);
+        let t0 = std::time::Instant::now();
+        // The daemon always folds in the whole directory listing.
+        let listing = |a_size: u64, b_size: u64| {
+            vec![
+                (PathBuf::from("a.txt"), a_size),
+                (PathBuf::from("b.txt"), b_size),
+            ]
+        };
+        assert!(state.next_ready(t0, &listing(1, 1)).is_none());
+        // Both settled by t0+500: a fires — one verdict per listing.
+        assert_eq!(
+            state.next_ready(t0 + Duration::from_millis(500), &listing(1, 1)),
+            Some(PathBuf::from("a.txt"))
+        );
+        state.mark_done(Path::new("a.txt"));
+        // While a ran, b grew; the next listing folds the growth in: b's
+        // clock resets...
+        assert!(state
+            .next_ready(t0 + Duration::from_millis(600), &listing(1, 2))
+            .is_none());
+        // ...and it stays pending until the fresh window elapses.
+        assert!(state
+            .next_ready(t0 + Duration::from_millis(1000), &listing(1, 2))
+            .is_none());
+        assert_eq!(
+            state.next_ready(t0 + Duration::from_millis(1100), &listing(1, 2)),
+            Some(PathBuf::from("b.txt"))
+        );
+    }
+
+    #[test]
+    fn artifact_stems_distinguish_what_stems_and_sanitizing_would_collapse() {
+        // Same stem, different extension: the classic collision.
+        let png = watch_artifact_stem(Path::new("shots/report.png")).unwrap();
+        let jpg = watch_artifact_stem(Path::new("shots/report.jpg")).unwrap();
+        assert_ne!(png, jpg);
+        // The readable part still reads like the input...
+        assert!(png.starts_with("report-png--"), "{png}");
+        // ...and the stem survives a second sanitizing unchanged, so the
+        // artifact name on disk is exactly this stem plus an extension.
+        assert_eq!(crate::output::sanitize_stem(&png), png);
+        // Names that sanitize to the same form stay distinct: the raw
+        // bytes are in the hash.
+        let dot = watch_artifact_stem(Path::new("a.b")).unwrap();
+        let dash = watch_artifact_stem(Path::new("a-b")).unwrap();
+        assert_ne!(dot, dash);
+        // The hash covers the raw name, so it is stable per input.
+        assert_eq!(
+            watch_artifact_stem(Path::new("shots/report.png")).unwrap(),
+            png
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_stem_survives_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"caf\xe9.png"));
+        let stem = watch_artifact_stem(&path).unwrap();
+        assert!(stem.starts_with("caf"), "{stem}");
+        // Distinct from every UTF-8 lookalike: the hash reads raw bytes.
+        assert_ne!(stem, watch_artifact_stem(Path::new("café.png")).unwrap());
     }
 
     #[test]

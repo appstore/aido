@@ -22,6 +22,22 @@ use std::sync::Arc;
 /// Exit code for "the user pressed Ctrl+C".
 pub const EXIT_CANCEL: i32 = 130;
 
+/// Why a run was cancelled: the history record names the signal that
+/// actually arrived instead of blaming Ctrl+C for everything.
+enum CancelReason {
+    CtrlC,
+    Sigterm,
+}
+
+impl CancelReason {
+    fn history_warning(self) -> &'static str {
+        match self {
+            Self::CtrlC => "interrupted by Ctrl+C",
+            Self::Sigterm => "interrupted by SIGTERM",
+        }
+    }
+}
+
 /// What the Ctrl+C handler needs to leave an honest trace of an
 /// interrupted run: the run was started (a history dir may exist) but no
 /// result ever existed.
@@ -87,11 +103,11 @@ pub async fn run() -> i32 {
     let result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
-            record_cancelled(&state);
+            record_cancelled(&state, CancelReason::CtrlC);
             return EXIT_CANCEL;
         }
         _ = sigterm() => {
-            record_cancelled(&state);
+            record_cancelled(&state, CancelReason::Sigterm);
             return EXIT_CANCEL;
         }
         result = dispatch(cli, normalized, state.clone()) => result,
@@ -111,7 +127,7 @@ pub async fn run() -> i32 {
     }
 }
 
-fn record_cancelled(state: &std::sync::Mutex<RunState>) {
+fn record_cancelled(state: &std::sync::Mutex<RunState>, reason: CancelReason) {
     let claimed = state.lock().ok().and_then(|mut s| s.pending.take());
     match claimed {
         Some(p) => {
@@ -124,7 +140,7 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
                     summary: p.summary,
                     generation: GenerationStatus::Cancelled,
                     artifacts: Vec::new(),
-                    warnings: vec!["interrupted by Ctrl+C".into()],
+                    warnings: vec![reason.history_warning().into()],
                     failed_parts: Vec::new(),
                     parts_total: 0,
                     deliveries: Vec::new(),
@@ -244,7 +260,8 @@ pub(crate) fn require_ask_prompt(cli: &Cli, task_name: &str) -> AppResult<()> {
 /// deliver. The single-run path and every watched file share it — a
 /// watched file is just an ordinary run whose input arrives later.
 /// `stem_hint` (watch only) names the artifacts after the arriving file
-/// so one `--out-dir` can collect a stream of results.
+/// (full name plus a short hash, so no two arrivals collide) so one
+/// `--out-dir` can collect a stream of results.
 pub(crate) async fn run_task(
     cli: &Cli,
     task_name: String,
@@ -262,7 +279,7 @@ pub(crate) async fn run_task(
     let mut plan = plan::build(cli, &task, &specs, &cfg, terminal, &mut env)?;
 
     // Watched runs derive artifact names from the input file (shot.png →
-    // shot.txt), the same convention a per-part batch uses, so two
+    // shot-txt--<hash>.txt; see watch::watch_artifact_stem), so two
     // arrivals never fight over one `text.txt`. Steps that already carry
     // a stem (per-part batches) keep theirs.
     if let Some(stem) = stem_hint {

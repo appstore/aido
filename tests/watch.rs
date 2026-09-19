@@ -248,6 +248,35 @@ fn args_of(parts: &[String]) -> Vec<&str> {
     parts.iter().map(|s| s.as_str()).collect()
 }
 
+/// The out-dir artifacts a watched input produced: the daemon names them
+/// after the sanitized input file name plus a short hash of the raw name,
+/// so a test matches on the readable prefix. (`a.b` and `a-b` share a
+/// prefix — that is the collision case; count or read contents there.)
+fn watch_artifacts(out: &std::path::Path, input: &str) -> Vec<std::path::PathBuf> {
+    let readable: String = input
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let prefix = format!("{}--", readable.trim_matches('-'));
+    let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(out)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    hits.sort();
+    hits
+}
+
 #[cfg(unix)]
 #[test]
 fn a_new_file_runs_the_task_and_sigint_exits_130() {
@@ -301,13 +330,13 @@ fn two_files_share_one_out_dir_without_colliding() {
     // artifacts are named after their inputs.
     std::fs::write(guard.join("a.txt"), b"first").unwrap();
     wait_until(
-        || out.join("a.txt").exists(),
+        || !watch_artifacts(&out, "a.txt").is_empty(),
         Duration::from_secs(15),
         "the first artifact",
     );
     std::fs::write(guard.join("b.txt"), b"second").unwrap();
     wait_until(
-        || out.join("b.txt").exists(),
+        || !watch_artifacts(&out, "b.txt").is_empty(),
         Duration::from_secs(15),
         "the second artifact",
     );
@@ -315,18 +344,96 @@ fn two_files_share_one_out_dir_without_colliding() {
     let outcome = watch.kill(libc::SIGINT);
     outcome.assert_code(130);
     assert_eq!(
-        std::fs::read_to_string(out.join("a.txt")).unwrap(),
+        std::fs::read_to_string(&watch_artifacts(&out, "a.txt")[0]).unwrap(),
         "first",
         "the first artifact survived the second run"
     );
     assert_eq!(
-        std::fs::read_to_string(out.join("b.txt")).unwrap(),
+        std::fs::read_to_string(&watch_artifacts(&out, "b.txt")[0]).unwrap(),
         "second"
     );
     assert!(out.join("manifest.json").exists());
     let err = outcome.stderr();
     assert!(err.contains("[watch] a.txt → ask: done"), "{err}");
     assert!(err.contains("[watch] b.txt → ask: done"), "{err}");
+    assert_eq!(run_dirs(&history).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn same_stem_different_extensions_do_not_collide() {
+    let server = MultiServer::start(&[chat_body("png result"), chat_body("jpg result")]);
+    let guard = temp_dir("watch-stem");
+    let out = temp_dir("watch-stem-out");
+    let history = temp_dir("watch-stem-hist");
+    let cfg = watch_config(server.port);
+    let mut watch = spawn_watch(&args_of(&watch_args(&guard, &out, &[])), &cfg, &history);
+    watch.ready();
+
+    // report.png and report.jpg share the stem `report`; both must land
+    // in one out-dir, neither clobbered. (Classification is by content:
+    // text bytes in a .png name are a valid ask input.)
+    std::fs::write(guard.join("report.png"), b"png input").unwrap();
+    wait_until(
+        || !watch_artifacts(&out, "report.png").is_empty(),
+        Duration::from_secs(15),
+        "the png artifact",
+    );
+    std::fs::write(guard.join("report.jpg"), b"jpg input").unwrap();
+    wait_until(
+        || !watch_artifacts(&out, "report.jpg").is_empty(),
+        Duration::from_secs(15),
+        "the jpg artifact",
+    );
+
+    let outcome = watch.kill(libc::SIGINT);
+    outcome.assert_code(130);
+    assert_eq!(
+        std::fs::read_to_string(&watch_artifacts(&out, "report.png")[0]).unwrap(),
+        "png result",
+        "the png result survived the jpg run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&watch_artifacts(&out, "report.jpg")[0]).unwrap(),
+        "jpg result"
+    );
+    assert_eq!(run_dirs(&history).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn sanitized_names_do_not_collide() {
+    let server = MultiServer::start(&[chat_body("dot result"), chat_body("dash result")]);
+    let guard = temp_dir("watch-sanitize");
+    let out = temp_dir("watch-sanitize-out");
+    let history = temp_dir("watch-sanitize-hist");
+    let cfg = watch_config(server.port);
+    let mut watch = spawn_watch(&args_of(&watch_args(&guard, &out, &[])), &cfg, &history);
+    watch.ready();
+
+    // `a.b` and `a-b` sanitize to the same readable form; the raw name is
+    // in the hash, so both artifacts must coexist.
+    std::fs::write(guard.join("a.b"), b"dot input").unwrap();
+    wait_until(
+        || watch_artifacts(&out, "a.b").len() == 1,
+        Duration::from_secs(15),
+        "the first artifact",
+    );
+    std::fs::write(guard.join("a-b"), b"dash input").unwrap();
+    wait_until(
+        || watch_artifacts(&out, "a.b").len() == 2,
+        Duration::from_secs(15),
+        "the second artifact",
+    );
+
+    let outcome = watch.kill(libc::SIGINT);
+    outcome.assert_code(130);
+    let mut contents: Vec<String> = watch_artifacts(&out, "a.b")
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
+    contents.sort();
+    assert_eq!(contents, ["dash result", "dot result"]);
     assert_eq!(run_dirs(&history).len(), 2);
 }
 
@@ -357,6 +464,48 @@ fn existing_files_are_not_replayed_without_include_existing() {
     assert!(!err.contains("old.txt"), "{err}");
     assert_eq!(server.requests().len(), 1);
     assert_eq!(run_dirs(&history).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restart_preserves_the_startup_inventory() {
+    let server = MultiServer::start(&[chat_body("first run"), chat_body("second run")]);
+    let guard = temp_dir("watch-restart");
+    let out = temp_dir("watch-restart-out");
+    let history = temp_dir("watch-restart-hist");
+    let cfg = watch_config(server.port);
+    // The pre-existing file is history for every daemon started later.
+    std::fs::write(guard.join("old.txt"), b"old").unwrap();
+
+    // First daemon: old.txt is skipped, one arrival runs.
+    let mut first = spawn_watch(&args_of(&watch_args(&guard, &out, &[])), &cfg, &history);
+    first.ready();
+    std::fs::write(guard.join("new.txt"), b"first").unwrap();
+    wait_until(
+        || out.join("manifest.json").exists(),
+        Duration::from_secs(15),
+        "the first daemon's manifest",
+    );
+    first.kill(libc::SIGINT).assert_code(130);
+
+    // Restart: the inventory is rebuilt from the real directory — old.txt
+    // and new.txt are history now; a fresh arrival must still run.
+    let mut second = spawn_watch(&args_of(&watch_args(&guard, &out, &[])), &cfg, &history);
+    second.ready();
+    std::fs::write(guard.join("fresh.txt"), b"second").unwrap();
+    wait_until(
+        || run_dirs(&history).len() == 2,
+        Duration::from_secs(15),
+        "the second daemon's history record",
+    );
+    let outcome = second.kill(libc::SIGINT);
+    outcome.assert_code(130);
+    let err = outcome.stderr();
+    assert!(!err.contains("[watch] old.txt"), "{err}");
+    assert!(!err.contains("[watch] new.txt"), "{err}");
+    assert!(err.contains("[watch] fresh.txt → ask: done"), "{err}");
+    assert_eq!(server.requests().len(), 2);
+    assert_eq!(run_dirs(&history).len(), 2);
 }
 
 #[cfg(unix)]
@@ -439,6 +588,89 @@ fn a_growing_file_is_debounced_until_it_settles() {
     out.assert_code(130);
     // Once, not once per chunk.
     assert_no_connection(&listener, Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_file_is_rechecked_after_the_previous_run() {
+    use std::io::Write as _;
+
+    // A server that holds the first request until the test releases it,
+    // then answers the second normally, recording both raw requests. The
+    // test keeps a cloned listener so it can probe for connections while
+    // the server thread is parked in its own accept.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let probe_listener = listener.try_clone().unwrap();
+    let (first_seen_tx, first_seen_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stream = accept(&listener, deadline);
+        stream.set_nonblocking(false).unwrap();
+        let raw1 = read_request(&mut stream);
+        let _ = first_seen_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        write_response(&mut stream, "200 OK", chat_body("first-done"));
+        let mut stream = accept(&listener, deadline);
+        stream.set_nonblocking(false).unwrap();
+        let raw2 = read_request(&mut stream);
+        write_response(&mut stream, "200 OK", chat_body("second-done"));
+        vec![raw1, raw2]
+    });
+
+    let guard = temp_dir("watch-queue");
+    let out = temp_dir("watch-queue-out");
+    let history = temp_dir("watch-queue-hist");
+    let cfg = watch_config(port);
+    let mut watch = spawn_watch(
+        &args_of(&watch_args(&guard, &out, &["--stable-ms", "800"])),
+        &cfg,
+        &history,
+    );
+    watch.ready();
+
+    // Both files are on disk before either settles, so one listing makes
+    // them ready together: a (lexically first) fires, and while its run
+    // blocks the daemon, b keeps growing.
+    std::fs::write(guard.join("a.txt"), b"one").unwrap();
+    std::fs::write(guard.join("b.txt"), b"two").unwrap();
+    first_seen_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the first file never started a request");
+    std::thread::sleep(Duration::from_millis(200));
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(guard.join("b.txt"))
+        .unwrap();
+    writeln!(f, "more").unwrap();
+    drop(f);
+
+    // Release a. The queued verdict on b must be re-made from fresh
+    // stats: b re-waits its stability window instead of running off the
+    // old listing's ready mark.
+    let _ = release_tx.send(());
+    assert_no_connection(&probe_listener, Duration::from_millis(600));
+
+    // Then b fires once, on the settled content.
+    let requests = server.join().unwrap();
+    assert!(
+        String::from_utf8_lossy(&requests[0]).contains("one"),
+        "the first run carried a's content"
+    );
+    assert!(
+        String::from_utf8_lossy(&requests[1]).contains("more"),
+        "the queued run carried b's final content: {}",
+        String::from_utf8_lossy(&requests[1])
+    );
+    wait_until(
+        || out.join("manifest.json").exists(),
+        Duration::from_secs(15),
+        "the out-dir manifest",
+    );
+    let out = watch.kill(libc::SIGINT);
+    out.assert_code(130);
 }
 
 #[cfg(unix)]
@@ -680,6 +912,97 @@ fn dry_run_prints_the_probe_plan_and_exits_without_a_request() {
     assert_no_connection(&listener, Duration::from_millis(300));
 }
 
+#[test]
+fn watch_task_resolution_matches_a_plain_run() {
+    // The startup precheck must resolve the task the way a plain run does:
+    // flag before task, `run` prefix, an implicit ask via `-p` — all
+    // ordinary spellings, so none may be refused before the daemon
+    // guards. `--dry-run` prints the probe plan and exits without a
+    // request, so no server is needed.
+    let cfg = watch_config(1);
+    let guard = temp_dir("watch-resolution");
+    let out_dir = temp_dir("watch-resolution-out");
+    let out_dir = out_dir.to_str().unwrap();
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            ["--out-dir", out_dir, "ocr", "--profile", "test"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "ocr",
+        ),
+        (
+            ["ocr", "--out-dir", out_dir, "--profile", "test"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "ocr",
+        ),
+        (
+            ["run", "ocr", "--out-dir", out_dir, "--profile", "test"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "ocr",
+        ),
+        (
+            [
+                "-p",
+                "describe this",
+                "--out-dir",
+                out_dir,
+                "--profile",
+                "test",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            "ask",
+        ),
+    ];
+    for (task_argv, task) in cases {
+        let mut args: Vec<String> = vec![
+            "watch".into(),
+            guard.to_str().unwrap().into(),
+            "--dry-run".into(),
+            "--".into(),
+        ];
+        args.extend(task_argv);
+        let args = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+        let outcome = run_with(&args, b"", &[], &cfg);
+        outcome.assert_code(0);
+        assert!(
+            outcome.stdout().contains(task),
+            "`{}`: wanted {task:?} in stdout: {}",
+            args.join(" "),
+            outcome.stdout()
+        );
+    }
+
+    // The clipboard needs a terminal; with one, even the flag-first
+    // spelling with --copy passes the precheck.
+    let outcome = run_full_tty(
+        &[
+            "watch",
+            guard.to_str().unwrap(),
+            "--dry-run",
+            "--",
+            "--copy",
+            "ocr",
+            "--profile",
+            "test",
+        ],
+        &[],
+        cfg.clone(),
+    );
+    outcome.assert_code(0);
+    assert!(
+        outcome.stdout().contains("clipboard"),
+        "{}",
+        outcome.stdout()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_file_does_not_stop_the_watch() {
@@ -737,9 +1060,11 @@ fn sigterm_exits_130_like_ctrl_c() {
     assert!(out.stderr().contains("guarding"), "{}", out.stderr());
 }
 
+/// A watch whose file's request hangs until the daemon is signalled: the
+/// shared body of the cancelled-during-a-run tests. Returns the daemon's
+/// full outcome and the cancelled run's manifest.
 #[cfg(unix)]
-#[test]
-fn ctrl_c_during_a_run_records_it_cancelled_and_exits_130() {
+fn signal_during_a_run(signal: i32) -> (RunOutcome, serde_json::Value) {
     use std::io::Read;
 
     // A server that accepts and never answers: the watched file's request
@@ -771,12 +1096,12 @@ fn ctrl_c_during_a_run_records_it_cancelled_and_exits_130() {
     watch.ready();
     std::fs::write(guard.join("hang.txt"), b"hang").unwrap();
     // The request must be in flight before the interrupt: wait for the
-    // holder's accept, not for a sleep.
-    std::thread::sleep(Duration::from_millis(2000));
+    // holder's accept, then a beat for the run to be fully underway.
     in_flight_rx
         .recv_timeout(Duration::from_secs(15))
         .expect("the watched file never started a request");
-    let out = watch.kill(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(300));
+    let out = watch.kill(signal);
     out.assert_code(130);
     holder.join().ok();
 
@@ -785,7 +1110,35 @@ fn ctrl_c_during_a_run_records_it_cancelled_and_exits_130() {
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
             .unwrap();
+    (out, manifest)
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_during_a_run_records_ctrl_c() {
+    let (_, manifest) = signal_during_a_run(libc::SIGINT);
     assert_eq!(manifest["generation"]["status"], "cancelled");
+    let warnings = manifest["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("Ctrl+C")),
+        "the history must name Ctrl+C: {warnings:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_a_run_records_sigterm() {
+    let (_, manifest) = signal_during_a_run(libc::SIGTERM);
+    assert_eq!(manifest["generation"]["status"], "cancelled");
+    let warnings = manifest["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("SIGTERM")),
+        "the history must name SIGTERM, not Ctrl+C: {warnings:?}"
+    );
 }
 
 #[cfg(unix)]
