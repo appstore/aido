@@ -145,6 +145,10 @@ pub fn save_generation(record: &RunRecord, keep_artifacts: bool) -> Result<()> {
         eprintln!("warning: cannot determine a history directory; result not kept on disk");
         return Ok(());
     };
+    // Two artifacts that sanitize to the same file name would overwrite
+    // each other while the manifest still names both — refuse before the
+    // first byte lands, so the record never lies about what is on disk.
+    crate::output::artifact_files_unique(&record.artifacts)?;
     let run_dir = dir.join(&record.run_id);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("cannot create {}", run_dir.display()))?;

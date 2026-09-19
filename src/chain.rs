@@ -705,17 +705,15 @@ fn retag(artifacts: &mut [Artifact], offset: usize) {
     }
 }
 
-/// Name an intermediate stage's artifacts after the stage, with the
-/// stage's ordinal so repeated tasks stay distinct (`summarize`,
-/// `summarize-3`): a chain record and its `--out-dir` manifest keep one
-/// readable file per stage without collisions. The last stage keeps the
-/// ordinary naming — its artifacts are the deliverables.
+/// Name an intermediate stage's artifacts after a stage-namespaced stem
+/// (`stage-1-summarize`, `stage-2-summarize`): the namespace keeps them
+/// from colliding with the last stage's ordinary ids (`text`, …) or with
+/// each other — a collision would be a silent on-disk overwrite, since
+/// file names, not raw ids, are what history and `--out-dir` write. The
+/// last stage keeps the ordinary naming — its artifacts are the
+/// deliverables.
 fn rename_intermediates(artifacts: &mut [Artifact], task_name: &str, stage: usize) {
-    let base = if stage == 0 {
-        task_name.to_string()
-    } else {
-        format!("{task_name}-{}", stage + 1)
-    };
+    let base = format!("stage-{}-{task_name}", stage + 1);
     let mut count = 0usize;
     for artifact in artifacts.iter_mut() {
         count += 1;

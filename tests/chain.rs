@@ -298,8 +298,9 @@ fn single_history_record_lists_stages_and_global_provenance() {
         .iter()
         .map(|a| a["id"].as_str().unwrap())
         .collect();
-    // Intermediate stages carry their ordinal so repeated tasks stay distinct.
-    assert_eq!(ids, ["summarize", "translate-2", "text"]);
+    // Intermediates carry a stage-namespaced stem so repeated tasks — and
+    // a task named like the final stage's default `text` — stay distinct.
+    assert_eq!(ids, ["stage-1-summarize", "stage-2-translate", "text"]);
     let indices: Vec<usize> = artifacts
         .iter()
         .map(|a| a["provenance"]["index"].as_u64().unwrap() as usize)
@@ -368,7 +369,7 @@ fn stage2_http_500_stops_the_chain_at_exit_3() {
     let artifacts = manifest["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 1, "only stage 1 produced anything");
     assert_eq!(
-        std::fs::read_to_string(runs[0].join("summarize.txt")).unwrap(),
+        std::fs::read_to_string(runs[0].join("stage-1-summarize.txt")).unwrap(),
         "OK1"
     );
 }
@@ -497,9 +498,9 @@ fn ctrl_c_mid_chain_keeps_completed_stages_in_history() {
         1,
         "stage 1's artifact is kept: {artifacts:?}"
     );
-    assert_eq!(artifacts[0]["id"], "summarize");
+    assert_eq!(artifacts[0]["id"], "stage-1-summarize");
     assert_eq!(
-        std::fs::read_to_string(runs[0].join("summarize.txt")).unwrap(),
+        std::fs::read_to_string(runs[0].join("stage-1-summarize.txt")).unwrap(),
         "stage one text"
     );
 }
@@ -572,12 +573,12 @@ fn outdir_manifest_keeps_every_stage() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
     let artifacts = manifest["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 2, "intermediate + final");
-    assert_eq!(artifacts[0]["id"], "summarize");
+    assert_eq!(artifacts[0]["id"], "stage-1-summarize");
     assert_eq!(artifacts[0]["provenance"]["index"], 0);
     assert_eq!(artifacts[1]["id"], "text");
     assert_eq!(artifacts[1]["provenance"]["index"], 1);
     assert_eq!(
-        std::fs::read_to_string(dir.join("summarize.txt")).unwrap(),
+        std::fs::read_to_string(dir.join("stage-1-summarize.txt")).unwrap(),
         "ONE"
     );
     assert_eq!(
@@ -625,7 +626,7 @@ fn history_show_redelivers_the_last_stage_only() {
         &cfg,
     );
     out.assert_code(0);
-    assert!(dir.join("summarize.txt").exists());
+    assert!(dir.join("stage-1-summarize.txt").exists());
     assert!(dir.join("text.txt").exists());
 }
 
@@ -798,9 +799,76 @@ fn repeated_task_names_keep_distinct_artifacts() {
         .iter()
         .map(|a| a["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["summarize", "summarize-2", "text"], "no collisions");
-    assert!(dir.join("summarize.txt").exists());
-    assert!(dir.join("summarize-2.txt").exists());
+    assert_eq!(
+        ids,
+        ["stage-1-summarize", "stage-2-summarize", "text"],
+        "no collisions"
+    );
+    assert!(dir.join("stage-1-summarize.txt").exists());
+    assert!(dir.join("stage-2-summarize.txt").exists());
+}
+
+/// A custom task literally named `text` used to rename stage 1's artifact
+/// to the final stage's default id — one file silently overwrote the
+/// other in `--out-dir` and in history. The stage-namespaced intermediate
+/// stem keeps them apart, and the pre-write uniqueness check (shared with
+/// history) turns any residual mapping into an error, never an overwrite.
+#[test]
+fn custom_task_named_text_does_not_collide_with_the_final_text() {
+    let tasks = temp_dir("chain-text-task");
+    std::fs::write(
+        tasks.join("text.toml"),
+        "operation = \"generate\"\n\
+         input_types = [\"text\"]\n\
+         output_types = [\"text\"]\n",
+    )
+    .unwrap();
+    let server = MultiServer::start(&[chat_body("ONE"), chat_body("TWO")]);
+    let cfg = live_cfg(&server.url());
+    let hist = temp_dir("chain-text-collide");
+    let dir = temp_dir("chain-text-collide-dir");
+    let out = run_with(
+        &[
+            "chain",
+            "text | translate",
+            "--text",
+            "hi",
+            "--out-dir",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", hist.to_str().unwrap()),
+        ],
+        &cfg,
+    );
+    out.assert_code(0);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let artifacts = manifest["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2, "intermediate + final: {manifest}");
+    assert_eq!(artifacts[0]["id"], "stage-1-text");
+    assert_eq!(artifacts[1]["id"], "text");
+    let files: Vec<&str> = artifacts
+        .iter()
+        .map(|a| a["file"].as_str().unwrap())
+        .collect();
+    assert_ne!(files[0], files[1], "the manifest names two real files");
+    assert_eq!(std::fs::read_to_string(dir.join(files[0])).unwrap(), "ONE");
+    assert_eq!(std::fs::read_to_string(dir.join(files[1])).unwrap(), "TWO");
+    // History holds both too, under the same distinct names.
+    let runs = run_dirs(&hist);
+    assert_eq!(runs.len(), 1);
+    let hmanifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(runs[0].join("manifest.json")).unwrap())
+            .unwrap();
+    let harts = hmanifest["artifacts"].as_array().unwrap();
+    assert_eq!(harts.len(), 2);
+    assert_ne!(harts[0]["file"], harts[1]["file"]);
+    assert!(runs[0].join(harts[0]["file"].as_str().unwrap()).exists());
+    assert!(runs[0].join(harts[1]["file"].as_str().unwrap()).exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -999,7 +1067,7 @@ fn empty_middle_stage_stops_the_chain_and_keeps_upstream() {
     let artifacts = manifest["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 1, "stage 1's artifact is kept");
     assert_eq!(
-        std::fs::read_to_string(runs[0].join("summarize.txt")).unwrap(),
+        std::fs::read_to_string(runs[0].join("stage-1-summarize.txt")).unwrap(),
         "OK1"
     );
 }
