@@ -71,12 +71,7 @@ pub(crate) async fn run(
     // baseline must be real: treating a failed scan as an empty directory
     // would replay every old file once the directory is readable again.
     let bell = bell_enabled(cli.quiet, std::io::stderr().is_terminal());
-    let existing = scan_dir(&guard).map_err(|e| {
-        AppError::usage(format!(
-            "cannot read watch directory '{}': {e}",
-            args.dir.display()
-        ))
-    })?;
+    let existing = initial_inventory(&guard, &args.dir)?;
     let mut watched = WatchState::new(stable, existing, args.include_existing);
     let mut unreadable = false;
 
@@ -165,7 +160,7 @@ async fn run_one(
 
 /// The artifact stem for one watched file: the sanitized full file name
 /// plus a short hash of the raw name (`report.png` →
-/// `report-png--31bd41af`). Two inputs must never land on one artifact:
+/// `report-png--<hash>`). Two inputs must never land on one artifact:
 /// bare stems collide (`report.png`/`report.jpg` share `report`), and even
 /// full names collide once sanitized (`a.b` and `a-b` both become `a-b`),
 /// so the raw bytes go into a stable FNV-1a suffix. The hash identifies,
@@ -527,6 +522,19 @@ fn absolute(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// The startup inventory: the listing a watch's baseline is seeded from.
+/// A failure here is fatal (exit 2, before the banner) — an empty
+/// fallback would mark every pre-existing file as a fresh arrival once
+/// the directory is readable again, replaying them all.
+fn initial_inventory(guard: &Path, display_dir: &Path) -> AppResult<Vec<(PathBuf, u64)>> {
+    scan_dir(guard).map_err(|e| {
+        AppError::usage(format!(
+            "cannot read watch directory '{}': {e}",
+            display_dir.display()
+        ))
+    })
 }
 
 /// The guarded directory's top-level regular files, sorted by name, with
@@ -999,6 +1007,45 @@ mod tests {
             .collect();
         // A link to a file is a file; a broken link is gone.
         assert_eq!(names, ["link.txt", "real.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Linux only: macOS filesystems refuse to make the fixture unreadable
+    // in a way the scan would see, and root reads through a 0o000 mode
+    // anyway — the error path is asserted where it is exercisable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_initial_inventory_is_a_usage_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root reads through a 0o000 mode, so the fixture cannot fail the
+        // scan there; the CI runners run unprivileged.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = crate::test_support::run_root().join("watch-inventory-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), b"old").unwrap();
+
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        let mut blocked = original.clone();
+        blocked.set_mode(0o000);
+        std::fs::set_permissions(&dir, blocked).unwrap();
+
+        let result = initial_inventory(&dir, &dir);
+
+        // Restore before asserting: a failure must not leave a directory
+        // this process can no longer clean up.
+        std::fs::set_permissions(&dir, original).unwrap();
+
+        let err = result.expect_err("an unreadable startup directory must fail");
+        assert_eq!(err.kind, crate::domain::ErrorKind::Usage);
+        assert!(
+            err.message.contains("cannot read watch directory"),
+            "{}",
+            err.message
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

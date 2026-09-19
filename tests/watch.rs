@@ -599,31 +599,14 @@ fn a_growing_file_is_debounced_until_it_settles() {
 fn queued_file_is_rechecked_after_the_previous_run() {
     use std::io::Write as _;
 
-    // A server that holds the first request until the test releases it,
-    // then answers the second normally, recording both raw requests. The
-    // test keeps a cloned listener so it can probe for connections while
-    // the server thread is parked in its own accept.
+    // The test thread is this listener's only accept consumer: if the
+    // queued file fired inside the no-connection window below, the assert
+    // there must be the one that sees it — a second accept loop (server
+    // thread, cloned listener) could swallow the connection first and let
+    // a regression slip through.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let probe_listener = listener.try_clone().unwrap();
-    let (first_seen_tx, first_seen_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut stream = accept(&listener, deadline);
-        stream.set_nonblocking(false).unwrap();
-        let raw1 = read_request(&mut stream);
-        let _ = first_seen_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(30));
-        write_response(&mut stream, "200 OK", chat_body("first-done"));
-        let mut stream = accept(&listener, deadline);
-        stream.set_nonblocking(false).unwrap();
-        let raw2 = read_request(&mut stream);
-        write_response(&mut stream, "200 OK", chat_body("second-done"));
-        vec![raw1, raw2]
-    });
-
     let guard = temp_dir("watch-queue");
     let out = temp_dir("watch-queue-out");
     let history = temp_dir("watch-queue-hist");
@@ -640,10 +623,18 @@ fn queued_file_is_rechecked_after_the_previous_run() {
     // blocks the daemon, b keeps growing.
     std::fs::write(guard.join("a.txt"), b"one").unwrap();
     std::fs::write(guard.join("b.txt"), b"two").unwrap();
-    first_seen_rx
-        .recv_timeout(Duration::from_secs(15))
-        .expect("the first file never started a request");
-    std::thread::sleep(Duration::from_millis(200));
+
+    // a's request is in flight; hold it unanswered.
+    let mut first = accept(&listener, Instant::now() + Duration::from_secs(15));
+    first.set_nonblocking(false).unwrap();
+    let raw1 = read_request(&mut first);
+    assert!(
+        String::from_utf8_lossy(&raw1).contains("one"),
+        "the first run must be a.txt: {}",
+        String::from_utf8_lossy(&raw1)
+    );
+
+    // While a is blocked, b keeps growing.
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(guard.join("b.txt"))
@@ -652,29 +643,32 @@ fn queued_file_is_rechecked_after_the_previous_run() {
     drop(f);
 
     // Release a. The queued verdict on b must be re-made from fresh
-    // stats: b re-waits its stability window instead of running off the
-    // old listing's ready mark.
-    let _ = release_tx.send(());
-    assert_no_connection(&probe_listener, Duration::from_millis(600));
+    // stats: b re-waits its stability window (800 ms) instead of running
+    // off the old listing's ready mark — a regression would fire within
+    // one poll interval, and the assert below catches it.
+    write_response(&mut first, "200 OK", chat_body("first-done"));
+    drop(first);
+    assert_no_connection(&listener, Duration::from_millis(600));
 
     // Then b fires once, on the settled content.
-    let requests = server.join().unwrap();
+    let mut second = accept(&listener, Instant::now() + Duration::from_secs(15));
+    second.set_nonblocking(false).unwrap();
+    let raw2 = read_request(&mut second);
     assert!(
-        String::from_utf8_lossy(&requests[0]).contains("one"),
-        "the first run carried a's content"
-    );
-    assert!(
-        String::from_utf8_lossy(&requests[1]).contains("more"),
+        String::from_utf8_lossy(&raw2).contains("more"),
         "the queued run carried b's final content: {}",
-        String::from_utf8_lossy(&requests[1])
+        String::from_utf8_lossy(&raw2)
     );
+    write_response(&mut second, "200 OK", chat_body("second-done"));
+    drop(second);
+
     wait_until(
-        || out.join("manifest.json").exists(),
+        || run_dirs(&history).len() == 2,
         Duration::from_secs(15),
-        "the out-dir manifest",
+        "both watch runs",
     );
-    let out = watch.kill(libc::SIGINT);
-    out.assert_code(130);
+    let outcome = watch.kill(libc::SIGINT);
+    outcome.assert_code(130);
 }
 
 #[cfg(unix)]
