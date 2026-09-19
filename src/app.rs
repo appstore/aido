@@ -2,7 +2,7 @@
 //! task end to end, and map outcomes to exit codes.
 
 use crate::chain;
-use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
+use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, SourceSpec, TasksCmd};
 use crate::config;
 use crate::domain::{
     first_line, AppError, AppResult, Artifact, Destination, ErrorKind, GenerationStatus, MediaKind,
@@ -22,6 +22,22 @@ use std::sync::Arc;
 
 /// Exit code for "the user pressed Ctrl+C".
 pub const EXIT_CANCEL: i32 = 130;
+
+/// Why a run was cancelled: the history record names the signal that
+/// actually arrived instead of blaming Ctrl+C for everything.
+enum CancelReason {
+    CtrlC,
+    Sigterm,
+}
+
+impl CancelReason {
+    fn history_warning(self) -> &'static str {
+        match self {
+            Self::CtrlC => "interrupted by Ctrl+C",
+            Self::Sigterm => "interrupted by SIGTERM",
+        }
+    }
+}
 
 /// What the Ctrl+C handler needs to leave an honest trace of an
 /// interrupted run: the run was started (a history dir may exist) but no
@@ -45,8 +61,10 @@ struct PendingRun {
 /// outcome exists — a later Ctrl+C must not overwrite a real record with
 /// an empty cancelled one — while the run identity stays until the end:
 /// a failure after the generation ran still names the run it belongs to.
+/// The watch daemon holds a handle to the same state so a Ctrl+C that
+/// interrupts a watched file records that file's run as cancelled.
 #[derive(Default)]
-struct RunState {
+pub(crate) struct RunState {
     pending: Option<PendingRun>,
     identity: Option<(String, Option<String>)>,
 }
@@ -120,16 +138,37 @@ pub async fn run() -> i32 {
             };
             (cli, None)
         }
+        cli::Normalized::Watch(args) => {
+            // The watch grammar carries only the three parent flags
+            // (`--dry-run`/`--quiet`/`--json`) in front of `--`; clap
+            // re-parses them into the run's top-level surface.
+            let cli = match Cli::try_parse_from(
+                std::iter::once(std::ffi::OsString::from("aido")).chain(args.parent_argv.clone()),
+            ) {
+                Ok(cli) => cli,
+                Err(e) => {
+                    let _ = e.print();
+                    return if e.use_stderr() { 2 } else { 0 };
+                }
+            };
+            (cli, None)
+        }
     };
     let wants_json = cli.json;
     // Ctrl+C anywhere in a run cancels it (exit 130) instead of hanging on
     // a slow request or leaving a half-written delivery. The interrupted
     // run is recorded as cancelled when a plan had already been built.
+    // SIGTERM takes the same path on Unix: a terminated daemon must leave
+    // the same honest trace a Ctrl+C does.
     let state: Arc<std::sync::Mutex<RunState>> = Arc::default();
     let result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
-            record_cancelled(&state);
+            record_cancelled(&state, CancelReason::CtrlC);
+            return EXIT_CANCEL;
+        }
+        _ = sigterm() => {
+            record_cancelled(&state, CancelReason::Sigterm);
             return EXIT_CANCEL;
         }
         result = dispatch(cli, normalized, chain, state.clone()) => result,
@@ -149,7 +188,7 @@ pub async fn run() -> i32 {
     }
 }
 
-fn record_cancelled(state: &std::sync::Mutex<RunState>) {
+fn record_cancelled(state: &std::sync::Mutex<RunState>, reason: CancelReason) {
     let claimed = state.lock().ok().and_then(|mut s| s.pending.take());
     match claimed {
         Some(p) => {
@@ -170,7 +209,7 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
                 // the failure path's — `keep_artifacts` is what makes
                 // save_generation write them at all.
                 best_effort(
-                    history::save_generation(&cancelled_record(&p), kept > 0),
+                    history::save_generation(&cancelled_record(&p, reason), kept > 0),
                     "failed to record the interrupted run",
                 );
             }
@@ -179,12 +218,27 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
     }
 }
 
+/// SIGTERM joins Ctrl+C (exit 130) on Unix: same cleanup, same exit code.
+/// Registration failure parks the future forever so the select still
+/// works; the platform simply keeps its default disposition then.
+async fn sigterm() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            term.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 /// The cancelled-run record. A chain's completed upstream stages travel in
 /// it; the interrupted stage contributed nothing, so `last_stage_len`
 /// stays 0 — and stays meaningless, since a cancelled record is never
 /// redelivered (`aido last` and `history show` restore complete
 /// generations only).
-fn cancelled_record(p: &PendingRun) -> RunRecord {
+fn cancelled_record(p: &PendingRun, reason: CancelReason) -> RunRecord {
     let kept = !p.chain_artifacts.is_empty();
     RunRecord {
         run_id: p.run_id.clone(),
@@ -194,11 +248,12 @@ fn cancelled_record(p: &PendingRun) -> RunRecord {
         generation: GenerationStatus::Cancelled,
         artifacts: p.chain_artifacts.clone(),
         warnings: vec![if kept {
-            "interrupted by Ctrl+C; the completed stages' artifacts are kept \
-             in this record"
-                .into()
+            format!(
+                "{}; the completed stages' artifacts are kept in this record",
+                reason.history_warning()
+            )
         } else {
-            "interrupted by Ctrl+C".into()
+            reason.history_warning().into()
         }],
         failed_parts: Vec::new(),
         parts_total: 0,
@@ -254,27 +309,30 @@ async fn dispatch(
         return run_chain(chain, state).await;
     }
 
-    let (task_name, specs) = match normalized {
-        Normalized::Single { task, specs, .. } => (task, specs),
+    warn_deprecated_env_vars();
+
+    match normalized {
+        // The watch daemon owns everything after its own flags: it
+        // re-enters this pipeline once per arriving file instead of
+        // running one here.
+        Normalized::Watch(args) => crate::watch::run(&cli, args, state).await,
         Normalized::Chain { .. } => unreachable!("chain handled above"),
-    };
-    let Some(task_name) = task_name.or_else(|| cli.task.clone()) else {
-        print_help();
-        return Err(AppError::usage(
-            "nothing to do: name a task (aido <TASK>), or ask with -p (see --help)",
-        ));
-    };
-
-    if task_name == cli::LAST_TASK {
-        return run_last(&cli).await;
+        Normalized::Single { task, specs, .. } => {
+            let Some(task_name) = task.or_else(|| cli.task.clone()) else {
+                print_help();
+                return Err(AppError::usage(
+                    "nothing to do: name a task (aido <TASK>), or ask with -p (see --help)",
+                ));
+            };
+            if task_name == cli::LAST_TASK {
+                return run_last(&cli).await;
+            }
+            run_task(&cli, task_name, specs, &state, None).await
+        }
     }
+}
 
-    if task_name == "ask" && cli.prompt.as_deref().is_none_or(str::is_empty) {
-        return Err(AppError::usage(
-            "`ask` needs -p with the instruction, e.g. `aido ask -p \"summarize this\" file.md`",
-        ));
-    }
-
+fn warn_deprecated_env_vars() {
     for var in config::DEPRECATED_ENV_VARS {
         if std::env::var(var)
             .map(|v| !v.trim().is_empty())
@@ -286,14 +344,53 @@ async fn dispatch(
             );
         }
     }
+}
+
+/// `ask` is nothing without its instruction. Both the single-run path and
+/// the watch precheck refuse it up front — a watch that starts without a
+/// prompt would fail every arriving file.
+pub(crate) fn require_ask_prompt(cli: &Cli, task_name: &str) -> AppResult<()> {
+    if task_name == "ask" && cli.prompt.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::usage(
+            "`ask` needs -p with the instruction, e.g. `aido ask -p \"summarize this\" file.md`",
+        ));
+    }
+    Ok(())
+}
+
+/// One task run, end to end: resolve, plan, precheck, execute, record,
+/// deliver. The single-run path and every watched file share it — a
+/// watched file is just an ordinary run whose input arrives later.
+/// `stem_hint` (watch only) names the artifacts after the arriving file
+/// (full name plus a short hash, so no two arrivals collide) so one
+/// `--out-dir` can collect a stream of results.
+pub(crate) async fn run_task(
+    cli: &Cli,
+    task_name: String,
+    specs: Vec<SourceSpec>,
+    state: &Arc<std::sync::Mutex<RunState>>,
+    stem_hint: Option<&str>,
+) -> AppResult<()> {
+    require_ask_prompt(cli, &task_name)?;
 
     let task = tasks::get(&task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo::real();
     let mut env = InputEnv::real();
-    let specs = specs.clone();
 
-    let plan = plan::build(&cli, &task, &specs, &cfg, terminal, &mut env)?;
+    let mut plan = plan::build(cli, &task, &specs, &cfg, terminal, &mut env)?;
+
+    // Watched runs derive artifact names from the input file (shot.png →
+    // shot-txt--<hash>.txt; see watch::watch_artifact_stem), so two
+    // arrivals never fight over one `text.txt`. Steps that already carry
+    // a stem (per-part batches) keep theirs.
+    if let Some(stem) = stem_hint {
+        for step in &mut plan.steps {
+            if step.artifact_stem.is_none() {
+                step.artifact_stem = Some(stem.to_string());
+            }
+        }
+    }
 
     if cli.dry_run {
         print!("{}", plan::describe(&plan));
@@ -337,7 +434,7 @@ async fn dispatch(
         state.pending = None;
     }
     finish_run(
-        &cli,
+        cli,
         &task.name,
         &cfg,
         &plan,
@@ -1153,7 +1250,7 @@ mod tests {
 
     #[test]
     fn cancelled_record_keeps_completed_chain_stages() {
-        let record = cancelled_record(&pending_with_chain());
+        let record = cancelled_record(&pending_with_chain(), CancelReason::CtrlC);
         assert_eq!(record.generation, GenerationStatus::Cancelled);
         // The paid-for upstream artifact travels with its bytes, and the
         // stage list describes the run; the interrupted final stage owns
@@ -1177,9 +1274,12 @@ mod tests {
             chain_stages: Vec::new(),
             ..pending_with_chain()
         };
-        let record = cancelled_record(&pending);
+        let record = cancelled_record(&pending, CancelReason::CtrlC);
         assert_eq!(record.generation, GenerationStatus::Cancelled);
         assert!(record.artifacts.is_empty() && record.stages.is_empty());
-        assert_eq!(record.warnings, vec!["interrupted by Ctrl+C"]);
+        assert_eq!(
+            record.warnings,
+            vec![CancelReason::CtrlC.history_warning().to_string()]
+        );
     }
 }

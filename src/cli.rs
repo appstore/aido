@@ -26,8 +26,8 @@ impl clap::ValueEnum for MediaKind {
 /// Names owned by management commands and helpers; never treated as tasks
 /// (`aido run NAME` reaches a custom task with such a name).
 pub const RESERVED_WORDS: &[&str] = &[
-    "tasks", "profiles", "config", "history", "run", "ask", "last", "help", "version", "__hold",
-    "chain",
+    "tasks", "profiles", "config", "history", "run", "ask", "last", "watch", "help", "version",
+    "__hold", "chain",
 ];
 
 /// The recovery pseudo-task behind `aido last`.
@@ -55,6 +55,29 @@ pub struct StageArgv {
     pub argv: Vec<OsString>,
 }
 
+/// Watch-mode arguments: everything before the `--` separator belongs to
+/// the watcher itself; everything after is the per-file task invocation,
+/// kept verbatim (it is re-normalized once per arriving file).
+#[derive(Debug, Clone)]
+pub struct WatchArgs {
+    /// The directory to guard.
+    pub dir: PathBuf,
+    /// Poll interval override in seconds (`--interval`).
+    pub interval: Option<f64>,
+    /// Size-stability window override in milliseconds (`--stable-ms`).
+    pub stable_ms: Option<u64>,
+    /// Also process files that already exist when the watch starts.
+    pub include_existing: bool,
+    /// The task invocation after `--`, verbatim and unvalidated — the
+    /// watcher feeds each arriving file into it and replays the whole
+    /// normalizer.
+    pub task_argv: Vec<OsString>,
+    /// The watch-level flags (`--dry-run`/`--quiet`/`--json`) the watch
+    /// grammar accepts in front of `--`; clap re-parses them into the
+    /// run's top-level Cli.
+    pub parent_argv: Vec<OsString>,
+}
+
 /// argv after normalization: either one task run, or a task chain already
 /// split into per-stage argv (`--then` markers, or the `chain "a | b"`
 /// sugar, both reduced to the same stage list here).
@@ -68,6 +91,10 @@ pub enum Normalized {
     Chain {
         stages: Vec<StageArgv>,
     },
+    /// `aido watch DIR [WATCH FLAGS] -- TASK [FLAGS...]`: the watcher
+    /// owns the grammar in front of `--` and re-enters the normalizer
+    /// once per arriving file.
+    Watch(WatchArgs),
 }
 
 impl Normalized {
@@ -83,6 +110,7 @@ impl Normalized {
         match self {
             Normalized::Single { argv, .. } => wants_json_in(argv),
             Normalized::Chain { stages } => stages.iter().any(|stage| wants_json_in(&stage.argv)),
+            Normalized::Watch(args) => wants_json_in(&args.parent_argv),
         }
     }
 }
@@ -320,6 +348,12 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     }
     if first_free_is_chain(&argv) {
         return normalize_chain(argv);
+    }
+    // `aido watch DIR -- TASK ...` has its own tiny grammar in front of the
+    // separator (watch owns those flags; the task may not); hand the whole
+    // argv to the watch parser, which reuses `--` the same way.
+    if argv.first().and_then(|t| t.to_str()) == Some("watch") {
+        return normalize_watch(argv);
     }
     if let Some(segments) = split_on_then(&argv) {
         let mut stages = Vec::new();
@@ -572,6 +606,10 @@ fn normalize_stage(argv: Vec<OsString>) -> Result<StageArgv> {
             let all_tasks = crate::tasks::load_all()?;
             if all_tasks.contains_key(word) {
                 Some(word.to_string())
+            } else if word == "watch" {
+                // watch must open the command line: flags cannot precede it
+                // the way they precede a task run.
+                bail!("'watch' must be the first word: aido watch DIR -- <TASK> [FLAGS]");
             } else if prompt_seen {
                 // -p selects `ask`; positionals are files.
                 None
@@ -971,6 +1009,129 @@ fn flag_long_name(token: &str) -> Option<&'static str> {
     None
 }
 
+/// The watch grammar: `aido watch DIR [WATCH FLAGS] -- TASK [FLAGS...]`.
+/// Everything before `--` belongs to watch — the directory, the watch-only
+/// options, and the three parent flags (`--dry-run`/`--quiet`/`--json`)
+/// that clap re-parses — and everything after is the per-file task
+/// invocation, kept verbatim. A task flag in front of `--` is refused
+/// rather than hoisted: the task call is re-normalized once per file, and
+/// a flag that changes meaning by position is a trap.
+fn normalize_watch(argv: Vec<OsString>) -> Result<Normalized> {
+    let mut dir: Option<OsString> = None;
+    let mut interval: Option<f64> = None;
+    let mut stable_ms: Option<u64> = None;
+    let mut include_existing = false;
+    let mut parent: Vec<OsString> = Vec::new();
+    let mut task_argv: Vec<OsString> = Vec::new();
+    let mut after_separator = false;
+
+    let mut iter = argv.into_iter().peekable();
+    iter.next(); // the `watch` word, checked by the caller
+    while let Some(token) = iter.next() {
+        if after_separator {
+            task_argv.push(token);
+            continue;
+        }
+        let Some(t) = token.to_str() else {
+            // Non-UTF-8 can only be the directory here: every watch flag
+            // is a UTF-8 word, and values are numbers.
+            watch_take_dir(&mut dir, token)?;
+            continue;
+        };
+        if t == "--" {
+            after_separator = true;
+        } else if t == "--help" || t == "--version" {
+            return Ok(Normalized::Single {
+                task: None,
+                specs: Vec::new(),
+                argv: vec![OsString::from(t)],
+            });
+        } else if t == "--include-existing" {
+            include_existing = true;
+        } else if t == "--dry-run" || t == "--quiet" || t == "--json" {
+            parent.push(OsString::from(t));
+        } else if t == "--interval" || t.starts_with("--interval=") {
+            let raw = match t.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => watch_take_value("--interval", &mut iter)?,
+            };
+            let secs: f64 = raw.trim().parse().map_err(|_| {
+                anyhow::anyhow!("--interval requires a number of seconds, e.g. --interval 0.5")
+            })?;
+            if !secs.is_finite() || secs <= 0.0 {
+                bail!("--interval requires a positive number of seconds");
+            }
+            interval = Some(secs);
+        } else if t == "--stable-ms" || t.starts_with("--stable-ms=") {
+            let raw = match t.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => watch_take_value("--stable-ms", &mut iter)?,
+            };
+            let ms: u64 = raw.trim().parse().map_err(|_| {
+                anyhow::anyhow!("--stable-ms requires a whole number of milliseconds")
+            })?;
+            stable_ms = Some(ms);
+        } else if t.starts_with('-') && t != "-" {
+            bail!(
+                "unknown watch option '{t}'; task flags (like --copy or --out-dir) \
+                 belong after the `--` separator: aido watch DIR -- <TASK> [FLAGS]"
+            );
+        } else {
+            watch_take_dir(&mut dir, token)?;
+        }
+    }
+
+    let Some(dir) = dir else {
+        bail!("watch requires a directory to guard: aido watch DIR -- <TASK> [FLAGS]");
+    };
+    if !after_separator || task_argv.is_empty() {
+        bail!(
+            "watch requires a task after the `--` separator: \
+             aido watch DIR -- <TASK> [FLAGS]"
+        );
+    }
+    // A per-file --dry-run would deliver nothing yet count the file as
+    // done; help and version flags would "succeed" on every file the same
+    // way. The parent-level spellings preview, print and exit instead.
+    for forbidden in ["--dry-run", "--help", "-h", "--version", "-V"] {
+        if task_argv.iter().any(|t| t.to_str() == Some(forbidden)) {
+            bail!(
+                "{forbidden} cannot be part of a watched task (nothing would be delivered \
+                 yet the file would count as done); use the parent-level form instead, \
+                 e.g. `aido watch DIR --dry-run -- <TASK> [FLAGS]`"
+            );
+        }
+    }
+    Ok(Normalized::Watch(WatchArgs {
+        dir: PathBuf::from(dir),
+        interval,
+        stable_ms,
+        include_existing,
+        task_argv,
+        parent_argv: parent,
+    }))
+}
+
+fn watch_take_dir(dir: &mut Option<OsString>, token: OsString) -> Result<()> {
+    if dir.replace(token).is_some() {
+        bail!("watch takes exactly one directory");
+    }
+    Ok(())
+}
+
+fn watch_take_value(
+    flag: &str,
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>,
+) -> Result<String> {
+    let Some(value) = iter.next() else {
+        bail!("{flag} requires a value");
+    };
+    value
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("{flag} requires a valid UTF-8 value"))
+}
+
 /// A word that names no task but looks like a file path is input rather
 /// than a typo — point at the task requirement instead of "unknown task".
 /// Keep diagnostics independent of filesystem state and automount probes.
@@ -1130,8 +1291,8 @@ impl std::fmt::Display for OutputFormat {
     name = "aido",
     version,
     about = "Send material to an AI task, deliver the result",
-    override_usage = "aido <TASK> [INPUT...] [OPTIONS]\n    aido run <TASK> [INPUT...] [OPTIONS]\n    aido ask [INPUT...] -p <INSTRUCTION> [OPTIONS]\n    aido -p <INSTRUCTION> [INPUT...] [OPTIONS]\n    aido <TASK> [INPUT...] --then <TASK> [...] [OPTIONS]\n    aido chain \"TASK [FLAGS] | TASK [FLAGS]\" [INPUT...] [OPTIONS]",
-    after_help = "INPUT is one or more of:\n  FILE            input file(s) in the order given\n  GLOB            pattern aido expands itself (quote it when the shell must not):\n                  matches in sorted order; no match is an error\n  DIR             directory: its files one level deep, sorted;\n                  dotfiles are skipped, subdirectories are refused\n                  (use a glob to descend)\n  PDF             each page's embedded images and text become material,\n                  in page order (vector-only PDFs need the pdfium build)\n  XLSX            each non-empty sheet becomes one text part, as a table\n  -               read stdin at this position (at most once)\n  --text TEXT     literal text material (repeatable)\n  --paste         read the clipboard at this position\n  -p TEXT         instruction for this run (not material)\n\nTask chains (--then, or the chain sugar) run several stages in one\n  run: stage parameters (--to, --voice, -p, --profile, ...) go on\n  their own stage; run-level ones (-o, --json, --dry-run, ...) on the\n  chain. Only the last stage delivers; every stage's artifact lands in\n  the record. When a stage argument needs shell expansion or both\n  quote kinds, use --then: its arguments are ordinary shell tokens.\n\nManagement: aido tasks|profiles|config|history ... and aido last\n\nExamples:\n  aido ocr screenshot.png --copy\n  aido ocr \"shots/*.png\" --copy\n  aido ocr shots/\n  git diff | aido code-review -\n  aido translate article.md --to zh-CN\n  aido tts --text \"你好\" -o hello.mp3\n  aido image --text \"a dog\" --count 2 --out-dir dogs/\n  aido ask a.png b.png -p \"比较两图\"\n  aido ask picture-book.pdf -p \"把这本绘本讲成旁白和对话\" | aido tts -o story.mp3\n  aido chain \"ocr | translate --to zh-CN | tts\" shot.png -o brief.mp3 --copy\n  aido ocr screenshot.png --dry-run"
+    override_usage = "aido <TASK> [INPUT...] [OPTIONS]\n    aido run <TASK> [INPUT...] [OPTIONS]\n    aido ask [INPUT...] -p <INSTRUCTION> [OPTIONS]\n    aido -p <INSTRUCTION> [INPUT...] [OPTIONS]\n    aido <TASK> [INPUT...] --then <TASK> [...] [OPTIONS]\n    aido chain \"TASK [FLAGS] | TASK [FLAGS]\" [INPUT...] [OPTIONS]\n    aido watch DIR [WATCH FLAGS] -- <TASK> [FLAGS]",
+    after_help = "INPUT is one or more of:\n  FILE            input file(s) in the order given\n  GLOB            pattern aido expands itself (quote it when the shell must not):\n                  matches in sorted order; no match is an error\n  DIR             directory: its files one level deep, sorted;\n                  dotfiles are skipped, subdirectories are refused\n                  (use a glob to descend)\n  PDF             each page's embedded images and text become material,\n                  in page order (vector-only PDFs need the pdfium build)\n  XLSX            each non-empty sheet becomes one text part, as a table\n  -               read stdin at this position (at most once)\n  --text TEXT     literal text material (repeatable)\n  --paste         read the clipboard at this position\n  -p TEXT         instruction for this run (not material)\n\nTask chains (--then, or the chain sugar) run several stages in one\n  run: stage parameters (--to, --voice, -p, --profile, ...) go on\n  their own stage; run-level ones (-o, --json, --dry-run, ...) on the\n  chain. Only the last stage delivers; every stage's artifact lands in\n  the record. When a stage argument needs shell expansion or both\n  quote kinds, use --then: its arguments are ordinary shell tokens.\n\nManagement: aido tasks|profiles|config|history ... and aido last\n\nExamples:\n  aido ocr screenshot.png --copy\n  aido ocr \"shots/*.png\" --copy\n  aido ocr shots/\n  git diff | aido code-review -\n  aido translate article.md --to zh-CN\n  aido tts --text \"你好\" -o hello.mp3\n  aido image --text \"a dog\" --count 2 --out-dir dogs/\n  aido ask a.png b.png -p \"比较两图\"\n  aido ask picture-book.pdf -p \"把这本绘本讲成旁白和对话\" | aido tts -o story.mp3\n  aido chain \"ocr | translate --to zh-CN | tts\" shot.png -o brief.mp3 --copy\n  aido ocr screenshot.png --dry-run\n\nWatch: aido watch ~/shots -- ocr --copy\n  every file that lands in DIR runs the task; task flags belong after the\n  `--` separator, and a delivery destination (--copy or --out-dir) is required"
 )]
 pub struct Cli {
     /// Task name, set by the normalizer (use `aido run NAME` explicitly)
@@ -1332,6 +1493,7 @@ mod tests {
         match super::normalize(args) {
             Ok(Normalized::Single { task, specs, argv }) => Ok(StageArgv { task, specs, argv }),
             Ok(Normalized::Chain { .. }) => panic!("expected a single-run normalization"),
+            Ok(Normalized::Watch(_)) => panic!("expected a single-run normalization"),
             Err(e) => Err(e),
         }
     }
@@ -1340,12 +1502,25 @@ mod tests {
     fn stages_of(args: &[&str]) -> Vec<StageArgv> {
         match super::normalize(os(args)).unwrap() {
             Normalized::Chain { stages } => stages,
-            Normalized::Single { .. } => panic!("expected a chain normalization"),
+            Normalized::Single { .. } | Normalized::Watch(_) => {
+                panic!("expected a chain normalization")
+            }
+        }
+    }
+
+    /// The watch view: unwraps [`Normalized::Watch`].
+    fn watch_of(args: Vec<OsString>) -> WatchArgs {
+        match super::normalize(args).unwrap() {
+            Normalized::Watch(args) => args,
+            _ => panic!("expected a watch normalization"),
         }
     }
 
     fn task_of(args: &[&str]) -> String {
-        normalize(os(args)).unwrap().task.unwrap()
+        match super::normalize(os(args)).unwrap() {
+            Normalized::Single { task, .. } => task.unwrap(),
+            _ => panic!("expected a single-run normalization"),
+        }
     }
 
     #[test]
@@ -1447,6 +1622,121 @@ mod tests {
         // The ask path produces the same Glob spec.
         let n = normalize(os(&["-p", "hi", "shots/*.png"])).unwrap();
         assert_eq!(n.specs, vec![SourceSpec::Glob("shots/*.png".into())]);
+    }
+
+    #[test]
+    fn watch_parses_dir_and_task_argv() {
+        let w = watch_of(os(&["watch", "shots", "--", "ocr", "--copy"]));
+        assert_eq!(w.dir, PathBuf::from("shots"));
+        assert_eq!(w.task_argv, os(&["ocr", "--copy"]));
+        assert!(w.parent_argv.is_empty());
+        assert!(!w.include_existing);
+        assert_eq!(w.interval, None);
+        assert_eq!(w.stable_ms, None);
+    }
+
+    #[test]
+    fn watch_flags_parse_in_both_spellings() {
+        let w = watch_of(os(&[
+            "watch",
+            "d",
+            "--interval",
+            "0.5",
+            "--stable-ms=250",
+            "--include-existing",
+            "--dry-run",
+            "--quiet",
+            "--json",
+            "--",
+            "tts",
+            "--out-dir",
+            "o/",
+        ]));
+        assert_eq!(w.interval, Some(0.5));
+        assert_eq!(w.stable_ms, Some(250));
+        assert!(w.include_existing);
+        assert_eq!(w.task_argv, os(&["tts", "--out-dir", "o/"]));
+        assert_eq!(w.parent_argv, os(&["--dry-run", "--quiet", "--json"]));
+    }
+
+    #[test]
+    fn watch_requires_dir_and_task() {
+        let e = normalize(os(&["watch", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("watch requires a directory"), "{e}");
+        let e = normalize(os(&["watch", "d"])).unwrap_err().to_string();
+        assert!(e.contains("`--` separator"), "{e}");
+        let e = normalize(os(&["watch", "d", "--"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`--` separator"), "{e}");
+        let e = normalize(os(&["watch", "a", "b", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("exactly one directory"), "{e}");
+    }
+
+    #[test]
+    fn watch_refuses_task_flags_before_separator() {
+        for flag in ["--copy", "--out-dir", "-o", "-ofile"] {
+            let e = normalize(os(&["watch", "d", flag, "--", "ocr"]))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("belong after the `--` separator"), "{flag}: {e}");
+        }
+        // A bare positional is a second directory, not material: watch
+        // takes its input from the filesystem, not the command line.
+        let e = normalize(os(&["watch", "d", "out.png", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("exactly one directory"), "{e}");
+    }
+
+    #[test]
+    fn watch_refuses_dry_run_inside_the_task() {
+        let e = normalize(os(&["watch", "d", "--", "ocr", "--dry-run"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot be part of a watched task"), "{e}");
+    }
+
+    #[test]
+    fn watch_must_open_the_command_line() {
+        let e = normalize(os(&["--quiet", "watch", "d", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'watch' must be the first word"), "{e}");
+    }
+
+    #[test]
+    fn watch_help_is_plain_help() {
+        // watch --help falls back to the single-run shape, whose argv is
+        // what clap prints help from.
+        match super::normalize(os(&["watch", "--help"])).unwrap() {
+            Normalized::Single { argv, .. } => assert_eq!(argv, os(&["--help"])),
+            _ => panic!("expected the single-run help fallback"),
+        }
+    }
+
+    #[test]
+    fn watch_value_flags_validate_their_values() {
+        let e = normalize(os(&["watch", "d", "--interval", "x", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("number of seconds"), "{e}");
+        let e = normalize(os(&["watch", "d", "--interval", "0", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("positive"), "{e}");
+        let e = normalize(os(&["watch", "d", "--stable-ms", "1.5", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("whole number"), "{e}");
+        let e = normalize(os(&["watch", "d", "--interval", "--", "ocr"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--interval requires"), "{e}");
     }
 
     #[test]
