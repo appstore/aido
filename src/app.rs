@@ -69,15 +69,27 @@ pub async fn run() -> i32 {
     let wants_json = normalized.wants_json();
     // A chain never clap-parses the whole argv (`--then` markers and the
     // spec string are not part of its grammar): the stages parse in
-    // chain::parse, and the run-level surface is the last stage's, with
-    // the outer run-level flags merged in.
+    // chain::parse_syntax, and the run-level surface is the last stage's,
+    // with the outer run-level flags merged in. Syntax comes first and
+    // touches no config, so a stage's --help/--version works on a broken
+    // machine, exactly like a single task's.
     let (cli, chain) = match &normalized {
         cli::Normalized::Chain { stages } => {
+            let syntax = match chain::parse_syntax(stages.clone()) {
+                Ok(syntax) => syntax,
+                Err(chain::ChainParseError::Display(e)) => {
+                    // `--help`/`--version` inside a stage: print like clap
+                    // itself would and stop — nothing else was asked for.
+                    let _ = e.print();
+                    return if e.use_stderr() { 2 } else { 0 };
+                }
+                Err(chain::ChainParseError::Usage(e)) => return fail(&e, wants_json, None, None),
+            };
             let cfg = match config::load() {
                 Ok(cfg) => cfg,
                 Err(e) => return fail(&AppError::usage(format!("{e:#}")), wants_json, None, None),
             };
-            let prepared = match chain::parse(stages.clone(), &cfg) {
+            let prepared = match chain::prepare(syntax, &cfg) {
                 Ok(prepared) => prepared,
                 Err(e) => return fail(&e, wants_json, None, None),
             };

@@ -53,21 +53,48 @@ impl PreparedChain {
     }
 }
 
-/// Parse and validate every stage: clap per stage (errors prefixed with
-/// the stage number), the stage-level rejections, run-level flag merging
-/// and the junction type checks. Zero requests, zero side effects.
-pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
-    if stages.len() < 2 {
-        return Err(AppError::usage("a chain needs at least two stages"));
+/// One chain stage past clap parsing, before any config is read: the
+/// stage's name, its own clap surface, and its input specs (stage 1 only
+/// — later stages read the previous stage's output).
+pub struct SyntaxStage {
+    pub name: String,
+    pub cli: Cli,
+    pub specs: Vec<SourceSpec>,
+}
+
+/// The syntax half of a chain, parsed without touching the config: a
+/// stage's `--help`/`--version` must work on a broken machine, exactly
+/// like a single task's.
+pub struct SyntaxChain {
+    pub stages: Vec<SyntaxStage>,
+}
+
+/// Why [`parse_syntax`] stopped. `Display` is a stage asking for
+/// `--help`/`--version`: the caller prints it and exits 0, keeping
+/// process exit decisions out of the parser.
+pub enum ChainParseError {
+    Display(clap::Error),
+    Usage(AppError),
+}
+
+/// Parse and validate chain syntax: clap per stage (errors prefixed with
+/// the stage number), the management-word rejections and the stage-level
+/// structural checks. Zero config, zero requests, zero side effects.
+pub fn parse_syntax(stages: Vec<StageArgv>) -> Result<SyntaxChain, ChainParseError> {
+    fn usage(e: impl Into<AppError>) -> ChainParseError {
+        ChainParseError::Usage(e.into())
     }
-    let mut parsed: Vec<StageParsed> = Vec::new();
+    if stages.len() < 2 {
+        return Err(usage(AppError::usage("a chain needs at least two stages")));
+    }
+    let mut parsed: Vec<SyntaxStage> = Vec::new();
     for (i, stage) in stages.into_iter().enumerate() {
         let index = i + 1;
         let name = stage.task.clone().ok_or_else(|| {
-            AppError::usage(format!(
+            usage(AppError::usage(format!(
                 "chain stage {index} must name a task (its first word, as in \
                  `aido ocr shot.png --then translate`)"
-            ))
+            )))
         })?;
         if matches!(
             name.as_str(),
@@ -88,9 +115,9 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
             } else {
                 name.as_str()
             };
-            return Err(AppError::usage(format!(
+            return Err(usage(AppError::usage(format!(
                 "'{shown}' cannot be a chain stage"
-            )));
+            ))));
         }
         let cli = match Cli::try_parse_from(
             std::iter::once(OsString::from("aido")).chain(stage.argv.iter().cloned()),
@@ -98,32 +125,50 @@ pub fn parse(stages: Vec<StageArgv>, cfg: &Config) -> AppResult<PreparedChain> {
             Ok(cli) => cli,
             Err(e) => {
                 if e.use_stderr() {
-                    return Err(AppError::usage(format!("stage {index} ({name}): {e}")));
+                    return Err(usage(AppError::usage(format!(
+                        "stage {index} ({name}): {e}"
+                    ))));
                 }
-                // `--help`/`--version` inside a stage: print like clap
-                // itself would and stop here — nothing else was asked for.
-                let _ = e.print();
-                std::process::exit(0);
+                // `--help`/`--version` inside a stage: hand the display
+                // error to the caller — nothing else was asked for.
+                return Err(ChainParseError::Display(e));
             }
         };
         if i > 0 && !stage.specs.is_empty() {
-            return Err(AppError::usage(format!(
+            return Err(usage(AppError::usage(format!(
                 "chain stage {index} takes no input material; it reads the previous \
                  stage's output"
-            )));
+            ))));
         }
         if name == "ask" && cli.prompt.as_deref().is_none_or(str::is_empty) {
-            return Err(AppError::usage(format!(
+            return Err(usage(AppError::usage(format!(
                 "stage {index} (ask) needs -p with the instruction, e.g. \
                  aido chain \"ask -p '...' | tts\""
-            )));
+            ))));
         }
+        parsed.push(SyntaxStage {
+            name,
+            cli,
+            specs: stage.specs,
+        });
+    }
+    Ok(SyntaxChain { stages: parsed })
+}
+
+/// Resolve a syntax-parsed chain against the config: task lookup, route
+/// resolution, run-level flag merging, the per-stage preflight and the
+/// junction type checks. Every rejection here is still zero requests.
+pub fn prepare(syntax: SyntaxChain, cfg: &Config) -> AppResult<PreparedChain> {
+    let mut parsed: Vec<StageParsed> = Vec::new();
+    for (i, stage) in syntax.stages.into_iter().enumerate() {
+        let index = i + 1;
+        let name = stage.name;
         let task = tasks::get(&name).map_err(|e| AppError::usage(format!("{e:#}")))?;
-        let resolved = resolve::resolve(&cli, cfg, &task)
+        let resolved = resolve::resolve(&stage.cli, cfg, &task)
             .map_err(|e| AppError::usage(format!("stage {index} ({name}): {e:#}")))?;
         parsed.push(StageParsed {
             task,
-            cli,
+            cli: stage.cli,
             specs: stage.specs,
             resolved,
         });

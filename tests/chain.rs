@@ -1348,3 +1348,44 @@ fn json_as_a_flag_value_inside_a_stage_is_not_json() {
         out.stderr()
     );
 }
+
+/// Stage `--help`/`--version` is a display request, not a run: it must
+/// work without a readable config (a single task's does), exit 0, and
+/// print to stdout. The library never terminates the process for it.
+#[test]
+fn chain_help_and_version_need_no_config() {
+    let broken = settings_config("invalid = [");
+
+    // A stage's --help prints usage (the shared clap surface — which
+    // stage's banner shows is today's behavior and stays that way).
+    let out = run_with(&["chain", "summarize --help | tts"], b"", &[], &broken);
+    assert_eq!(out.code(), 0, "stderr: {}", out.stderr());
+    assert!(out.stdout().contains("Usage"), "{}", out.stdout());
+
+    // A stage's --version prints the version.
+    let out = run_with(&["chain", "summarize -V | tts"], b"", &[], &broken);
+    assert_eq!(out.code(), 0, "stderr: {}", out.stderr());
+    assert!(out.stdout().contains("aido 0."), "{}", out.stdout());
+
+    // The --then form: the help lands in the last stage's argv.
+    let out = run_with(&["summarize", "--then", "tts", "--help"], b"", &[], &broken);
+    assert_eq!(out.code(), 0, "stderr: {}", out.stderr());
+    assert!(out.stdout().contains("Usage"), "{}", out.stdout());
+
+    // Top-level chain help/version stay clap-owned and config-free too.
+    let out = run_with(&["chain", "--help"], b"", &[], &broken);
+    assert_eq!(out.code(), 0);
+    let out = run_with(&["chain", "-V"], b"", &[], &broken);
+    assert_eq!(out.code(), 0);
+
+    // A real syntax error still exits 2 with its stage prefix — no config
+    // was needed to know that.
+    let out = run_with(&["chain", "summarize --bogus | tts"], b"", &[], &broken);
+    out.assert_code(2);
+    assert!(
+        out.stderr()
+            .contains("stage 1 (summarize): error: unexpected argument '--bogus'"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
