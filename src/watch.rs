@@ -248,8 +248,9 @@ struct Probe {
 /// is a placeholder input standing in for each arriving file.
 fn probe(cli: &Cli, args: &WatchArgs, guard: &Path) -> AppResult<Probe> {
     // The task is whoever the normalizer says it is — the same parse the
-    // per-file runs go through, so a form a plain run accepts (`--copy
-    // ocr`, `run ocr`, an implicit `-p` ask) cannot be refused here.
+    // per-file runs go through, so a single-task form a plain run accepts
+    // (`--copy ocr`, `run ocr`, an implicit `-p` ask) cannot be refused
+    // here, and a chain spelling is refused identically in both places.
     let invocation = parse_task_invocation(args.task_argv.clone())?;
     let task = tasks::get(&invocation.task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
 
@@ -365,18 +366,22 @@ fn probe_plan(
 
 /// A fully parsed task invocation: the clap `Cli` a run will use, the task
 /// name the normalizer resolved, and the input specs.
+#[derive(Debug)]
 struct TaskInvocation {
     cli: Cli,
     task_name: String,
     specs: Vec<SourceSpec>,
 }
 
-/// Parse a task invocation exactly the way a plain run parses it: the
-/// normalizer decides which token names the task (so `--copy ocr`, `run
-/// ocr` and an implicit `-p` ask all work), then clap parses the flags.
-/// The watch layer adds no parsing rules of its own — the startup precheck
-/// and the per-file runs must never disagree about what an invocation
-/// means.
+/// Parse the single-task invocation used by watch.
+///
+/// The ordinary normalizer still decides task names, flag ownership, `run
+/// NAME`, implicit `-p` ask and input specs, so watch does not maintain a
+/// second task grammar — the startup precheck and the per-file runs can
+/// never disagree about what an invocation means. Watch v1 deliberately
+/// rejects [`cli::Normalized::Chain`]: each arriving file runs exactly one
+/// task, and chain composition (file injection, artifact naming, history,
+/// cancellation semantics) is defined later, if at all.
 fn parse_task_invocation(argv: Vec<OsString>) -> AppResult<TaskInvocation> {
     let normalized = cli::normalize(argv).map_err(|e| AppError::usage(format!("{e:#}")))?;
     let (cli, task_name, specs) = match &normalized {
@@ -395,7 +400,8 @@ fn parse_task_invocation(argv: Vec<OsString>) -> AppResult<TaskInvocation> {
         // per-file stem naming have no chain story yet.
         cli::Normalized::Chain { .. } => {
             return Err(AppError::usage(
-                "a watched invocation cannot be a task chain; watch a single task                  (v1 keeps watches and chains apart)",
+                "task chains are not supported inside watch v1; \
+                 watch runs exactly one task per arriving file",
             ));
         }
         cli::Normalized::Watch(_) => {
@@ -665,9 +671,40 @@ impl WatchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ErrorKind;
+
+    fn argv(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
 
     fn entries(names: &[&str]) -> Vec<(PathBuf, u64)> {
         names.iter().map(|n| (PathBuf::from(n), 10)).collect()
+    }
+
+    /// Both chain spellings reduce to [`cli::Normalized::Chain`] in the
+    /// normalizer, so both must hit the same watch-v1 refusal — a bypass
+    /// through either entry point would be a contract hole.
+    #[test]
+    fn watch_rejects_chain_sugar() {
+        let err = parse_task_invocation(argv(&["chain", "ocr | translate", "--copy"])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message
+                .contains("task chains are not supported inside watch v1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn watch_rejects_then_chain() {
+        let err =
+            parse_task_invocation(argv(&["ocr", "--then", "translate", "--copy"])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message
+                .contains("task chains are not supported inside watch v1"),
+            "{err}"
+        );
     }
 
     #[test]
