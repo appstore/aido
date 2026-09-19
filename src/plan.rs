@@ -208,16 +208,7 @@ fn plan_from(
 ) -> AppResult<ExecutionPlan> {
     // --- inputs -----------------------------------------------------------
     validate_inputs(task, &resolved, &inputs)?;
-    // Adapter availability: the EdgeTts variant stays compiled without the
-    // feature (so a config naming 'edge-tts' still parses), but no adapter
-    // is linked — refuse here, where --dry-run already reports it, instead
-    // of waiting for the send-time defense.
-    #[cfg(not(feature = "edge-tts"))]
-    if resolved.adapter == crate::api::Adapter::EdgeTts {
-        return Err(AppError::usage(
-            crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
-        ));
-    }
+    validate_adapter_availability(&resolved)?;
     edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
     let processor = select_processor(cli, task);
     let steps = if task.per_part {
@@ -439,6 +430,26 @@ fn edge_tts_instruction_check(
     Ok(())
 }
 
+/// Whether the stage's adapter exists in this build: the EdgeTts variant
+/// stays compiled without the feature (so a config naming 'edge-tts'
+/// still parses), but no adapter is linked — refuse here, where --dry-run
+/// already reports it, instead of waiting for the send-time defense.
+/// Shared by the plan build and the chain's parse-time preflight, so a
+/// chain can never pay stage 1 before learning that a later stage's
+/// adapter is unavailable.
+fn validate_adapter_availability(resolved: &Resolved) -> AppResult<()> {
+    #[cfg(not(feature = "edge-tts"))]
+    if resolved.adapter == crate::api::Adapter::EdgeTts {
+        return Err(AppError::usage(
+            crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
+        ));
+    }
+    // With the feature on there is nothing to check; keep the parameter used.
+    #[cfg(feature = "edge-tts")]
+    let _ = resolved;
+    Ok(())
+}
+
 /// The material-independent plan checks, run per stage at chain parse
 /// time: typed parameters, adapter option validation, the edge-tts
 /// instruction channel, the stream capability and the output/encoding
@@ -455,6 +466,7 @@ pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config, last: bool) 
     let mut resolved =
         resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
     apply_param_options(cli, task, &mut resolved)?;
+    validate_adapter_availability(&resolved)?;
     let instruction = compose_instruction(cli, task)?;
     let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
     edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
@@ -598,8 +610,8 @@ pub(crate) fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
 
 /// Whether one input kind is acceptable to this stage: the task∩profile
 /// allow-list when one exists, else the adapter's accepted set. The
-/// shared predicate behind [`validate_inputs`] and the chain's junction
-/// type check.
+/// shared predicate behind [`validate_inputs`], [`validate_junction_input`]
+/// and the chain's junction type check.
 pub(crate) fn kind_accepted(resolved: &Resolved, kind: MediaKind) -> bool {
     if let Some(allowed) = &resolved.allowed_inputs {
         allowed.contains(&kind)
@@ -618,15 +630,7 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
             task.name
         )));
     }
-    if let Some(max) = task.max_inputs {
-        if inputs.len() > max {
-            return Err(AppError::usage(format!(
-                "task '{}' accepts at most {max} input(s), got {}",
-                task.name,
-                inputs.len()
-            )));
-        }
-    }
+    validate_input_count(task, inputs.len())?;
     for part in inputs {
         // An unknown-kind part is the --dry-run clipboard placeholder:
         // its real kind is decided when the clipboard is read, so neither
@@ -635,29 +639,8 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         if part.unknown_kind {
             continue;
         }
-        if let Some(allowed) = &resolved.allowed_inputs {
-            if !allowed.contains(&part.kind) {
-                return Err(AppError::usage(format!(
-                    "input '{}' is {}, which this task/profile does not accept \
-                     (allowed: {}){}",
-                    part.name,
-                    part.kind,
-                    allowed
-                        .iter()
-                        .map(|k| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    origin_note(part)
-                )));
-            }
-        } else if !resolved.adapter.inputs().contains(&part.kind) {
-            return Err(AppError::usage(format!(
-                "adapter '{}' does not accept input type '{}' (input '{}'){}",
-                resolved.adapter,
-                part.kind,
-                part.name,
-                origin_note(part)
-            )));
+        if !kind_accepted(resolved, part.kind) {
+            return Err(AppError::usage(kind_rejection(resolved, part)));
         }
     }
     for required in &task.required_types {
@@ -671,6 +654,77 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     Ok(())
+}
+
+/// The count half of [`validate_inputs`], shared with the chain junction:
+/// a junction hands exactly one part to the next stage, so the count is
+/// fully known at parse time.
+fn validate_input_count(task: &Task, count: usize) -> AppResult<()> {
+    if let Some(max) = task.max_inputs {
+        if count > max {
+            return Err(AppError::usage(format!(
+                "task '{}' accepts at most {max} input(s), got {count}",
+                task.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The full input judgment for a chain junction's downstream stage: the
+/// junction hands exactly one text part, so kind and count are both known
+/// at parse time — a stage that cannot receive them must fail before
+/// stage 1's paid request, exactly like the other preflight checks.
+/// The count rule is the same [`validate_input_count`] the real plan
+/// build applies; the kind rule is [`kind_accepted`].
+pub(crate) fn validate_junction_input(task: &Task, resolved: &Resolved) -> AppResult<()> {
+    validate_input_count(task, 1)?;
+    if !kind_accepted(resolved, MediaKind::Text) {
+        return Err(AppError::usage(format!(
+            "the stage does not accept text input (allowed: {})",
+            match &resolved.allowed_inputs {
+                Some(list) => list
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => resolved
+                    .adapter
+                    .inputs()
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// The type-rejection message for a real input part: the task∩profile
+/// allow-list and the adapter's accepted set word it differently.
+fn kind_rejection(resolved: &Resolved, part: &InputPart) -> String {
+    match &resolved.allowed_inputs {
+        Some(allowed) => format!(
+            "input '{}' is {}, which this task/profile does not accept \
+             (allowed: {}){}",
+            part.name,
+            part.kind,
+            allowed
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            origin_note(part)
+        ),
+        None => format!(
+            "adapter '{}' does not accept input type '{}' (input '{}'){}",
+            resolved.adapter,
+            part.kind,
+            part.name,
+            origin_note(part)
+        ),
+    }
 }
 
 /// Materialized parts are the only ones whose name is not a name the user
@@ -1302,6 +1356,90 @@ mod tests {
     fn empty_and_untagged_step_lists_pass() {
         assert_parts_contiguous(&[]).unwrap();
         assert_parts_contiguous(&[step(0, None), step(1, None)]).unwrap();
+    }
+
+    fn junction_task(name: &str, max_inputs: Option<usize>) -> Task {
+        Task {
+            name: name.into(),
+            operation: crate::tasks::Operation::Generate,
+            instruction: String::new(),
+            profile: None,
+            input_types: None,
+            required_types: Vec::new(),
+            max_inputs,
+            output_types: vec![MediaKind::Text],
+            requires_material: true,
+            processor: ProcessorKind::Single,
+            per_part: false,
+            params: Vec::new(),
+            defaults: Default::default(),
+            options: Default::default(),
+            builtin: true,
+        }
+    }
+
+    fn chat_resolved() -> Resolved {
+        Resolved {
+            profile_name: "p".into(),
+            provider_name: "p".into(),
+            adapter: crate::api::Adapter::Chat,
+            base_url: None,
+            api_key_env: None,
+            model: "m".into(),
+            model_source: crate::config::resolve::ParamSource::Default,
+            max_tokens: None,
+            max_tokens_source: crate::config::resolve::ParamSource::Default,
+            temperature: None,
+            temperature_source: crate::config::resolve::ParamSource::Default,
+            options: Default::default(),
+            allowed_inputs: None,
+            required_inputs: Vec::new(),
+            produce: vec![MediaKind::Text],
+        }
+    }
+
+    /// The junction hands exactly one text part downstream, so even the
+    /// count rule is a parse-time fact: a downstream `max_inputs = 0`
+    /// fails the junction before stage 1's paid request.
+    #[test]
+    fn junction_input_rejects_a_zero_max_inputs_downstream() {
+        let task = junction_task("solo", Some(0));
+        let err = validate_junction_input(&task, &chat_resolved()).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("accepts at most 0 input(s)"), "{err}");
+
+        // One text input is exactly the junction's shape.
+        let task = junction_task("normal", Some(1));
+        validate_junction_input(&task, &chat_resolved()).unwrap();
+    }
+
+    #[test]
+    fn junction_input_rejects_a_stage_that_refuses_text() {
+        let mut resolved = chat_resolved();
+        resolved.allowed_inputs = Some(vec![MediaKind::Audio]);
+        let task = junction_task("audio-only", None);
+        let err = validate_junction_input(&task, &resolved).unwrap_err();
+        assert!(err.message.contains("does not accept text input"), "{err}");
+    }
+
+    /// Without the edge-tts feature the adapter variant still parses (a
+    /// config naming it is readable), but preflight must refuse it: a
+    /// chain would otherwise pay stage 1 before stage 2's plan build
+    /// discovered the missing adapter.
+    #[cfg(not(feature = "edge-tts"))]
+    #[test]
+    fn preflight_refuses_an_edge_tts_route_without_the_feature() {
+        let resolved = Resolved {
+            adapter: crate::api::Adapter::EdgeTts,
+            produce: vec![MediaKind::Audio],
+            ..chat_resolved()
+        };
+        let err = validate_adapter_availability(&resolved).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message.contains(crate::api::EDGE_TTS_NOT_COMPILED),
+            "{err}"
+        );
     }
     #[test]
     fn redact_url_hides_userinfo_credentials() {

@@ -1199,3 +1199,75 @@ fn then_form_stage1_batch_with_outer_outdir_is_refused_without_paying() {
         out.stderr()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review regressions, round three: the parse-time preflight must cover
+// every judgment that does not need real material, so a chain can never
+// pay stage 1 before learning that a later stage cannot run.
+// ---------------------------------------------------------------------------
+
+/// Without the edge-tts feature the tts stage cannot run at all; the
+/// refusal must come at parse time (exit 2, zero requests) instead of
+/// after stage 1's paid request. An exit of 3 here would mean the request
+/// went out (connection refused), so the code alone proves the contract.
+#[cfg(not(feature = "edge-tts"))]
+#[test]
+fn chain_rejects_unavailable_edge_tts_before_stage1_request() {
+    // Stage 1 keeps a plain chat route; the tts stage's profile routes
+    // speech to the edge-tts adapter the binary was built without.
+    let cfg = settings_config(
+        "default_profile = \"test\"\n\
+         [settings]\nhistory_keep = 0\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+         [profiles.speech]\nprovider = \"msft\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:1\"\n\
+         [providers.msft]\n[providers.msft.routes]\nspeech = \"edge-tts\"",
+    );
+    let out = run_with(
+        &["chain", "summarize | tts --profile speech", "--text", "hi"],
+        b"",
+        &[("AIDO_CONFIG", cfg.to_str().unwrap())],
+        &cfg,
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr()
+            .contains("stage 2 (tts): the 'edge-tts' adapter is not compiled"),
+        "stderr: {}",
+        out.stderr()
+    );
+}
+
+/// The junction hands exactly one text part downstream, so the
+/// downstream's `max_inputs` is judged at parse time with the same rule
+/// the plan build applies — before stage 1 pays.
+#[test]
+fn downstream_max_inputs_zero_fails_the_junction_before_stage1() {
+    let tasks = temp_dir("chain-max-inputs");
+    std::fs::write(
+        tasks.join("solo.toml"),
+        "operation = \"generate\"\n\
+         input_types = [\"text\"]\n\
+         max_inputs = 0\n\
+         output_types = [\"text\"]\n",
+    )
+    .unwrap();
+    let out = run_with(
+        &["chain", "summarize | solo", "--text", "hi"],
+        b"",
+        &[("AIDO_TASKS_DIR", tasks.to_str().unwrap())],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    assert!(
+        out.stderr().contains("accepts at most 0 input(s)"),
+        "stderr: {}",
+        out.stderr()
+    );
+    assert!(
+        out.stderr()
+            .contains("stage 1 (summarize) → stage 2 (solo)"),
+        "stderr: {}",
+        out.stderr()
+    );
+}

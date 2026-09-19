@@ -282,7 +282,9 @@ fn merge_opt<T: PartialEq + Clone>(
 
 /// The junction contract, checked in order for every adjacent pair: the
 /// upstream stage produces exactly one text artifact; the downstream
-/// stage accepts text; its required kinds are met. A violation stops the
+/// stage accepts text and takes at most the one input the junction hands
+/// it ([`plan::validate_junction_input`], the same rules the real plan
+/// build applies); its required kinds are met. A violation stops the
 /// chain before any request exists.
 fn validate_chain_types(stages: &[StageParsed]) -> AppResult<()> {
     for k in 0..stages.len() - 1 {
@@ -303,13 +305,8 @@ fn validate_chain_types(stages: &[StageParsed]) -> AppResult<()> {
                 kinds(&up.resolved.produce)
             )));
         }
-        if !plan::kind_accepted(&down.resolved, MediaKind::Text) {
-            return Err(AppError::usage(format!(
-                "{junction}: {} does not accept text input (allowed: {})",
-                down.task.name,
-                allowed_kinds(&down.resolved)
-            )));
-        }
+        plan::validate_junction_input(&down.task, &down.resolved)
+            .map_err(|e| AppError::usage(format!("{junction}: {}", e.message)))?;
         for required in &down.task.required_types {
             if !up.resolved.produce.contains(required) {
                 return Err(AppError::usage(format!(
@@ -330,13 +327,6 @@ fn kinds(kinds: &[MediaKind]) -> String {
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn allowed_kinds(resolved: &Resolved) -> String {
-    match &resolved.allowed_inputs {
-        Some(list) => kinds(list),
-        None => kinds(resolved.adapter.inputs()),
-    }
 }
 
 fn processor_name(kind: ProcessorKind) -> &'static str {
