@@ -81,6 +81,9 @@ pub struct ExecutionPlan {
     pub param_sources: Vec<(String, String, ParamSource)>,
     pub credentials_available: Option<bool>,
     pub terminal: TerminalInfo,
+    /// Set only on chain stages: `chain 2/3`, shown by the spinner so a
+    /// multi-stage run says which stage is asking.
+    pub stage_label: Option<String>,
 }
 
 /// Old `-o` values that meant modes, not files.
@@ -101,14 +104,10 @@ pub fn build(
     terminal: TerminalInfo,
     env: &mut InputEnv<'_>,
 ) -> AppResult<ExecutionPlan> {
-    // --- task parameters -------------------------------------------------
-    validate_task_params(cli, task)?;
-    let mut resolved =
-        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
-    apply_param_options(cli, task, &mut resolved)?;
-    let instruction = compose_instruction(cli, task)?;
-    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
-
+    // Task parameters and route resolution come FIRST (contract §step 4):
+    // a knowable parameter or capability error must fire before any file
+    // is read, exactly as it always has.
+    let (resolved, instruction, requirement) = resolve_stage(cli, task, cfg)?;
     // --- inputs -----------------------------------------------------------
     let mut notes = Vec::new();
     let inputs = input::gather_with_notes(
@@ -131,37 +130,86 @@ pub fn build(
             eprintln!("note: {note}");
         }
     }
+    plan_from(
+        cli,
+        task,
+        inputs,
+        cfg,
+        terminal,
+        StageRole::Terminal,
+        resolved,
+        instruction,
+        requirement,
+    )
+}
+
+/// How a stage delivers: the last stage of a run owns the destinations
+/// and may stream; a chain's intermediate stages hand their single text
+/// artifact to the next stage and stay silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageRole {
+    Terminal,
+    Intermediate,
+}
+
+/// The planner over material that already exists: the ordinary run path
+/// gathers and lands here; a chain stage lands here with the previous
+/// stage's artifact as its single input.
+pub(crate) fn build_with_inputs(
+    cli: &Cli,
+    task: &Task,
+    inputs: Vec<InputPart>,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    role: StageRole,
+) -> AppResult<ExecutionPlan> {
+    let (resolved, instruction, requirement) = resolve_stage(cli, task, cfg)?;
+    plan_from(
+        cli,
+        task,
+        inputs,
+        cfg,
+        terminal,
+        role,
+        resolved,
+        instruction,
+        requirement,
+    )
+}
+
+/// The pure task-parameters preamble both planner entries share: typed
+/// parameter validation, route resolution, param options and the composed
+/// instruction. No IO.
+fn resolve_stage(
+    cli: &Cli,
+    task: &Task,
+    cfg: &Config,
+) -> AppResult<(Resolved, String, Option<String>)> {
+    validate_task_params(cli, task)?;
+    let mut resolved =
+        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    apply_param_options(cli, task, &mut resolved)?;
+    let instruction = compose_instruction(cli, task)?;
+    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
+    Ok((resolved, instruction, requirement))
+}
+
+#[allow(clippy::too_many_arguments)] // one planner body over two entries
+fn plan_from(
+    cli: &Cli,
+    task: &Task,
+    inputs: Vec<InputPart>,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    role: StageRole,
+    mut resolved: Resolved,
+    instruction: String,
+    requirement: Option<String>,
+) -> AppResult<ExecutionPlan> {
+    // --- inputs -----------------------------------------------------------
     validate_inputs(task, &resolved, &inputs)?;
-    // Adapter availability: the EdgeTts variant stays compiled without the
-    // feature (so a config naming 'edge-tts' still parses), but no adapter
-    // is linked — refuse here, where --dry-run already reports it, instead
-    // of waiting for the send-time defense.
-    #[cfg(not(feature = "edge-tts"))]
-    if resolved.adapter == crate::api::Adapter::EdgeTts {
-        return Err(AppError::usage(
-            crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
-        ));
-    }
-    // Adapter capability: the edge-tts protocol has no instruction channel.
-    // Refusing at plan time (not just at send time) keeps --dry-run honest
-    // about a plan that could never execute.
-    if resolved.adapter == crate::api::Adapter::EdgeTts {
-        let from_task = !instruction.trim().is_empty();
-        let from_prompt = requirement.as_deref().is_some_and(|p| !p.trim().is_empty());
-        if from_task || from_prompt {
-            let source = match (from_task, from_prompt) {
-                (true, true) => "the task's fixed instruction and -p",
-                (true, false) => "the task's fixed instruction",
-                _ => "-p",
-            };
-            return Err(AppError::usage(format!(
-                "{}; {} would have nowhere to go — drop it, or use a provider \
-                 whose speech route has one",
-                crate::api::EDGE_NO_INSTRUCTION_CHANNEL,
-                source
-            )));
-        }
-    }
+    validate_adapter_availability(&resolved)?;
+    edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
     let processor = select_processor(cli, task);
     let steps = if task.per_part {
         processors::perpart::plan_steps(&inputs, processor, cli.quiet)
@@ -177,6 +225,19 @@ pub fn build(
     part_ids.sort_unstable();
     part_ids.dedup();
     let batch = part_ids.len() > 1;
+    // An intermediate stage hands its artifact to the next stage: a real
+    // per-part batch has no single result to hand off, whatever delivery
+    // flags say. Refused before the batch-delivery checks so the message
+    // names the chain contract, not a missing --out-dir.
+    let intermediate = role == StageRole::Intermediate;
+    if intermediate && batch {
+        return Err(AppError::usage(format!(
+            "an intermediate chain stage must hand off a single result, but {} unit(s) \
+             would run one request each; run the batch form on its own (v1 keeps \
+             chains and per-part batches apart)",
+            part_ids.len()
+        )));
+    }
     // Delivery-target rules bind a --dry-run too: they are pure prechecks
     // with no side effects, and a plan the real run would reject must not
     // be shown as if it were deliverable.
@@ -199,8 +260,15 @@ pub fn build(
     validate_outputs(cli, &mut resolved, &steps)?;
 
     // --- destinations -------------------------------------------------------
-    let destinations = resolve_destinations(cli, &resolved.produce, terminal)?;
-    if batch
+    // An intermediate stage hands its artifact to the next stage: it has
+    // no destinations of its own and never reaches delivery.
+    let destinations = if intermediate {
+        Vec::new()
+    } else {
+        resolve_destinations(cli, &resolved.produce, terminal)?
+    };
+    if !intermediate
+        && batch
         && (destinations.contains(&Destination::Stdout) && !cli.json
             || destinations.contains(&Destination::Clipboard))
     {
@@ -236,8 +304,10 @@ pub fn build(
         DeliveryMode::Buffered
     };
     // A batch never streams live: replies belong to named artifacts in a
-    // directory, and a failed part must not have already hit stdout.
-    let delivery = if batch {
+    // directory, and a failed part must not have already hit stdout. An
+    // intermediate stage never streams either — only the last stage of a
+    // chain owns stdout.
+    let delivery = if intermediate || batch {
         DeliveryMode::Buffered
     } else {
         delivery
@@ -300,6 +370,7 @@ pub fn build(
         param_sources,
         credentials_available,
         terminal,
+        stage_label: None,
     })
 }
 
@@ -326,6 +397,91 @@ fn assert_parts_contiguous(steps: &[RequestStep]) -> AppResult<()> {
             )));
         }
         last = Some(id);
+    }
+    Ok(())
+}
+
+/// The edge-tts protocol has no instruction channel: an instruction that
+/// would go nowhere is a usage error at plan time (and at chain parse
+/// time) rather than at send time.
+fn edge_tts_instruction_check(
+    resolved: &Resolved,
+    instruction: &str,
+    requirement: Option<&str>,
+) -> AppResult<()> {
+    if resolved.adapter != crate::api::Adapter::EdgeTts {
+        return Ok(());
+    }
+    let from_task = !instruction.trim().is_empty();
+    let from_prompt = requirement.is_some_and(|p| !p.trim().is_empty());
+    if from_task || from_prompt {
+        let source = match (from_task, from_prompt) {
+            (true, true) => "the task's fixed instruction and -p",
+            (true, false) => "the task's fixed instruction",
+            _ => "-p",
+        };
+        return Err(AppError::usage(format!(
+            "{}; {} would have nowhere to go — drop it, or use a provider \
+             whose speech route has one",
+            crate::api::EDGE_NO_INSTRUCTION_CHANNEL,
+            source
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the stage's adapter exists in this build: the EdgeTts variant
+/// stays compiled without the feature (so a config naming 'edge-tts'
+/// still parses), but no adapter is linked — refuse here, where --dry-run
+/// already reports it, instead of waiting for the send-time defense.
+/// Shared by the plan build and the chain's parse-time preflight, so a
+/// chain can never pay stage 1 before learning that a later stage's
+/// adapter is unavailable.
+fn validate_adapter_availability(resolved: &Resolved) -> AppResult<()> {
+    #[cfg(not(feature = "edge-tts"))]
+    if resolved.adapter == crate::api::Adapter::EdgeTts {
+        return Err(AppError::usage(
+            crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
+        ));
+    }
+    // With the feature on there is nothing to check; keep the parameter used.
+    #[cfg(feature = "edge-tts")]
+    let _ = resolved;
+    Ok(())
+}
+
+/// The material-independent plan checks, run per stage at chain parse
+/// time: typed parameters, adapter option validation, the edge-tts
+/// instruction channel, the stream capability and the output/encoding
+/// rules. A stage that cannot work must fail before stage 1's paid
+/// request, not after it. Pure computation — no gather, no IO.
+///
+/// `last` gates the delivery-shaped output rules: they read the
+/// run-level `-o`/`--out-dir`, which a chain merges into its final stage
+/// — an earlier stage has no delivery of its own, and judging it against
+/// those flags would reject chains whose delivery flags sit in the outer
+/// argv.
+pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config, last: bool) -> AppResult<()> {
+    validate_task_params(cli, task)?;
+    let mut resolved =
+        resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
+    apply_param_options(cli, task, &mut resolved)?;
+    validate_adapter_availability(&resolved)?;
+    let instruction = compose_instruction(cli, task)?;
+    let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
+    edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
+    // `--stream` demands a streaming adapter — the same judgment
+    // `plan_from` applies, pulled forward to parse time so a merged
+    // run-level `--stream` cannot surface only after stage 1 paid.
+    if cli.stream && !resolved.adapter.streams() {
+        return Err(AppError::usage(format!(
+            "adapter '{}' does not support --stream; use --no-stream or omit the flag",
+            resolved.adapter
+        )));
+    }
+    validate_format_outputs(cli, &mut resolved)?;
+    if last {
+        validate_delivery_outputs(cli, &mut resolved)?;
     }
     Ok(())
 }
@@ -428,7 +584,7 @@ fn param_value(cli: &Cli, task: &Task, param: TaskParam) -> Option<serde_json::V
 }
 
 /// The fixed instruction with typed parameter effects folded in.
-fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
+pub(crate) fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
     let mut instruction = task.instruction.trim().to_string();
     if task.accepts_param("to") {
         let to = cli
@@ -452,6 +608,18 @@ fn compose_instruction(cli: &Cli, task: &Task) -> AppResult<String> {
     Ok(instruction)
 }
 
+/// Whether one input kind is acceptable to this stage: the task∩profile
+/// allow-list when one exists, else the adapter's accepted set. The
+/// shared predicate behind [`validate_inputs`], [`validate_junction_input`]
+/// and the chain's junction type check.
+pub(crate) fn kind_accepted(resolved: &Resolved, kind: MediaKind) -> bool {
+    if let Some(allowed) = &resolved.allowed_inputs {
+        allowed.contains(&kind)
+    } else {
+        resolved.adapter.inputs().contains(&kind)
+    }
+}
+
 fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> AppResult<()> {
     if !task.requires_material && inputs.is_empty() {
         return Ok(());
@@ -462,15 +630,7 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
             task.name
         )));
     }
-    if let Some(max) = task.max_inputs {
-        if inputs.len() > max {
-            return Err(AppError::usage(format!(
-                "task '{}' accepts at most {max} input(s), got {}",
-                task.name,
-                inputs.len()
-            )));
-        }
-    }
+    validate_input_count(task, inputs.len())?;
     for part in inputs {
         // An unknown-kind part is the --dry-run clipboard placeholder:
         // its real kind is decided when the clipboard is read, so neither
@@ -479,29 +639,8 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         if part.unknown_kind {
             continue;
         }
-        if let Some(allowed) = &resolved.allowed_inputs {
-            if !allowed.contains(&part.kind) {
-                return Err(AppError::usage(format!(
-                    "input '{}' is {}, which this task/profile does not accept \
-                     (allowed: {}){}",
-                    part.name,
-                    part.kind,
-                    allowed
-                        .iter()
-                        .map(|k| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    origin_note(part)
-                )));
-            }
-        } else if !resolved.adapter.inputs().contains(&part.kind) {
-            return Err(AppError::usage(format!(
-                "adapter '{}' does not accept input type '{}' (input '{}'){}",
-                resolved.adapter,
-                part.kind,
-                part.name,
-                origin_note(part)
-            )));
+        if !kind_accepted(resolved, part.kind) {
+            return Err(AppError::usage(kind_rejection(resolved, part)));
         }
     }
     for required in &task.required_types {
@@ -515,6 +654,77 @@ fn validate_inputs(task: &Task, resolved: &Resolved, inputs: &[InputPart]) -> Ap
         }
     }
     Ok(())
+}
+
+/// The count half of [`validate_inputs`], shared with the chain junction:
+/// a junction hands exactly one part to the next stage, so the count is
+/// fully known at parse time.
+fn validate_input_count(task: &Task, count: usize) -> AppResult<()> {
+    if let Some(max) = task.max_inputs {
+        if count > max {
+            return Err(AppError::usage(format!(
+                "task '{}' accepts at most {max} input(s), got {count}",
+                task.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The full input judgment for a chain junction's downstream stage: the
+/// junction hands exactly one text part, so kind and count are both known
+/// at parse time — a stage that cannot receive them must fail before
+/// stage 1's paid request, exactly like the other preflight checks.
+/// The count rule is the same [`validate_input_count`] the real plan
+/// build applies; the kind rule is [`kind_accepted`].
+pub(crate) fn validate_junction_input(task: &Task, resolved: &Resolved) -> AppResult<()> {
+    validate_input_count(task, 1)?;
+    if !kind_accepted(resolved, MediaKind::Text) {
+        return Err(AppError::usage(format!(
+            "the stage does not accept text input (allowed: {})",
+            match &resolved.allowed_inputs {
+                Some(list) => list
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => resolved
+                    .adapter
+                    .inputs()
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// The type-rejection message for a real input part: the task∩profile
+/// allow-list and the adapter's accepted set word it differently.
+fn kind_rejection(resolved: &Resolved, part: &InputPart) -> String {
+    match &resolved.allowed_inputs {
+        Some(allowed) => format!(
+            "input '{}' is {}, which this task/profile does not accept \
+             (allowed: {}){}",
+            part.name,
+            part.kind,
+            allowed
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            origin_note(part)
+        ),
+        None => format!(
+            "adapter '{}' does not accept input type '{}' (input '{}'){}",
+            resolved.adapter,
+            part.kind,
+            part.name,
+            origin_note(part)
+        ),
+    }
 }
 
 /// Materialized parts are the only ones whose name is not a name the user
@@ -546,6 +756,17 @@ fn select_processor(cli: &Cli, task: &Task) -> ProcessorKind {
 }
 
 fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -> AppResult<()> {
+    validate_format_outputs(cli, resolved)?;
+    validate_delivery_outputs(cli, resolved)?;
+    // Slice runs produce one text artifact from several requests: that is
+    // fine, the merge gate handles it.
+    let _ = steps;
+    Ok(())
+}
+
+/// The `--format` half of the output rules: one encoding across the
+/// produced kinds, and the resolved option that carries it.
+fn validate_format_outputs(cli: &Cli, resolved: &mut Resolved) -> AppResult<()> {
     let media_kinds: Vec<MediaKind> = resolved
         .produce
         .iter()
@@ -592,6 +813,19 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
             serde_json::Value::String(format.to_string()),
         );
     }
+    Ok(())
+}
+
+/// The delivery-shaped half of the output rules: they read the run-level
+/// `-o`/`--out-dir`, so a chain runs them against the merged last stage
+/// only (an intermediate stage has no delivery of its own).
+fn validate_delivery_outputs(cli: &Cli, resolved: &mut Resolved) -> AppResult<()> {
+    let media_kinds: Vec<MediaKind> = resolved
+        .produce
+        .iter()
+        .copied()
+        .filter(|k| *k != MediaKind::Text)
+        .collect();
     // Media output needs somewhere to go — a judgment made on the
     // resolved destinations in `resolve_destinations`, where every
     // possible target (file, directory, clipboard, stdout pipe) is known.
@@ -639,13 +873,10 @@ fn validate_outputs(cli: &Cli, resolved: &mut Resolved, steps: &[RequestStep]) -
             }
         }
     }
-    // Slice runs produce one text artifact from several requests: that is
-    // fine, the merge gate handles it.
-    let _ = steps;
     Ok(())
 }
 
-fn resolve_destinations(
+pub(crate) fn resolve_destinations(
     cli: &Cli,
     produce: &[MediaKind],
     terminal: TerminalInfo,
@@ -733,7 +964,7 @@ fn resolve_destinations(
 /// the task that declares them. The CLI flag wins, then the task's
 /// default (`to` and `voice` are the only ones a task may default), else
 /// nothing is sent for it.
-fn describe_param_sources(
+pub(crate) fn describe_param_sources(
     cli: &Cli,
     task: &Task,
     resolved: &Resolved,
@@ -987,17 +1218,17 @@ pub fn describe(plan: &ExecutionPlan) -> String {
 
 /// How many chars of the instruction/requirement the dry-run report shows:
 /// a conventional full terminal line's worth of text, elided past that.
-const DRY_RUN_LINE_MAX: usize = 72;
+pub(crate) const DRY_RUN_LINE_MAX: usize = 72;
 
 /// Whether the run would actually carry a key — by the shared judgment
 /// (`config::effective_key_env`) the runner's send-time resolution also
 /// uses, so the cleartext warning fires under exactly the conditions a
 /// real request would see a key.
-fn api_key_present(resolved: &Resolved) -> bool {
+pub(crate) fn api_key_present(resolved: &Resolved) -> bool {
     crate::config::effective_key_env(resolved.api_key_env.as_deref()).is_some()
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
     } else if n < 1024 * 1024 {
@@ -1009,7 +1240,7 @@ fn human_bytes(n: u64) -> String {
 
 /// Strip credentials and potentially sensitive query values from URLs
 /// shown in reports.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut u) => {
             if !u.username().is_empty() {
@@ -1125,6 +1356,90 @@ mod tests {
     fn empty_and_untagged_step_lists_pass() {
         assert_parts_contiguous(&[]).unwrap();
         assert_parts_contiguous(&[step(0, None), step(1, None)]).unwrap();
+    }
+
+    fn junction_task(name: &str, max_inputs: Option<usize>) -> Task {
+        Task {
+            name: name.into(),
+            operation: crate::tasks::Operation::Generate,
+            instruction: String::new(),
+            profile: None,
+            input_types: None,
+            required_types: Vec::new(),
+            max_inputs,
+            output_types: vec![MediaKind::Text],
+            requires_material: true,
+            processor: ProcessorKind::Single,
+            per_part: false,
+            params: Vec::new(),
+            defaults: Default::default(),
+            options: Default::default(),
+            builtin: true,
+        }
+    }
+
+    fn chat_resolved() -> Resolved {
+        Resolved {
+            profile_name: "p".into(),
+            provider_name: "p".into(),
+            adapter: crate::api::Adapter::Chat,
+            base_url: None,
+            api_key_env: None,
+            model: "m".into(),
+            model_source: crate::config::resolve::ParamSource::Default,
+            max_tokens: None,
+            max_tokens_source: crate::config::resolve::ParamSource::Default,
+            temperature: None,
+            temperature_source: crate::config::resolve::ParamSource::Default,
+            options: Default::default(),
+            allowed_inputs: None,
+            required_inputs: Vec::new(),
+            produce: vec![MediaKind::Text],
+        }
+    }
+
+    /// The junction hands exactly one text part downstream, so even the
+    /// count rule is a parse-time fact: a downstream `max_inputs = 0`
+    /// fails the junction before stage 1's paid request.
+    #[test]
+    fn junction_input_rejects_a_zero_max_inputs_downstream() {
+        let task = junction_task("solo", Some(0));
+        let err = validate_junction_input(&task, &chat_resolved()).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("accepts at most 0 input(s)"), "{err}");
+
+        // One text input is exactly the junction's shape.
+        let task = junction_task("normal", Some(1));
+        validate_junction_input(&task, &chat_resolved()).unwrap();
+    }
+
+    #[test]
+    fn junction_input_rejects_a_stage_that_refuses_text() {
+        let mut resolved = chat_resolved();
+        resolved.allowed_inputs = Some(vec![MediaKind::Audio]);
+        let task = junction_task("audio-only", None);
+        let err = validate_junction_input(&task, &resolved).unwrap_err();
+        assert!(err.message.contains("does not accept text input"), "{err}");
+    }
+
+    /// Without the edge-tts feature the adapter variant still parses (a
+    /// config naming it is readable), but preflight must refuse it: a
+    /// chain would otherwise pay stage 1 before stage 2's plan build
+    /// discovered the missing adapter.
+    #[cfg(not(feature = "edge-tts"))]
+    #[test]
+    fn preflight_refuses_an_edge_tts_route_without_the_feature() {
+        let resolved = Resolved {
+            adapter: crate::api::Adapter::EdgeTts,
+            produce: vec![MediaKind::Audio],
+            ..chat_resolved()
+        };
+        let err = validate_adapter_availability(&resolved).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(
+            err.message.contains(crate::api::EDGE_TTS_NOT_COMPILED),
+            "{err}"
+        );
     }
     #[test]
     fn redact_url_hides_userinfo_credentials() {

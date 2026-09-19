@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod app;
+pub mod chain;
 pub mod cli;
 pub mod clipboard;
 pub mod config;

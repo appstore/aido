@@ -43,6 +43,11 @@ pub struct DeliverArgs<'a> {
     /// empty everywhere else. A restored delivery (`last`, `history show`)
     /// passes the recorded run's pairs so its report matches the original.
     pub failed_parts: &'a [(String, String)],
+    /// Chain runs only: the intermediate stages' artifacts. They never
+    /// reach stdout, `-o` or the clipboard — the `--out-dir` manifest is
+    /// the one destination that keeps them, so a chain's full trail lands
+    /// on disk together with the final result. Empty everywhere else.
+    pub dir_extras: &'a [Artifact],
 }
 
 pub struct DeliveryOutcome {
@@ -317,7 +322,11 @@ fn deliver_to_destinations(
 
     // --- directory with manifest
     if let Some(dir) = &dir_dest {
-        match write_directory(delivered, dir, args.run_id, args.overwrite, args.quiet) {
+        // The chain's intermediate artifacts ride along: manifest entries
+        // first (they were produced first), then the final stage's.
+        let mut dir_items: Vec<&Artifact> = args.dir_extras.iter().collect();
+        dir_items.extend(delivered.iter().copied());
+        match write_directory(&dir_items, dir, args.run_id, args.overwrite, args.quiet) {
             Ok(paths) => {
                 for (id, path) in paths {
                     saved.insert(id, path);
@@ -749,6 +758,11 @@ fn write_directory(
     // this run is checked before the first byte is written — also within
     // a per-part batch, where a mid-batch clobber would leave a half-old
     // half-new directory behind.
+    //
+    // The internal-collision check runs regardless of --overwrite:
+    // overwriting covers this run's files replacing a previous delivery's,
+    // never this run's artifacts replacing each other.
+    artifact_files_unique(artifacts.iter().copied())?;
     if !overwrite {
         let manifest_path = dir.join("manifest.json");
         if manifest_path.exists() {
@@ -842,6 +856,30 @@ pub(crate) fn artifact_file_name(artifact: &Artifact) -> String {
         _ => artifact.format.as_str(),
     };
     format!("{}.{}", sanitize_stem(&artifact.id), extension)
+}
+
+/// The artifact-to-filename mapping must be injective: two artifacts whose
+/// ids sanitize to the same name (`a/b` and `a-b`, or a custom task named
+/// `text` against the final stage's default `text` id) would otherwise
+/// silently overwrite each other on disk — history keeps one file while
+/// its manifest names two, and a `--out-dir` delivery loses a result.
+/// Checked before the first byte is written, shared by history and
+/// directory delivery so the two cannot drift.
+pub(crate) fn artifact_files_unique<'a, I>(artifacts: I) -> AppResult<()>
+where
+    I: IntoIterator<Item = &'a Artifact>,
+{
+    let mut seen = std::collections::HashSet::new();
+    for artifact in artifacts {
+        let name = artifact_file_name(artifact);
+        if !seen.insert(name.clone()) {
+            return Err(AppError::delivery(format!(
+                "artifact filename collision: several artifacts map to '{name}'; \
+                 rename the task or pick another --out-dir"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -973,6 +1011,7 @@ mod tests {
             run_id: "t",
             task: Some("t"),
             failed_parts: &[],
+            dir_extras: &[],
         };
         // Deliver to a real stdout is awkward in-process; the states tell
         // the story.
@@ -1292,5 +1331,60 @@ mod tests {
         // A stem of only separators still yields a usable, visible name.
         let artifact = text_artifact("···", "body");
         assert_eq!(artifact_file_name(&artifact), "artifact.txt");
+    }
+
+    /// Two distinct ids can sanitize to one file name (`a/b` and `a-b`):
+    /// the delivery must refuse before writing anything, and `--overwrite`
+    /// covers a previous delivery's files, never this run's artifacts
+    /// replacing each other.
+    #[test]
+    fn write_directory_refuses_internal_filename_collisions_before_writing() {
+        for overwrite in [false, true] {
+            let dir = crate::test_support::run_root()
+                .join(format!("aido-collide-{}-{overwrite}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let artifacts = [
+                text_artifact("a/b", "first"),
+                text_artifact("a-b", "second"),
+            ];
+            assert_eq!(
+                artifact_file_name(&artifacts[0]),
+                artifact_file_name(&artifacts[1]),
+                "the ids collide on the sanitized file name"
+            );
+            let err = write_directory(
+                &artifacts.iter().collect::<Vec<_>>(),
+                &dir,
+                "run",
+                overwrite,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                err.message.contains("filename collision"),
+                "{:?}",
+                err.message
+            );
+            assert_eq!(err.kind, ErrorKind::Delivery);
+            // Nothing was written — not even the directory.
+            assert!(
+                !dir.exists(),
+                "the refusal happens before any byte is written"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_ids_still_deliver_to_a_directory() {
+        let dir =
+            crate::test_support::run_root().join(format!("aido-collide-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = text_artifact("a/b", "first");
+        let b = text_artifact("a_b", "second");
+        let saved =
+            write_directory(&[&a, &b], &dir, "run", false, true).expect("distinct names deliver");
+        assert_eq!(saved.len(), 2);
+        assert!(dir.join("a-b.txt").exists());
+        assert!(dir.join("a_b.txt").exists());
     }
 }

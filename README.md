@@ -114,6 +114,49 @@ aido ask -p "总结要点" --profile vision -m glm-4.6v   # 临时换 Profile / 
 aido translate article.md --to en -o out.md --overwrite   # 允许覆盖已存在的文件
 ```
 
+## 任务链：一次运行，多段任务
+
+多任务串联不必再靠 shell 管道。两种等价写法，链跑完只留一条 history 记录、一份完整清单，中间产物随时可恢复：
+
+```bash
+aido ocr shot.png --then translate --to zh-CN --then tts -o brief.mp3 --copy   # 原语：每个 --then 开启下一段
+aido chain "ocr | translate --to zh-CN | tts" shot.png -o brief.mp3 --copy     # 糖衣：规格串写阶段，材料与交付写在串外
+```
+
+规则一目了然：
+
+- 材料流自动接线：首环吃命令行材料，后续环吃上一环的产物；stdout 只有末环正文；
+- 一条链一条记录：各环产物同落一份 manifest/history（provenance 记录每环的全局请求号），`history show <RUN> --out-dir` 可整链恢复；
+- 交付只看末环：`-o` / `--copy` / stdout 作用在最后一环，`--out-dir` 则收全环；
+- 计划期类型检查：上一环产物类型 → 下一环输入类型，不匹配 exit 2，一个请求都不发；任何一环失败，后续环不再执行，退出码取失败环的分类（3/4），已产出的上游产物照常入历史；
+- 旗标归属：阶段参数（`--to`、`--voice`、`-p`、`--profile` …）写在自己那一段；run 级参数（`-o`、`--json`、`--dry-run` …）写在整条链上，`chain` 形式下位置随意。
+
+直接解锁的场景：
+
+```bash
+aido chain "ocr | translate | tts" shot.png -o brief.mp3      # 截图 → 翻译 → 配音
+aido chain "transcribe | translate --to en | tts" talk.m4a    # 语音同传
+aido chain "summarize | tts" daily.md -o brief.mp3            # 配 cron 即每日简报
+aido chain "ocr | ask -p '这页在讲什么？'" page.png           # 长图 → 提问
+```
+
+### 何时用 --then
+
+`chain` 的规格字符串刻意保持简单：引号只用来包裹空格和 `|`，**没有转义、没有变量展开**。跨平台约定是外层双引号给 shell、内层单引号给 aido——cmd 与 PowerShell 不把单引号当特殊字符，同一拼写在 zsh / bash / cmd / PowerShell 全部成立：
+
+```bash
+aido chain "ocr | ask -p '这页在讲什么？'" page.png
+```
+
+需要 shell 展开、或一段文本里同时出现单双引号时，改用 `--then`——它的参数就是普通 shell token，语义与其它任何 aido 命令相同：
+
+```bash
+aido ask -p "总结 $TOPIC 的要点" --then tts -o brief.mp3   # $TOPIC 由 shell 展开
+aido ocr page.png --then ask -p "他说\"行\"了吗"           # 双引号内嵌双引号
+```
+
+v1 的边界：链是线性的（分支/汇合不支持）；per-part 批处理（目录、多页 PDF）不与链组合，遇到会明确报错；管理命令（`history`、`tasks` …）不能作为链的一环。
+
 ## 命令结构
 
 ```
@@ -197,7 +240,7 @@ aido watch recordings -- transcribe --out-dir trans/   # 录音收件箱：转�
 aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素材流水线前置
 ```
 
-`--` 之后照搬一次普通任务调用的全部写法；每个新文件都会带着该文件走一次完整的 run 路径（预检、执行、交付、history 各一条普通记录）。watch 自身的 flags 只能出现在 `--` 之前：
+`--` 之后填写一次普通的**单任务**调用；任务名、任务 flags、`run NAME` 以及 `-p` 隐式 ask 等解析规则都与普通运行一致。每个新文件都会带着该文件走一次完整的 run 路径（预检、执行、交付、history 各一条普通记录）。watch 自身的 flags 只能出现在 `--` 之前：
 
 | watch flag | 含义 |
 |---|---|
@@ -212,6 +255,7 @@ aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素
 - **启动即预检**：任务解析、能力交集、交付目标、凭据在进入守护前全部校验，任何一项失败 exit 2，不守护。
 - **交付去向必须显式**：任务调用必须带 `--copy` 或 `--out-dir`（守护模式下 stdout 无人看）；`-o` 不允许（一个固定文件接不住不断到来的结果）；任务调用也不能依赖 stdin。`--out-dir` 不得就是守护目录本身（产物会再次触发守护）。
 - **产物按输入文件命名且互不覆盖**：`shots/a.png` 的结果落在 `--out-dir` 里叫 `a-png--<hash>.txt`（完整文件名经 sanitize 后再加一段由原始文件名算出的短哈希），任何两个不同输入都不会静默写到同一个文件；守护交付恒为覆盖写——`manifest.json` 只记录最近一次运行，同一输入重复到达（如重启守护后）以最新结果为准。
+- **单任务边界**：watch v1 每个文件只运行一个 task，暂不支持 `chain "..."` 或 `--then` 任务链（两者都会明确报错）。
 - **任务 flags 只能在 `--` 之后**：出现在 `--` 之前直接报错——任务调用按文件逐次重放解析，位置决定含义的写法是个坑；`--dry-run`/`--help`/`--version` 同理只能用在 `--` 之前（逐文件执行它们等于什么都没交付就标记完成）。
 - **去抖**：编辑器、scp 等增量写入按「大小稳定 N ms」去抖，写完只触发一次；点文件与子目录不触发（与目录输入的展开规则一致）。
 - **失败不重试**：单个文件失败（类型不符、服务 5xx 等）stderr 记一行后守护继续；已处理文件被原地修改或同名重建不会重新处理（重启守护即重置）。

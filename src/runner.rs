@@ -63,8 +63,19 @@ impl RunOutput {
     /// nothing usable at all. The caller records the run and refuses
     /// delivery instead of discarding what did come back.
     pub fn unsatisfied_reason(&self, plan: &ExecutionPlan) -> Option<String> {
+        self.unsatisfied_reason_in(plan, &self.artifacts)
+    }
+
+    /// The same judgment over a slice of the artifacts — a chain judges
+    /// its final stage's deliverables only, so an upstream artifact can
+    /// never stand in for what the last stage did not produce.
+    pub fn unsatisfied_reason_in(
+        &self,
+        plan: &ExecutionPlan,
+        artifacts: &[Artifact],
+    ) -> Option<String> {
         for kind in &plan.resolved.produce {
-            if !self.artifacts.iter().any(|a| a.kind == *kind) {
+            if !artifacts.iter().any(|a| a.kind == *kind) {
                 return Some(format!(
                     "the response did not produce the requested '{kind}' output"
                 ));
@@ -72,13 +83,13 @@ impl RunOutput {
         }
         for (kind, expected) in &plan.expected_counts {
             if let Some(n) = expected {
-                let have = self.artifacts.iter().filter(|a| a.kind == *kind).count() as u64;
+                let have = artifacts.iter().filter(|a| a.kind == *kind).count() as u64;
                 if have != *n {
                     return Some(format!("expected {n} {kind} artifact(s), got {have}"));
                 }
             }
         }
-        if self.artifacts.is_empty() {
+        if artifacts.is_empty() {
             return Some("the model returned no usable content for this run".into());
         }
         None
@@ -234,7 +245,12 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             .unwrap_or(1)
     };
 
-    let prefix = spinner_prefix(&plan.resolved);
+    let mut prefix = spinner_prefix(&plan.resolved);
+    // A chain stage says which stage of the run is asking: the spinner is
+    // the only per-stage signal a quiet terminal gets.
+    if let Some(label) = &plan.stage_label {
+        prefix = format!("{label} — {prefix}");
+    }
 
     let spinner: SharedSpinner = if plan.quiet {
         Rc::new(RefCell::new(None))
