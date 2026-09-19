@@ -1,7 +1,7 @@
 //! Application orchestration: dispatch a normalized invocation, run one
 //! task end to end, and map outcomes to exit codes.
 
-use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, TasksCmd};
+use crate::cli::{self, Cli, Commands, ConfigCmd, HistoryCmd, Normalized, SourceSpec, TasksCmd};
 use crate::config;
 use crate::domain::{
     first_line, AppError, AppResult, Destination, ErrorKind, GenerationStatus, MediaKind,
@@ -22,6 +22,22 @@ use std::sync::Arc;
 /// Exit code for "the user pressed Ctrl+C".
 pub const EXIT_CANCEL: i32 = 130;
 
+/// Why a run was cancelled: the history record names the signal that
+/// actually arrived instead of blaming Ctrl+C for everything.
+enum CancelReason {
+    CtrlC,
+    Sigterm,
+}
+
+impl CancelReason {
+    fn history_warning(self) -> &'static str {
+        match self {
+            Self::CtrlC => "interrupted by Ctrl+C",
+            Self::Sigterm => "interrupted by SIGTERM",
+        }
+    }
+}
+
 /// What the Ctrl+C handler needs to leave an honest trace of an
 /// interrupted run: the run was started (a history dir may exist) but no
 /// result ever existed.
@@ -37,8 +53,10 @@ struct PendingRun {
 /// outcome exists — a later Ctrl+C must not overwrite a real record with
 /// an empty cancelled one — while the run identity stays until the end:
 /// a failure after the generation ran still names the run it belongs to.
+/// The watch daemon holds a handle to the same state so a Ctrl+C that
+/// interrupts a watched file records that file's run as cancelled.
 #[derive(Default)]
-struct RunState {
+pub(crate) struct RunState {
     pending: Option<PendingRun>,
     identity: Option<(String, Option<String>)>,
 }
@@ -79,11 +97,17 @@ pub async fn run() -> i32 {
     // Ctrl+C anywhere in a run cancels it (exit 130) instead of hanging on
     // a slow request or leaving a half-written delivery. The interrupted
     // run is recorded as cancelled when a plan had already been built.
+    // SIGTERM takes the same path on Unix: a terminated daemon must leave
+    // the same honest trace a Ctrl+C does.
     let state: Arc<std::sync::Mutex<RunState>> = Arc::default();
     let result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
-            record_cancelled(&state);
+            record_cancelled(&state, CancelReason::CtrlC);
+            return EXIT_CANCEL;
+        }
+        _ = sigterm() => {
+            record_cancelled(&state, CancelReason::Sigterm);
             return EXIT_CANCEL;
         }
         result = dispatch(cli, normalized, state.clone()) => result,
@@ -103,7 +127,7 @@ pub async fn run() -> i32 {
     }
 }
 
-fn record_cancelled(state: &std::sync::Mutex<RunState>) {
+fn record_cancelled(state: &std::sync::Mutex<RunState>, reason: CancelReason) {
     let claimed = state.lock().ok().and_then(|mut s| s.pending.take());
     match claimed {
         Some(p) => {
@@ -116,7 +140,7 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
                     summary: p.summary,
                     generation: GenerationStatus::Cancelled,
                     artifacts: Vec::new(),
-                    warnings: vec!["interrupted by Ctrl+C".into()],
+                    warnings: vec![reason.history_warning().into()],
                     failed_parts: Vec::new(),
                     parts_total: 0,
                     deliveries: Vec::new(),
@@ -129,6 +153,21 @@ fn record_cancelled(state: &std::sync::Mutex<RunState>) {
         }
         None => eprintln!("interrupted"),
     }
+}
+
+/// SIGTERM joins Ctrl+C (exit 130) on Unix: same cleanup, same exit code.
+/// Registration failure parks the future forever so the select still
+/// works; the platform simply keeps its default disposition then.
+async fn sigterm() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            term.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 fn fail(e: &AppError, json: bool, run_id: Option<&str>, task: Option<&str>) -> i32 {
@@ -169,6 +208,14 @@ async fn dispatch(
         None => {}
     }
 
+    warn_deprecated_env_vars();
+
+    // The watch daemon owns everything after its own flags: it re-enters
+    // this pipeline once per arriving file instead of running one here.
+    if let Some(args) = normalized.watch.clone() {
+        return crate::watch::run(&cli, args, state).await;
+    }
+
     let Some(task_name) = normalized.task.or_else(|| cli.task.clone()) else {
         print_help();
         return Err(AppError::usage(
@@ -180,12 +227,10 @@ async fn dispatch(
         return run_last(&cli).await;
     }
 
-    if task_name == "ask" && cli.prompt.as_deref().is_none_or(str::is_empty) {
-        return Err(AppError::usage(
-            "`ask` needs -p with the instruction, e.g. `aido ask -p \"summarize this\" file.md`",
-        ));
-    }
+    run_task(&cli, task_name, normalized.specs.clone(), &state, None).await
+}
 
+fn warn_deprecated_env_vars() {
     for var in config::DEPRECATED_ENV_VARS {
         if std::env::var(var)
             .map(|v| !v.trim().is_empty())
@@ -197,14 +242,53 @@ async fn dispatch(
             );
         }
     }
+}
+
+/// `ask` is nothing without its instruction. Both the single-run path and
+/// the watch precheck refuse it up front — a watch that starts without a
+/// prompt would fail every arriving file.
+pub(crate) fn require_ask_prompt(cli: &Cli, task_name: &str) -> AppResult<()> {
+    if task_name == "ask" && cli.prompt.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::usage(
+            "`ask` needs -p with the instruction, e.g. `aido ask -p \"summarize this\" file.md`",
+        ));
+    }
+    Ok(())
+}
+
+/// One task run, end to end: resolve, plan, precheck, execute, record,
+/// deliver. The single-run path and every watched file share it — a
+/// watched file is just an ordinary run whose input arrives later.
+/// `stem_hint` (watch only) names the artifacts after the arriving file
+/// (full name plus a short hash, so no two arrivals collide) so one
+/// `--out-dir` can collect a stream of results.
+pub(crate) async fn run_task(
+    cli: &Cli,
+    task_name: String,
+    specs: Vec<SourceSpec>,
+    state: &Arc<std::sync::Mutex<RunState>>,
+    stem_hint: Option<&str>,
+) -> AppResult<()> {
+    require_ask_prompt(cli, &task_name)?;
 
     let task = tasks::get(&task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo::real();
     let mut env = InputEnv::real();
-    let specs = normalized.specs.clone();
 
-    let plan = plan::build(&cli, &task, &specs, &cfg, terminal, &mut env)?;
+    let mut plan = plan::build(cli, &task, &specs, &cfg, terminal, &mut env)?;
+
+    // Watched runs derive artifact names from the input file (shot.png →
+    // shot-txt--<hash>.txt; see watch::watch_artifact_stem), so two
+    // arrivals never fight over one `text.txt`. Steps that already carry
+    // a stem (per-part batches) keep theirs.
+    if let Some(stem) = stem_hint {
+        for step in &mut plan.steps {
+            if step.artifact_stem.is_none() {
+                step.artifact_stem = Some(stem.to_string());
+            }
+        }
+    }
 
     if cli.dry_run {
         print!("{}", plan::describe(&plan));

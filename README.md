@@ -121,6 +121,7 @@ aido <TASK> [INPUT...] [OPTIONS]     # 任务名直接开头
 aido run <TASK> [INPUT...] [OPTIONS] # 无歧义入口；可访问与管理命令重名的自定义任务
 aido ask [INPUT...] -p <INSTRUCTION> # 临时任务
 aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
+aido watch DIR -- <TASK> [FLAGS]     # 目录守护：新文件自动执行任务（见下）
 ```
 
 任务名可以出现在 flags 之前或之后：`aido ocr --copy` 与 `aido --copy ocr` 等价。
@@ -184,7 +185,38 @@ aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 | 4 | 生成不完整或产物不满足请求 |
 | 5 | 显式输出目标交付失败 |
 | 6 | 批处理部分失败：成功部分已交付，失败部分在 warning 与历史中列出 |
-| 130 | 用户取消（Ctrl+C） |
+| 130 | 用户取消（Ctrl+C；SIGTERM 走同一清理路径） |
+
+## watch 模式（目录守护）
+
+把「丢进目录的文件」直接变成一次任务执行——放置即触发：
+
+```bash
+aido watch ~/shots -- ocr --copy                # 截图收件箱：OCR 文字自动进剪贴板
+aido watch recordings -- transcribe --out-dir trans/   # 录音收件箱：转写自动归档
+aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素材流水线前置
+```
+
+`--` 之后照搬一次普通任务调用的全部写法；每个新文件都会带着该文件走一次完整的 run 路径（预检、执行、交付、history 各一条普通记录）。watch 自身的 flags 只能出现在 `--` 之前：
+
+| watch flag | 含义 |
+|---|---|
+| `--interval SECS` | 目录轮询间隔（秒，可为小数；默认 1s，配置键 `watch_interval_ms`，下限 50ms） |
+| `--stable-ms MS` | 大小稳定窗：文件尺寸持续不变这么久才算写完（默认 500ms，配置键 `watch_stable_ms`，下限 100ms） |
+| `--include-existing` | 启动时把目录里已有的文件也作为第一批处理（默认跳过，重启不会重跑旧文件） |
+| `--dry-run` | 打印一次探针计划即退出（附注说明占位输入；不发任何请求） |
+| `--quiet` / `--json` | 透传给每个文件的运行（`--json` 时成功交付的文件各输出一份报告；失败的文件以 `[watch] … failed` 行呈现） |
+
+语义与边界：
+
+- **启动即预检**：任务解析、能力交集、交付目标、凭据在进入守护前全部校验，任何一项失败 exit 2，不守护。
+- **交付去向必须显式**：任务调用必须带 `--copy` 或 `--out-dir`（守护模式下 stdout 无人看）；`-o` 不允许（一个固定文件接不住不断到来的结果）；任务调用也不能依赖 stdin。`--out-dir` 不得就是守护目录本身（产物会再次触发守护）。
+- **产物按输入文件命名且互不覆盖**：`shots/a.png` 的结果落在 `--out-dir` 里叫 `a-png--<hash>.txt`（完整文件名经 sanitize 后再加一段由原始文件名算出的短哈希），任何两个不同输入都不会静默写到同一个文件；守护交付恒为覆盖写——`manifest.json` 只记录最近一次运行，同一输入重复到达（如重启守护后）以最新结果为准。
+- **任务 flags 只能在 `--` 之后**：出现在 `--` 之前直接报错——任务调用按文件逐次重放解析，位置决定含义的写法是个坑；`--dry-run`/`--help`/`--version` 同理只能用在 `--` 之前（逐文件执行它们等于什么都没交付就标记完成）。
+- **去抖**：编辑器、scp 等增量写入按「大小稳定 N ms」去抖，写完只触发一次；点文件与子目录不触发（与目录输入的展开规则一致）。
+- **失败不重试**：单个文件失败（类型不符、服务 5xx 等）stderr 记一行后守护继续；已处理文件被原地修改或同名重建不会重新处理（重启守护即重置）。
+- **每文件一行结果**：`[watch] shot.png → ocr: done` / `[watch] … → ocr: failed (not retried; still watching): …`，stderr 为终端时附加一声响铃（`--quiet` 关闭全部提示）。
+- **退出**：Ctrl+C / SIGTERM → exit 130，在途文件按取消记入历史（history 的 warning 写明实际信号）；守护目录暂时不可读只警告一次，恢复后继续（启动时建立初始文件清单失败则 exit 2，不守护）。
 
 ## 配置：Provider / Profile / Task 三层
 
@@ -213,6 +245,8 @@ default_profile = "vision"
 # hold_secs = 45
 # history_keep = 50
 # history_bytes = 536870912
+# watch_interval_ms = 1000
+# watch_stable_ms = 500
 
 [providers.cloud]
 base_url = "https://example.invalid/v1"
@@ -381,6 +415,8 @@ aido config init / config check
 ## Linux 剪贴板说明
 
 X11（以及多数 Wayland 合成器）的剪贴板内容依附于写入它的进程，进程退出后内容即失效。aido 写剪贴板时会自动派生一个后台子进程，把内容保持一段时间（默认 45 秒，`settings.hold_secs` 可调），行为与 `xclip` / `wl-copy` 一致。
+
+watch 模式下连续投喂多个文件会短暂积累多个持有子进程：剪贴板内容始终以最后一次写入为准，旧持有进程到时自然退出、不会互相覆盖，行为无害；介意进程数量可在 watch 场景调小 `settings.hold_secs`。
 
 ## 从 0.x 升级（破坏性变更）
 

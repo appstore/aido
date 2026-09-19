@@ -71,11 +71,21 @@ pub struct Settings {
     pub history_bytes: Option<u64>,
     /// Total input budget for one run in bytes (default 128 MiB).
     pub input_bytes: Option<u64>,
+    /// Watch mode: how often the guarded directory is listed.
+    pub watch_interval_ms: Option<u64>,
+    /// Watch mode: how long a file's size must stay put before the task
+    /// runs on it.
+    pub watch_stable_ms: Option<u64>,
 }
 
 /// Clipboard hold duration when `settings.hold_secs` is unset: on Linux
 /// the clipboard is kept alive this long after a copy.
 pub const DEFAULT_HOLD_SECS: u64 = 45;
+
+/// Watch mode defaults: list the guarded directory every second, and let
+/// a file's size settle for half a second before running the task on it.
+pub const DEFAULT_WATCH_INTERVAL_MS: u64 = 1000;
+pub const DEFAULT_WATCH_STABLE_MS: u64 = 500;
 
 /// Pre-2.0 globals that no longer apply; kept explicit so the user hears
 /// about the change instead of the value being used silently.
@@ -371,6 +381,8 @@ default_profile = "default"
 # hold_secs = 45           # Linux: keep the clipboard alive this long
 # history_keep = 50        # runs kept on disk; 0 disables history
 # history_bytes = 536870912 # total history budget (512 MiB)
+# watch_interval_ms = 1000 # watch mode: directory poll interval
+# watch_stable_ms = 500    # watch mode: size-stability window before a file runs
 
 # The zero-config default: official OpenAI, key from AIDO_API_KEY or
 # OPENAI_API_KEY.
