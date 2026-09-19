@@ -70,6 +70,23 @@ pub enum Normalized {
     },
 }
 
+impl Normalized {
+    /// Whether the run asked for `--json`, judged on the normalized argv.
+    /// The raw argv scan answers this for tokens at the top level, but a
+    /// chain spec is one shell token — `chain "a | b --json"` carries the
+    /// flag where only the tokenizer can see it, and the run would print
+    /// its report as JSON while a parse error printed as plain text. This
+    /// walks the same stage lists the run itself will parse, so the error
+    /// contract and the report format cannot disagree. (After parsing
+    /// succeeds, `cli.json` is the authority.)
+    pub fn wants_json(&self) -> bool {
+        match self {
+            Normalized::Single { argv, .. } => wants_json_in(argv),
+            Normalized::Chain { stages } => stages.iter().any(|stage| wants_json_in(&stage.argv)),
+        }
+    }
+}
+
 /// Flags and their value arity — the normalizer's single source of truth.
 /// `takes_value` must match the clap schema below.
 const FLAGS: &[(&str, bool)] = &[

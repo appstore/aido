@@ -1271,3 +1271,80 @@ fn downstream_max_inputs_zero_fails_the_junction_before_stage1() {
         out.stderr()
     );
 }
+
+/// `--json` inside the chain spec is invisible to the raw argv scan (the
+/// spec is one shell token), yet the run itself would report as JSON — so
+/// a parse/preflight error must honor the same contract and print the
+/// error envelope, not plain text.
+#[test]
+fn chain_json_inside_the_spec_formats_parse_errors_as_json() {
+    // translate refuses --count: a preflight error, zero requests.
+    let out = run_with(
+        &[
+            "chain",
+            "summarize | translate --count 3 --json",
+            "--text",
+            "hi",
+        ],
+        b"",
+        &[],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}; stdout: {}", out.stdout()));
+    assert_eq!(report["error"]["kind"], "usage", "{report}");
+    assert!(
+        !out.stderr().contains("\"version\""),
+        "stderr must not carry the JSON report: {}",
+        out.stderr()
+    );
+
+    // The outer --json spelling behaves the same (regression guard).
+    let out = run_with(
+        &[
+            "chain",
+            "summarize | translate --count 3",
+            "--json",
+            "--text",
+            "hi",
+        ],
+        b"",
+        &[],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout())
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}; stdout: {}", out.stdout()));
+    assert_eq!(report["error"]["kind"], "usage", "{report}");
+}
+
+/// A `--json` that is some flag's value is not a request for JSON, even
+/// when a sibling stage fails to parse: the arity-aware scan must not
+/// mistake the value for the flag.
+#[test]
+fn json_as_a_flag_value_inside_a_stage_is_not_json() {
+    // Stage 1's -p swallows "--json" as its value; stage 2 fails to parse.
+    let out = run_with(
+        &[
+            "chain",
+            "summarize -p --json | translate --count 3",
+            "--text",
+            "hi",
+        ],
+        b"",
+        &[],
+        dead_cfg(),
+    );
+    out.assert_code(2);
+    assert!(
+        !out.stdout().contains("\"version\""),
+        "the value-position --json must not produce a JSON report: {}",
+        out.stdout()
+    );
+    assert!(
+        out.stderr().contains("does not accept --count"),
+        "stderr: {}",
+        out.stderr()
+    );
+}

@@ -62,6 +62,11 @@ pub async fn run() -> i32 {
         Ok(n) => n,
         Err(e) => return fail(&AppError::usage(format!("{e:#}")), wants_json, None, None),
     };
+    // Normalize succeeded, so the stage lists exist: judge --json on them.
+    // A chain spec is one shell token, and `--json` inside it is invisible
+    // to the raw argv scan — the error path must honor what the run itself
+    // would have printed.
+    let wants_json = normalized.wants_json();
     // A chain never clap-parses the whole argv (`--then` markers and the
     // spec string are not part of its grammar): the stages parse in
     // chain::parse, and the run-level surface is the last stage's, with
