@@ -9,12 +9,17 @@
 //! applies to images and audio. A `%PDF-` header (searched through the
 //! first KiB, as readers may see leading junk from scanners and mail
 //! gateways) is a PDF; a ZIP archive whose central directory lists
-//! `xl/workbook.xml` is an OOXML workbook; `word/document.xml` and
-//! `ppt/presentation.xml` are Word and PowerPoint files, refused with
-//! guidance until loaders exist. Anything else keeps the
-//! content-classification path: a random ZIP is "neither valid UTF-8
-//! text nor a supported image/audio file", exactly as before this module
-//! existed.
+//! `xl/workbook.xml` is an OOXML workbook; `word/document.xml`,
+//! `ppt/presentation.xml` or a root `content.xml` is a Word,
+//! PowerPoint or OpenDocument package; a compound-file or `{\rtf`
+//! signature is a legacy Office document or rich text. Word,
+//! PowerPoint, OpenDocument, legacy Office, RTF and CSV convert through
+//! the anydoc backend ([`document`]) behind the container gates in
+//! [`security`]; a workbook keeps its dedicated loader ([`xlsx`]), which
+//! splits sheets into per-sheet parts and bounds the used grid while
+//! streaming. Anything else keeps the content-classification path: a
+//! random ZIP is "neither valid UTF-8 text nor a supported image/audio
+//! file", exactly as before this module existed.
 //!
 //! Decomposition is bounded like reading: one document yields at most one
 //! single-file input's worth of material ([`Budget`]), whatever its pages
@@ -30,10 +35,13 @@
 
 use crate::domain::{InputContent, InputPart, InputSource, MediaKind};
 use anyhow::{bail, Result};
+use security::zip_lists_entry;
 use std::collections::HashSet;
 
+pub(crate) mod document;
 pub(crate) mod pdf;
 pub(crate) mod pdf_render;
+pub(crate) mod security;
 pub(crate) mod xlsx;
 
 /// One document expands to at most this many parts — the same ceiling one
@@ -42,10 +50,6 @@ pub(super) const MAX_PARTS_PER_DOCUMENT: usize = 4096;
 /// One document expands to at most this many materialized bytes — one
 /// [`crate::input`] single-file cap's worth.
 pub(super) const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
-/// OOXML entries may declare at most this much decompressed content: a
-/// deflate bomb inside a ≤32 MB file would otherwise stream gigabytes
-/// through the workbook loader.
-const MAX_OOXML_DECOMPRESSED: u64 = 512 * 1024 * 1024;
 /// Distinct notes one document may carry before the rest collapse into a
 /// single "… N more" note — notes explain partial material, they must not
 /// become their own flood.
@@ -173,33 +177,84 @@ pub(crate) fn expand(
             // lying header still passes, since a header costs nothing
             // to write; the xlsx loader's bounded second pass measures
             // what the eagerly-loaded entries really decompress to.
-            if zip_declared_total(bytes) > MAX_OOXML_DECOMPRESSED
-                || zip_declared_max(bytes) > MAX_OOXML_DECOMPRESSED
-            {
-                bail!(
-                    "'{origin}' declares more than {} MB of decompressed content; refusing",
-                    MAX_OOXML_DECOMPRESSED / (1024 * 1024)
-                );
-            }
+            security::gate_declared(origin, bytes)?;
             let parts = xlsx::expand(origin, bytes, source, document, start_id, &mut budget)?;
             return Ok(Some((parts, budget.notes)));
         }
-        if zip_lists_entry(bytes, b"word/document.xml") {
-            bail!(
-                "'{origin}' is a Word document; docx input is not supported yet — \
-                 convert it to plain text or markdown first"
-            );
+        // Word, PowerPoint and OpenDocument packages convert through the
+        // anydoc backend. The same two gates bound what conversion may
+        // decompress: anydoc parses the container with its own reader,
+        // and a lying header must not buy it unbounded work.
+        let office = if zip_lists_entry(bytes, b"word/document.xml") {
+            Some(Some(anydoc::Format::Docx))
+        } else if zip_lists_entry(bytes, b"ppt/presentation.xml") {
+            Some(Some(anydoc::Format::Pptx))
+        } else if zip_lists_entry(bytes, b"content.xml") {
+            // OpenDocument: odt/ods/odp share the package shape, so the
+            // marker only says "ODF" — anydoc tells them apart by the
+            // package mimetype.
+            Some(None)
+        } else {
+            None
+        };
+        if let Some(format) = office {
+            security::gate_declared(origin, bytes)?;
+            security::verify_all(origin, bytes, security::MAX_OOXML_DECOMPRESSED, "document")?;
+            let parts = document::expand(
+                origin,
+                bytes,
+                source,
+                document,
+                start_id,
+                &mut budget,
+                format,
+            )?;
+            return Ok(Some((parts, budget.notes)));
         }
-        if zip_lists_entry(bytes, b"ppt/presentation.xml") {
-            bail!(
-                "'{origin}' is a PowerPoint presentation; pptx input is not \
-                 supported yet — convert it to images or plain text first"
-            );
+        // A ZIP that is neither OOXML nor ODF (or whose central
+        // directory cannot be parsed) is not ours to judge.
+    }
+    // Legacy binary Office (doc/ppt/xls share the compound-file
+    // container; anydoc tells them apart by their OLE stream names) and
+    // RTF convert through anydoc too. Compound files store their sectors
+    // uncompressed and RTF is plain text — no deflate surface, so no
+    // ZIP gates; anydoc's own resource limits apply.
+    if bytes.starts_with(&CFB_MAGIC) || bytes.starts_with(b"{\\rtf") {
+        let parts = document::expand(origin, bytes, source, document, start_id, &mut budget, None)?;
+        return Ok(Some((parts, budget.notes)));
+    }
+    // CSV carries no signature: the extension names it, and only a
+    // converter success changes anything. A failure (content anydoc
+    // cannot table, or material past the budget) falls back to
+    // classification, so a .csv keeps behaving like the plain text it
+    // is — one text part — whenever the table conversion cannot
+    // improve on that.
+    if names_csv(origin) {
+        match document::expand(
+            origin,
+            bytes,
+            source,
+            document,
+            start_id,
+            &mut budget,
+            Some(anydoc::Format::Csv),
+        ) {
+            Ok(parts) => return Ok(Some((parts, budget.notes))),
+            Err(_) => return Ok(None),
         }
-        // A ZIP that is neither OOXML kind (or whose central directory
-        // cannot be parsed) is not ours to judge.
     }
     Ok(None)
+}
+
+/// The compound-file magic every legacy Office binary starts with.
+const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// CSV is the one dispatch on extension — it has no signature to sniff.
+/// Stdin and clipboard origins have no extension and stay text.
+fn names_csv(origin: &str) -> bool {
+    std::path::Path::new(origin)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
 }
 
 /// The label stem every part of one document shares: the source file's
@@ -272,99 +327,6 @@ fn size_of(content: &InputContent) -> usize {
     }
 }
 
-/// Walk the ZIP central directory, handing each entry's name and its
-/// declared uncompressed size to `visit`. Returns false when the EOCD
-/// cannot be found or the directory cannot be parsed — callers treat that
-/// as "not ours to judge" and classification describes the bytes instead.
-/// ZIP64 is out of scope: inputs are capped at 32 MB, far below the ZIP64
-/// threshold; a declared 0xFFFFFFFF (the ZIP64 "unknown" marker) is
-/// passed through for the visitor to judge.
-fn zip_walk(bytes: &[u8], mut visit: impl FnMut(&[u8], u64)) -> bool {
-    const EOCD: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-    const EOCD_LEN: usize = 22;
-    if bytes.len() < EOCD_LEN {
-        return false;
-    }
-    // The EOCD sits at the very end unless a ZIP comment (up to 65_535
-    // bytes) follows it; scan backwards for the signature.
-    let floor = bytes.len().saturating_sub(EOCD_LEN + 65_535);
-    let Some(eocd) = (floor..=bytes.len() - EOCD_LEN)
-        .rev()
-        .find(|&i| bytes[i..].starts_with(&EOCD))
-    else {
-        return false;
-    };
-    let u16le = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    let entries = u16le(&bytes[eocd + 10..]);
-    // Central directory offset + size, each clamped to the buffer so a
-    // corrupt directory degrades to "not found" instead of a panic.
-    let cd_offset = (u32le(&bytes[eocd + 16..]) as usize).min(bytes.len());
-    let cd_end = cd_offset
-        .saturating_add(u32le(&bytes[eocd + 12..]) as usize)
-        .min(bytes.len());
-    // Walk the file headers: PK\x01\x02, the fixed 42-byte field block,
-    // then the name, extra field and comment.
-    let mut p = cd_offset;
-    for _ in 0..entries {
-        if p + 46 > cd_end || !bytes[p..].starts_with(b"PK\x01\x02") {
-            return false;
-        }
-        let name_len = u16le(&bytes[p + 28..]) as usize;
-        let extra_len = u16le(&bytes[p + 30..]) as usize;
-        let comment_len = u16le(&bytes[p + 32..]) as usize;
-        let name_start = p + 46;
-        if name_start + name_len > bytes.len() {
-            return false;
-        }
-        visit(
-            &bytes[name_start..name_start + name_len],
-            u64::from(u32le(&bytes[p + 24..])),
-        );
-        p = name_start + name_len + extra_len + comment_len;
-    }
-    true
-}
-
-/// The exact-name scan the OOXML detection branch uses.
-fn zip_lists_entry(bytes: &[u8], needle: &[u8]) -> bool {
-    let mut found = false;
-    zip_walk(bytes, |name, _| {
-        if name == needle {
-            found = true;
-        }
-    });
-    found
-}
-
-/// The decompressed size the central directory declares in total.
-/// Declared sizes can lie — a header costs nothing to write — so this is
-/// a cheap first gate against deflate bombs, not the defense: the
-/// loader's per-sheet cell bound is what actually contains one. A
-/// declared 0xFFFFFFFF (the ZIP64 "unknown" marker) counts as unknown
-/// and stays out of the sum.
-fn zip_declared_total(bytes: &[u8]) -> u64 {
-    let mut total = 0;
-    zip_walk(bytes, |_, declared| {
-        if declared != u64::from(u32::MAX) {
-            total += declared;
-        }
-    });
-    total
-}
-
-/// The largest single entry's declared uncompressed size, unknown markers
-/// excluded (see [`zip_declared_total`]).
-fn zip_declared_max(bytes: &[u8]) -> u64 {
-    let mut max = 0;
-    zip_walk(bytes, |_, declared| {
-        if declared != u64::from(u32::MAX) {
-            max = max.max(declared);
-        }
-    });
-    max
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     /// A minimal ZIP-shaped buffer whose central directory lists exactly
@@ -410,6 +372,124 @@ pub(crate) mod test_support {
             &[],
         )
     }
+
+    /// A real ZIP (zip crate, deflate) holding the given text entries —
+    /// the shape every honest test document takes, when the bytes under
+    /// the central directory must actually parse.
+    pub(crate) fn real_zip(entries: &[(&str, String)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, content) in entries {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// A minimal but real .docx wrapping `body_xml` (the children of a
+    /// `<w:body>`): package content types, the office-document
+    /// relationship, and one body part. Enough for the converter to
+    /// parse, small enough to read in one glance.
+    pub(crate) fn docx_fixture(body_xml: &str) -> Vec<u8> {
+        real_zip(&[
+            ("[Content_Types].xml", DOCX_CONTENT_TYPES.into()),
+            ("_rels/.rels", DOCX_RELS.into()),
+            (
+                "word/document.xml",
+                format!("{XML_DECL}<w:document {W_NS}>{body_xml}</w:document>"),
+            ),
+        ])
+    }
+
+    const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
+    const W_NS: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
+
+    const DOCX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+
+    const DOCX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+
+    /// A minimal but real .pptx: one slide whose shape holds `slide_text`.
+    pub(crate) fn pptx_fixture(slide_text: &str) -> Vec<u8> {
+        real_zip(&[
+            (
+                "[Content_Types].xml",
+                format!(
+                    "{XML_DECL}\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>\
+<Override PartName=\"/ppt/slides/slide1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>\
+</Types>"
+                ),
+            ),
+            ("_rels/.rels", PPTX_RELS.into()),
+            (
+                "ppt/presentation.xml",
+                format!(
+                    "{XML_DECL}\
+<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/></p:sldIdLst>\
+</p:presentation>"
+                ),
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#
+                    .into(),
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                format!(
+                    "{XML_DECL}\
+<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<p:cSld><p:spTree>\
+<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>\
+<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Title 1\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
+<p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>{slide_text}</a:t></a:r></a:p></p:txBody></p:sp>\
+</p:spTree></p:cSld></p:sld>"
+                ),
+            ),
+        ])
+    }
+
+    const PPTX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#;
+
+    /// A minimal but real .odt whose body holds one paragraph. The
+    /// mimetype entry is the identity the ODF spec designates; the
+    /// manifest lists the parts a strict reader asks for.
+    pub(crate) fn odt_fixture(paragraph: &str) -> Vec<u8> {
+        real_zip(&[
+            (
+                "mimetype",
+                "application/vnd.oasis.opendocument.text".into(),
+            ),
+            ("META-INF/manifest.xml", ODF_MANIFEST.into()),
+            (
+                "content.xml",
+                format!(
+                    "{}\
+<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" office:version=\"1.2\">\
+<office:body><office:text><text:p>{paragraph}</text:p></office:text></office:body>\
+</office:document-content>",
+                    r#"<?xml version="1.0" encoding="UTF-8"?>"#
+                ),
+            ),
+        ])
+    }
+
+    const ODF_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/></manifest:manifest>"#;
 }
 
 #[cfg(test)]
@@ -456,23 +536,126 @@ mod tests {
     }
 
     #[test]
-    fn docx_is_refused_with_guidance() {
-        let bytes = zip_with_entries(&[b"[Content_Types].xml", b"word/document.xml"]);
-        let err = expand("notes.docx", &bytes, &file_source("notes.docx"), 0, 0).unwrap_err();
+    fn a_word_document_materializes_through_anydoc() {
+        // docx used to be refused with guidance; it converts now — one
+        // markdown part carrying the document's provenance.
+        let bytes = test_support::docx_fixture(
+            "<w:body><w:p><w:r><w:t>Chapter One</w:t></w:r></w:p></w:body>",
+        );
+        let Some((parts, _)) =
+            expand("notes.docx", &bytes, &file_source("notes.docx"), 0, 0).unwrap()
+        else {
+            panic!("a docx is a document");
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].mime, "text/markdown");
+        assert!(parts[0].text().unwrap().contains("Chapter One"));
+    }
+
+    #[test]
+    fn a_powerpoint_document_materializes_through_anydoc() {
+        let bytes = test_support::pptx_fixture("Hello Slide");
+        let Some((parts, _)) =
+            expand("slides.pptx", &bytes, &file_source("slides.pptx"), 0, 0).unwrap()
+        else {
+            panic!("a pptx is a document");
+        };
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].text().unwrap().contains("Hello Slide"));
+    }
+
+    #[test]
+    fn an_opendocument_package_materializes_through_anydoc() {
+        // The dispatcher only says "ODF" (the root content.xml marker);
+        // the package mimetype is what makes it a text document.
+        let bytes = test_support::odt_fixture("Once upon a time.");
+        let Some((parts, _)) = expand("tale.odt", &bytes, &file_source("tale.odt"), 0, 0).unwrap()
+        else {
+            panic!("an odt is a document");
+        };
+        assert!(parts[0].text().unwrap().contains("Once upon a time."));
+    }
+
+    #[test]
+    fn rtf_materializes_through_anydoc() {
+        let Some((parts, _)) = expand(
+            "tale.rtf",
+            br#"{\rtf1\ansi Once upon a time.}"#,
+            &file_source("tale.rtf"),
+            0,
+            0,
+        )
+        .unwrap() else {
+            panic!("rtf is a document");
+        };
+        assert!(parts[0].text().unwrap().contains("Once upon a time."));
+    }
+
+    #[test]
+    fn a_compound_file_routes_to_the_converter() {
+        // Legacy doc/ppt/xls share the compound-file magic; garbage
+        // behind it makes the converter's refusal name the file — proof
+        // of routing, not of classification.
+        let mut bytes = CFB_MAGIC.to_vec();
+        bytes.extend_from_slice(b"not a compound file");
+        let err = expand("legacy.doc", &bytes, &file_source("legacy.doc"), 0, 0).unwrap_err();
+        assert!(err.to_string().contains("legacy.doc"), "{err}");
+    }
+
+    #[test]
+    fn csv_by_extension_becomes_a_markdown_table() {
+        // CSV has no signature; the extension names it, case-insensitively.
+        for name in ["data.csv", "DATA.CSV"] {
+            let Some((parts, _)) = expand(
+                name,
+                b"city,sales\nBeijing,1200\n",
+                &file_source(name),
+                0,
+                0,
+            )
+            .unwrap() else {
+                panic!("a .csv is a document");
+            };
+            assert!(parts[0].text().unwrap().contains("Beijing"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_csv_the_converter_cannot_table_falls_back_to_text() {
+        // A conversion failure — here an empty file, which tables to
+        // nothing — falls back to classification, exactly the pre-anydoc
+        // behavior for such a file.
+        assert!(expand("junk.csv", b"", &file_source("junk.csv"), 0, 0)
+            .unwrap()
+            .is_none());
+        // So does a table past the budget: the plain text the file
+        // already is stays under one single-file input's worth, the
+        // inflated table does not.
+        let rows = "a,b\n".repeat(4_000_000); // ~16 MB → ~36 MB as a table
         assert!(
-            err.to_string().contains("docx input is not supported"),
-            "{err}"
+            expand("huge.csv", rows.as_bytes(), &file_source("huge.csv"), 0, 0)
+                .unwrap()
+                .is_none()
         );
     }
 
     #[test]
-    fn pptx_is_refused_with_guidance() {
-        let bytes = zip_with_entries(&[b"[Content_Types].xml", b"ppt/presentation.xml"]);
-        let err = expand("slides.pptx", &bytes, &file_source("slides.pptx"), 0, 0).unwrap_err();
+    fn an_office_package_declaring_over_512_mb_is_refused_before_reading() {
+        // The declared gate stands in front of the converter too: a
+        // Word-shaped zip claiming more than the ceiling is refused
+        // even though its entries hold nothing.
+        let bomb = zip_fixture(&[(b"word/document.xml", 600 * 1024 * 1024)], &[]);
+        let err = expand("notes.docx", &bomb, &file_source("notes.docx"), 0, 0).unwrap_err();
         assert!(
-            err.to_string().contains("pptx input is not supported"),
+            err.to_string().contains("declares more than 512 MB"),
             "{err}"
         );
+        // The same gate fronts the workbook loader: a normal declaration
+        // passes and runs on into the loader, which fails on the fake
+        // content — proof the gate did not swallow it.
+        let small = zip_fixture(&[(b"xl/workbook.xml", 1024)], &[]);
+        let err = expand("book.xlsx", &small, &file_source("book.xlsx"), 0, 0).unwrap_err();
+        assert!(err.to_string().contains("as a workbook"), "{err}");
     }
 
     #[test]
@@ -533,56 +716,6 @@ mod tests {
         // A stem of only odd characters sanitizes to something non-empty
         // (or "artifact"), never breaks downstream naming.
         assert!(!doc_stem(&file_source("...pdf"), "...pdf").is_empty());
-    }
-
-    #[test]
-    fn zip_scan_survives_corrupt_directories() {
-        // Signature only, no room for the fields the scan reads.
-        assert!(!zip_lists_entry(b"PK\x05\x06", b"xl/workbook.xml"));
-        assert!(!zip_lists_entry(&[], b"xl/workbook.xml"));
-        // An EOCD pointing into the void.
-        let mut bytes = zip_with_entries(&[b"xl/workbook.xml"]);
-        let n = bytes.len();
-        bytes[n - 8..].copy_from_slice(&[0xffu8; 8]); // cd_offset/cd_size garbage
-        assert!(!zip_lists_entry(&bytes, b"xl/workbook.xml"));
-    }
-
-    #[test]
-    fn a_workbook_declaring_over_512_mb_is_refused_before_reading() {
-        // The gate reads declarations, never entry data: a workbook-shaped
-        // zip claiming more than the ceiling is refused even though the
-        // fixture's entry holds nothing.
-        let bomb = zip_fixture(&[(b"xl/workbook.xml", 600 * 1024 * 1024)], &[]);
-        let err = expand("book.xlsx", &bomb, &file_source("book.xlsx"), 0, 0).unwrap_err();
-        assert!(
-            err.to_string().contains("declares more than 512 MB"),
-            "{err}"
-        );
-        // A normal declaration passes the gate and runs on into the
-        // workbook loader, which fails on the fixture's fake content —
-        // proof the gate did not swallow it.
-        let small = zip_fixture(&[(b"xl/workbook.xml", 1024)], &[]);
-        let err = expand("book.xlsx", &small, &file_source("book.xlsx"), 0, 0).unwrap_err();
-        assert!(err.to_string().contains("as a workbook"), "{err}");
-    }
-
-    #[test]
-    fn zip64_unknown_sizes_stay_out_of_the_declared_sums() {
-        // 0xFFFFFFFF is the ZIP64 "unknown" marker: neither counted in the
-        // total nor judged as an oversized single entry.
-        let bytes = zip_fixture(&[(b"a", u32::MAX), (b"b", 10)], &[]);
-        assert_eq!(zip_declared_total(&bytes), 10);
-        assert_eq!(zip_declared_max(&bytes), 10);
-    }
-
-    #[test]
-    fn a_zip_comment_after_the_eocd_hides_nothing() {
-        // The backwards scan must find the EOCD under a trailing comment;
-        // the walker reads the directory behind it normally.
-        let bytes = zip_fixture(&[(b"xl/workbook.xml", 7)], b"packed by hand, with feeling");
-        assert!(zip_lists_entry(&bytes, b"xl/workbook.xml"));
-        assert_eq!(zip_declared_total(&bytes), 7);
-        assert_eq!(zip_declared_max(&bytes), 7);
     }
 
     #[test]
