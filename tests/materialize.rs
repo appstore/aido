@@ -136,8 +136,18 @@ fn zip_fixture(entries: &[(&[u8], u32)], comment: &[u8]) -> Vec<u8> {
     bytes
 }
 
+// The package builders below (real_zip, docx_fixture, pptx_fixture,
+// epub_fixture) deliberately mirror their twins in
+// `src/materialize/mod.rs` `test_support`: integration tests are a
+// separate crate and cannot see that `pub(crate)` module. "Twin" means
+// shape-equivalent — the same entries with the same XML payloads (only
+// the XML prolog's trailing whitespace may differ) — so keep each pair
+// in sync by hand: a one-sided change would quietly test different
+// shapes on the two layers.
+
 /// A real ZIP (zip crate, deflate) holding the given text entries — the
-/// minimal honest package shape the anydoc converter parses.
+/// minimal honest package shape the anydoc converter parses. Twin of
+/// `test_support::real_zip`.
 fn real_zip(entries: &[(&str, String)]) -> Vec<u8> {
     use std::io::Write as _;
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -155,6 +165,7 @@ fn real_zip(entries: &[(&str, String)]) -> Vec<u8> {
 }
 
 /// A minimal but real .docx whose body holds one paragraph of `text`.
+/// Twin of `test_support::docx_fixture`.
 fn docx_fixture(text: &str) -> Vec<u8> {
     real_zip(&[
         (
@@ -186,7 +197,8 @@ fn docx_fixture(text: &str) -> Vec<u8> {
     ])
 }
 
-/// A minimal but real .pptx: one slide whose shape holds `text`.
+/// A minimal but real .pptx: one slide whose shape holds `text`. Twin of
+/// `test_support::pptx_fixture`.
 fn pptx_fixture(text: &str) -> Vec<u8> {
     real_zip(&[
         (
@@ -483,6 +495,51 @@ fn a_csv_file_reaches_the_plan_as_a_markdown_table() {
     assert!(stdout.contains("single request"), "{stdout}");
 }
 
+/// A minimal but real .epub: OCF container descriptor, one package
+/// document, one xhtml chapter whose body holds `text`. Twin of
+/// `test_support::epub_fixture`.
+fn epub_fixture(text: &str) -> Vec<u8> {
+    real_zip(&[
+        ("mimetype", "application/epub+zip".into()),
+        (
+            "META-INF/container.xml",
+            "<?xml version=\"1.0\"?>\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles><rootfile full-path=\"content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>"
+                .into(),
+        ),
+        (
+            "content.opf",
+            "<?xml version=\"1.0\"?>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Book</dc:title><dc:identifier id=\"id\">urn:uuid:aido</dc:identifier><dc:language>en</dc:language></metadata>\
+<manifest><item id=\"ch1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
+<spine><itemref idref=\"ch1\"/></spine></package>"
+                .into(),
+        ),
+        (
+            "ch1.xhtml",
+            format!(
+                "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>{text}</p></body></html>"
+            ),
+        ),
+    ])
+}
+
+#[test]
+fn an_epub_reaches_the_plan_as_markdown() {
+    let epub = temp_file("tale.epub", &epub_fixture("A very memorable chapter"));
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", epub.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("tale"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
 /// The committed legacy binary fixtures (see fixtures/documents/README.md)
 /// are real compound files: the CFB magic routes them through the
 /// converter and their text reaches the plan like any text input.
@@ -513,6 +570,27 @@ fn a_legacy_excel_workbook_reaches_the_plan_as_markdown() {
     let cfg = dry_run_config();
     let out = run_null_stdin(
         &["ask", xls.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("legacy"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+/// The binary workbook flavor (BIFF12 in an OPC package): the
+/// xl/workbook.bin marker routes it through the converter and the grid
+/// reaches the plan as a markdown table.
+#[test]
+fn a_binary_workbook_reaches_the_plan_as_markdown() {
+    let xlsb = temp_file(
+        "legacy.xlsb",
+        include_bytes!("fixtures/documents/sample.xlsb"),
+    );
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", xlsb.to_str().unwrap(), "-p", "总结", "--dry-run"],
         &[],
         &cfg,
     );
