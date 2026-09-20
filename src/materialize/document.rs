@@ -235,4 +235,46 @@ mod tests {
             err.to_string()
         );
     }
+
+    /// A real Word 97 compound file, committed under
+    /// `tests/fixtures/documents/` (see its README): the binary OLE
+    /// container cannot be assembled from parts the way a ZIP package
+    /// can. CJK body text must survive the legacy format into markdown.
+    #[test]
+    fn a_legacy_word_document_converts() {
+        let parts = expand(
+            "legacy.doc",
+            include_bytes!("../../tests/fixtures/documents/sample.doc"),
+            &InputSource::File("legacy.doc".into()),
+            0,
+            0,
+            &mut Budget::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].name, "legacy");
+        assert_eq!(parts[0].mime, "text/markdown");
+        assert_eq!(parts[0].text().unwrap(), "Office preview 中文文档\n");
+    }
+
+    /// A real BIFF8 workbook in a compound file, riding anydoc's Excel
+    /// format into a markdown table. Dispatch goes through the
+    /// compound-file magic with `None` — detection is anydoc's job.
+    #[test]
+    fn a_legacy_excel_workbook_converts() {
+        let parts = expand(
+            "legacy.xls",
+            include_bytes!("../../tests/fixtures/documents/sample.xls"),
+            &InputSource::File("legacy.xls".into()),
+            0,
+            0,
+            &mut Budget::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        let text = parts[0].text().unwrap();
+        assert!(text.contains("Office preview 中文文档"), "{text}");
+    }
 }

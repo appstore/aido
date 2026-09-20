@@ -483,6 +483,45 @@ fn a_csv_file_reaches_the_plan_as_a_markdown_table() {
     assert!(stdout.contains("single request"), "{stdout}");
 }
 
+/// The committed legacy binary fixtures (see fixtures/documents/README.md)
+/// are real compound files: the CFB magic routes them through the
+/// converter and their text reaches the plan like any text input.
+#[test]
+fn a_legacy_word_document_reaches_the_plan_as_markdown() {
+    let doc = temp_file(
+        "legacy.doc",
+        include_bytes!("fixtures/documents/sample.doc"),
+    );
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", doc.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("legacy"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+#[test]
+fn a_legacy_excel_workbook_reaches_the_plan_as_markdown() {
+    let xls = temp_file(
+        "legacy.xls",
+        include_bytes!("fixtures/documents/sample.xls"),
+    );
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", xls.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("legacy"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
 #[test]
 fn a_pdf_via_stdin_materializes_like_a_file() {
     let pdf = picture_book();
