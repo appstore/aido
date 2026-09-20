@@ -10,16 +10,17 @@
 //! first KiB, as readers may see leading junk from scanners and mail
 //! gateways) is a PDF; a ZIP archive whose central directory lists
 //! `xl/workbook.xml` is an OOXML workbook; `word/document.xml`,
-//! `ppt/presentation.xml` or a root `content.xml` is a Word,
-//! PowerPoint or OpenDocument package; a compound-file or `{\rtf`
-//! signature is a legacy Office document or rich text. Word,
-//! PowerPoint, OpenDocument, legacy Office, RTF and CSV convert through
-//! the anydoc backend ([`document`]) behind the container gates in
-//! [`security`]; a workbook keeps its dedicated loader ([`xlsx`]), which
-//! splits sheets into per-sheet parts and bounds the used grid while
-//! streaming. Anything else keeps the content-classification path: a
-//! random ZIP is "neither valid UTF-8 text nor a supported image/audio
-//! file", exactly as before this module existed.
+//! `ppt/presentation.xml`, `xl/workbook.bin`, a root `content.xml` or
+//! `META-INF/container.xml` is a Word, PowerPoint, binary-workbook,
+//! OpenDocument or EPUB package; a compound-file or `{\rtf` signature is
+//! a legacy Office document or rich text. Word, PowerPoint, OpenDocument,
+//! EPUB, legacy Office, RTF and CSV convert through the anydoc backend
+//! ([`document`]) behind the container gates in [`security`]; a workbook
+//! keeps its dedicated loader ([`xlsx`]), which splits sheets into
+//! per-sheet parts and bounds the used grid while streaming. Anything
+//! else keeps the content-classification path: a random ZIP is "neither
+//! valid UTF-8 text nor a supported image/audio file", exactly as before
+//! this module existed.
 //!
 //! Decomposition is bounded like reading: one document yields at most one
 //! single-file input's worth of material ([`Budget`]), whatever its pages
@@ -181,10 +182,11 @@ pub(crate) fn expand(
             let parts = xlsx::expand(origin, bytes, source, document, start_id, &mut budget)?;
             return Ok(Some((parts, budget.notes)));
         }
-        // Word, PowerPoint and OpenDocument packages convert through the
-        // anydoc backend. The same two gates bound what conversion may
-        // decompress: anydoc parses the container with its own reader,
-        // and a lying header must not buy it unbounded work.
+        // Word, PowerPoint, OpenDocument, EPUB and the binary workbook
+        // (.xlsb) convert through the anydoc backend. The same two gates
+        // bound what conversion may decompress: anydoc parses the
+        // container with its own reader, and a lying header must not buy
+        // it unbounded work.
         let office = if zip_lists_entry(bytes, b"word/document.xml") {
             Some(Some(anydoc::Format::Docx))
         } else if zip_lists_entry(bytes, b"ppt/presentation.xml") {
@@ -194,6 +196,17 @@ pub(crate) fn expand(
             // marker only says "ODF" — anydoc tells them apart by the
             // package mimetype.
             Some(None)
+        } else if zip_lists_entry(bytes, b"xl/workbook.bin") {
+            // The binary workbook flavor (.xlsb): same OPC package as a
+            // workbook but BIFF12 parts, so the workbook.xml scan above
+            // never matches. The per-sheet calamine loader cannot read
+            // it; the converter can.
+            Some(Some(anydoc::Format::Excel))
+        } else if zip_lists_entry(bytes, b"META-INF/container.xml") {
+            // EPUB: the OCF container descriptor is the package's
+            // identity (the mimetype entry is its mandatory carrier, but
+            // detection falls back to the descriptor).
+            Some(Some(anydoc::Format::Epub))
         } else {
             None
         };
@@ -211,8 +224,8 @@ pub(crate) fn expand(
             )?;
             return Ok(Some((parts, budget.notes)));
         }
-        // A ZIP that is neither OOXML nor ODF (or whose central
-        // directory cannot be parsed) is not ours to judge.
+        // A ZIP that is none of these (or whose central directory
+        // cannot be parsed) is not ours to judge.
     }
     // Legacy binary Office (doc/ppt/xls share the compound-file
     // container; anydoc tells them apart by their OLE stream names) and
@@ -490,6 +503,36 @@ pub(crate) mod test_support {
 
     const ODF_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/></manifest:manifest>"#;
+
+    /// A minimal but real .epub: OCF container descriptor, one package
+    /// document, one xhtml chapter whose body holds the text. The same
+    /// shape anydoc's own tests convert.
+    pub(crate) fn epub_fixture(chapter_text: &str) -> Vec<u8> {
+        real_zip(&[
+            (
+                "mimetype",
+                "application/epub+zip".into(),
+            ),
+            (
+                "META-INF/container.xml",
+                r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                    .into(),
+            ),
+            (
+                "content.opf",
+                r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title><dc:identifier id="id">urn:uuid:aido</dc:identifier><dc:language>en</dc:language></metadata><manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="ch1"/></spine></package>"#
+                    .into(),
+            ),
+            (
+                "ch1.xhtml",
+                format!(
+                    r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>{chapter_text}</p></body></html>"#
+                ),
+            ),
+        ])
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +617,32 @@ mod tests {
             panic!("an odt is a document");
         };
         assert!(parts[0].text().unwrap().contains("Once upon a time."));
+    }
+
+    #[test]
+    fn an_epub_materializes_through_anydoc() {
+        // The OCF container descriptor (META-INF/container.xml) is the
+        // EPUB marker; the spine's chapters ride into one markdown part.
+        let bytes = test_support::epub_fixture("Once upon a time.");
+        let Some((parts, _)) =
+            expand("tale.epub", &bytes, &file_source("tale.epub"), 0, 0).unwrap()
+        else {
+            panic!("an epub is a document");
+        };
+        assert!(parts[0].text().unwrap().contains("Once upon a time."));
+    }
+
+    #[test]
+    fn a_binary_workbook_routes_to_the_converter() {
+        // .xlsb carries xl/workbook.bin instead of workbook.xml, so the
+        // calamine branch cannot take it; garbage behind the marker makes
+        // the converter's refusal name the file — proof of routing.
+        let bytes = test_support::real_zip(&[
+            ("xl/workbook.bin", "not a workbook".into()),
+            ("[Content_Types].xml", "also not".into()),
+        ]);
+        let err = expand("book.xlsb", &bytes, &file_source("book.xlsb"), 0, 0).unwrap_err();
+        assert!(err.to_string().contains("book.xlsb"), "{err}");
     }
 
     #[test]

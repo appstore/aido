@@ -483,6 +483,50 @@ fn a_csv_file_reaches_the_plan_as_a_markdown_table() {
     assert!(stdout.contains("single request"), "{stdout}");
 }
 
+/// A minimal but real .epub: OCF container descriptor, one package
+/// document, one xhtml chapter whose body holds `text`.
+fn epub_fixture(text: &str) -> Vec<u8> {
+    real_zip(&[
+        ("mimetype", "application/epub+zip".into()),
+        (
+            "META-INF/container.xml",
+            "<?xml version=\"1.0\"?>\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles><rootfile full-path=\"content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>"
+                .into(),
+        ),
+        (
+            "content.opf",
+            "<?xml version=\"1.0\"?>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"/>\
+<manifest><item id=\"ch1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
+<spine><itemref idref=\"ch1\"/></spine></package>"
+                .into(),
+        ),
+        (
+            "ch1.xhtml",
+            format!(
+                "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>{text}</p></body></html>"
+            ),
+        ),
+    ])
+}
+
+#[test]
+fn an_epub_reaches_the_plan_as_markdown() {
+    let epub = temp_file("tale.epub", &epub_fixture("A very memorable chapter"));
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", epub.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("tale"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
 /// The committed legacy binary fixtures (see fixtures/documents/README.md)
 /// are real compound files: the CFB magic routes them through the
 /// converter and their text reaches the plan like any text input.
