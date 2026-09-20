@@ -136,11 +136,106 @@ fn zip_fixture(entries: &[(&[u8], u32)], comment: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn zip_with_entries(names: &[&[u8]]) -> Vec<u8> {
-    zip_fixture(
-        &names.iter().map(|name| (*name, 0u32)).collect::<Vec<_>>(),
-        &[],
-    )
+/// A real ZIP (zip crate, deflate) holding the given text entries — the
+/// minimal honest package shape the anydoc converter parses.
+fn real_zip(entries: &[(&str, String)]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// A minimal but real .docx whose body holds one paragraph of `text`.
+fn docx_fixture(text: &str) -> Vec<u8> {
+    real_zip(&[
+        (
+            "[Content_Types].xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+</Types>"
+                .into(),
+        ),
+        (
+            "_rels/.rels",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+</Relationships>"
+                .into(),
+        ),
+        (
+            "word/document.xml",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            ),
+        ),
+    ])
+}
+
+/// A minimal but real .pptx: one slide whose shape holds `text`.
+fn pptx_fixture(text: &str) -> Vec<u8> {
+    real_zip(&[
+        (
+            "[Content_Types].xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>\
+<Override PartName=\"/ppt/slides/slide1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>\
+</Types>"
+                .into(),
+        ),
+        (
+            "_rels/.rels",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"ppt/presentation.xml\"/>\
+</Relationships>"
+                .into(),
+        ),
+        (
+            "ppt/presentation.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/></p:sldIdLst></p:presentation>"
+                .into(),
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/>\
+</Relationships>"
+                .into(),
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+<p:cSld><p:spTree>\
+<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>\
+<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Title 1\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
+<p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>\
+</p:spTree></p:cSld></p:sld>"
+            ),
+        ),
+    ])
 }
 
 /// Page 1 is a real picture with a text layer; page 2's only image is
@@ -339,23 +434,92 @@ fn workbook_sheets_reach_the_plan_as_text() {
     assert!(stdout.contains("single request"), "{stdout}");
 }
 
+/// A Word document converts through the anydoc backend now: one markdown
+/// text part named after the file, planned like any text input.
 #[test]
-fn docx_refused_with_guidance_naming_the_file() {
-    let docx = temp_file("notes.docx", &zip_with_entries(&[b"word/document.xml"]));
+fn a_word_document_reaches_the_plan_as_markdown() {
+    let docx = temp_file("notes.docx", &docx_fixture("Meeting notes from Tuesday"));
     let cfg = dry_run_config();
     let out = run_null_stdin(
-        &["ask", docx.to_str().unwrap(), "-p", "hi", "--dry-run"],
+        &["ask", docx.to_str().unwrap(), "-p", "总结", "--dry-run"],
         &[],
         &cfg,
     );
-    // Usage errors exit 2.
-    out.assert_code(2);
-    assert!(
-        out.stderr().contains("docx input is not supported"),
-        "{}",
-        out.stderr()
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("notes"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+#[test]
+fn a_powerpoint_document_reaches_the_plan_as_markdown() {
+    let pptx = temp_file("slides.pptx", &pptx_fixture("Quarterly review"));
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", pptx.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
     );
-    assert!(out.stderr().contains("notes.docx"), "{}", out.stderr());
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("slides"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+/// CSV has no content signature: the extension names it, and the table
+/// conversion rides the same markdown-part path as the Office formats.
+#[test]
+fn a_csv_file_reaches_the_plan_as_a_markdown_table() {
+    let csv = temp_file("data.csv", b"city,sales\nBeijing,1200\n");
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", csv.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("data"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+/// The committed legacy binary fixtures (see fixtures/documents/README.md)
+/// are real compound files: the CFB magic routes them through the
+/// converter and their text reaches the plan like any text input.
+#[test]
+fn a_legacy_word_document_reaches_the_plan_as_markdown() {
+    let doc = temp_file(
+        "legacy.doc",
+        include_bytes!("fixtures/documents/sample.doc"),
+    );
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", doc.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("legacy"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
+}
+
+#[test]
+fn a_legacy_excel_workbook_reaches_the_plan_as_markdown() {
+    let xls = temp_file(
+        "legacy.xls",
+        include_bytes!("fixtures/documents/sample.xls"),
+    );
+    let cfg = dry_run_config();
+    let out = run_null_stdin(
+        &["ask", xls.to_str().unwrap(), "-p", "总结", "--dry-run"],
+        &[],
+        &cfg,
+    );
+    out.assert_code(0);
+    let stdout = out.stdout();
+    assert!(stdout.contains("legacy"), "{stdout}");
+    assert!(stdout.contains("single request"), "{stdout}");
 }
 
 #[test]

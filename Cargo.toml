@@ -20,6 +20,10 @@ edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
 pdfium = []
 
 [dependencies]
+# Office/OpenDocument/RTF/CSV → markdown 转换后端（materialize/document.rs）。
+# 纯 Rust、自带 ResourceLimit 防护（解压/嵌套深度/节点数），因此不需要
+# feature 门控；容器格式的炸弹防护仍由 materialize/security.rs 把守。
+anydoc = "0.2"
 anyhow = "1"
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 base64 = "0.22"

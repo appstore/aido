@@ -27,8 +27,7 @@ use crate::domain::{InputContent, InputPart, InputSource, MediaKind};
 use anyhow::{bail, Context, Result};
 use calamine::{Cell, Data, DataRef, Range, Reader, Xlsx};
 use std::collections::HashSet;
-use std::io::{Cursor, Read};
-use zip::ZipArchive;
+use std::io::Cursor;
 
 /// A sheet's used grid is refused beyond this many cells: four million is
 /// far above any sheet meant for reading, and bounds the dense range (and
@@ -40,44 +39,27 @@ const MAX_SHEET_CELLS: u64 = 4_000_000;
 /// declared sizes, which cost nothing to write; this bound is measured on
 /// the real stream. Shared strings are the entry a hostile workbook hides
 /// its bomb in — every distinct string is loaded before any sheet is read.
-const MAX_LOADED_ENTRY_BYTES: u64 = super::MAX_OOXML_DECOMPRESSED;
+const MAX_LOADED_ENTRY_BYTES: u64 = super::security::MAX_OOXML_DECOMPRESSED;
 
 /// The entries calamine decompresses whole while opening the workbook.
 const EAGER_ENTRIES: [&str; 3] = ["xl/sharedStrings.xml", "xl/styles.xml", "xl/workbook.xml"];
 
-/// Decompress each eagerly-loaded entry through a `take(ceiling + 1)` and
-/// drop the bytes: the actual decompressed size is bounded no matter what
-/// the central directory declares (a ZIP64 unknown marker or a plain lie
-/// both sail past the declared-size gate, and zip's deflate reader does
-/// not cap output itself). One bounded extra pass over ≤3 entries of a
-/// ≤32 MB file; a normal workbook costs one quick scan.
+/// The per-sheet cell bound cannot contain what `Xlsx::new` itself loads:
+/// calamine eagerly decompresses `xl/sharedStrings.xml`, `xl/styles.xml`
+/// and `xl/workbook.xml` whole at open time, and the zip crate's deflate
+/// reader never caps a lying declared size. [`super::security::verify_entries`]
+/// pays one bounded pass over those entries first — each streamed through
+/// a `take` bound, the bytes dropped — so a workbook whose entries
+/// actually decompress past the ceiling is refused before the loader can
+/// allocate.
 fn verify_decompression(origin: &str, bytes: &[u8]) -> Result<()> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
-        .with_context(|| format!("cannot open '{origin}' as a workbook"))?;
-    for name in EAGER_ENTRIES {
-        let Ok(mut entry) = archive.by_name(name) else {
-            continue;
-        };
-        // take() bounds how much decompression happens at all; the read is
-        // discarded, so the pass costs CPU only.
-        let mut limited = (&mut entry).take(MAX_LOADED_ENTRY_BYTES + 1);
-        let mut sink = [0u8; 64 * 1024];
-        let mut read = 0u64;
-        loop {
-            let n = limited.read(&mut sink)? as u64;
-            if n == 0 {
-                break;
-            }
-            read += n;
-            if read > MAX_LOADED_ENTRY_BYTES {
-                bail!(
-                    "'{origin}': entry '{name}' actually decompresses past {} MB; refusing",
-                    MAX_LOADED_ENTRY_BYTES / (1024 * 1024)
-                );
-            }
-        }
-    }
-    Ok(())
+    super::security::verify_entries(
+        origin,
+        bytes,
+        MAX_LOADED_ENTRY_BYTES,
+        &EAGER_ENTRIES,
+        "workbook",
+    )
 }
 
 pub(super) fn expand(
