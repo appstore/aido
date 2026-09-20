@@ -139,9 +139,11 @@ fn zip_fixture(entries: &[(&[u8], u32)], comment: &[u8]) -> Vec<u8> {
 // The package builders below (real_zip, docx_fixture, pptx_fixture,
 // epub_fixture) deliberately mirror their twins in
 // `src/materialize/mod.rs` `test_support`: integration tests are a
-// separate crate and cannot see that `pub(crate)` module. Keep each pair
-// in sync — if you change one, change its twin, or the two test layers
-// will quietly test different shapes.
+// separate crate and cannot see that `pub(crate)` module. "Twin" means
+// shape-equivalent — the same entries with the same XML payloads (only
+// the XML prolog's trailing whitespace may differ) — so keep each pair
+// in sync by hand: a one-sided change would quietly test different
+// shapes on the two layers.
 
 /// A real ZIP (zip crate, deflate) holding the given text entries — the
 /// minimal honest package shape the anydoc converter parses. Twin of
@@ -509,7 +511,7 @@ fn epub_fixture(text: &str) -> Vec<u8> {
         (
             "content.opf",
             "<?xml version=\"1.0\"?>\
-<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"/>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Book</dc:title><dc:identifier id=\"id\">urn:uuid:aido</dc:identifier><dc:language>en</dc:language></metadata>\
 <manifest><item id=\"ch1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
 <spine><itemref idref=\"ch1\"/></spine></package>"
                 .into(),
