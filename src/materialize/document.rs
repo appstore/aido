@@ -277,4 +277,29 @@ mod tests {
         let text = parts[0].text().unwrap();
         assert!(text.contains("Office preview 中文文档"), "{text}");
     }
+
+    /// A real BIFF12 workbook, committed under `tests/fixtures/documents/`
+    /// (see its README): the binary workbook flavor no open-source writer
+    /// can produce. The Excel format must ride its grid into a markdown
+    /// table end to end.
+    #[test]
+    fn a_binary_workbook_converts() {
+        let parts = expand(
+            "legacy.xlsb",
+            include_bytes!("../../tests/fixtures/documents/sample.xlsb"),
+            &InputSource::File("legacy.xlsb".into()),
+            0,
+            0,
+            &mut Budget::new(),
+            Some(anydoc::Format::Excel),
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].name, "legacy");
+        assert_eq!(parts[0].mime, "text/markdown");
+        assert_eq!(
+            parts[0].text().unwrap(),
+            "| hello | world |\n| --- | --- |\n| 1 | 2 |\n"
+        );
+    }
 }

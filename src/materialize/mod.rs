@@ -635,8 +635,13 @@ mod tests {
     #[test]
     fn a_binary_workbook_routes_to_the_converter() {
         // .xlsb carries xl/workbook.bin instead of workbook.xml, so the
-        // calamine branch cannot take it; garbage behind the marker makes
-        // the converter's refusal name the file — proof of routing.
+        // calamine branch cannot take it. This anchors two contracts at
+        // once: the marker routes into the converter, and a converter
+        // failure surfaces as an anyhow error whose message carries the
+        // file name (the `cannot convert '{origin}': …` lead-in built by
+        // document::conversion_error — the real-content counterpart is
+        // document::tests::a_binary_workbook_converts). If anydoc ever
+        // changes its error text, this is the test that says so.
         let bytes = test_support::real_zip(&[
             ("xl/workbook.bin", "not a workbook".into()),
             ("[Content_Types].xml", "also not".into()),
