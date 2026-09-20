@@ -44,6 +44,19 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # AGENTS.md 约定：单元测试拆到 src/<module>/tests.rs，生产源码不内嵌
+      # #[cfg(test)] 门控的模块体。凡 cfg(test) 后跟带内联 { 的 mod 声明
+      # （无论叫 tests 还是别的名字）都算内嵌，一律拦截。
+      - name: No embedded test modules
+        if: runner.os == 'Linux'
+        run: |
+          if grep -rn --include='*.rs' -A1 '#\[cfg(test)\]' src | grep -E 'mod [A-Za-z_][A-Za-z0-9_]* *\{'; then
+            echo "::error::embedded #[cfg(test)] module body in src/; split it into src/<module>/tests.rs (AGENTS.md)"
+            exit 1
+          else
+            echo "no embedded test modules"
+          fi
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
