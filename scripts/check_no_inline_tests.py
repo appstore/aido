@@ -255,7 +255,9 @@ def main(argv):
     violations = 0
     for raw in paths:
         for path in sorted(Path(raw).rglob("*.rs")):
-            for line, name in find_inline_test_modules(path.read_text()):
+            # Rust sources are UTF-8 by definition; don't inherit the
+            # runner's locale encoding.
+            for line, name in find_inline_test_modules(path.read_text(encoding="utf-8")):
                 print(f"::error file={path},line={line}::embedded #[cfg(test)] module body "
                       f"`mod {name}` — move it to a separate tests.rs file (AGENTS.md)")
                 violations += 1
