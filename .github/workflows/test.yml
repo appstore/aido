@@ -44,6 +44,15 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # AGENTS.md 约定：单元测试拆到 src/<module>/tests.rs，生产源码不内嵌
+      # #[cfg(test)] 门控的模块体。检查脚本 token-aware，不依赖代码格式：
+      # gate 与 mod 之间夹注释、空行、其他 attribute 一样会被拦下。
+      - name: No embedded test modules
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/check_no_inline_tests.py --self-test
+          python3 scripts/check_no_inline_tests.py src
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
