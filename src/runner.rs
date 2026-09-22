@@ -100,22 +100,31 @@ fn env_key(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// The run's spinner, shared with the live sinks: the first delta that
-/// reaches stdout takes and stops it (see `DeltaSink::emit`).
+/// The run's spinner, shared with the live sinks: every step's first live
+/// delta stops whatever spinner that step started with (see
+/// `DeltaSink::emit`).
 type SharedSpinner = Rc<RefCell<Option<Spinner>>>;
 
 struct DeltaSink {
     merged: String,
     live: bool,
     /// Present only when the live text and the spinner share one terminal
-    /// (stdout is a TTY too): the first live emit takes and stops it. A
-    /// piped stdout never displays the content, so there the spinner runs
-    /// to the end of the run as before.
+    /// (stdout is a TTY too): a permanent handle on the shared cell. Each
+    /// step's first live emit stops whatever spinner the step started
+    /// with — the cell is emptied, this handle is not, so a restarted
+    /// step spinner retires the same way. A piped stdout never displays
+    /// the content, so there the spinner runs to the end of the run as
+    /// before.
     spinner: Option<SharedSpinner>,
     chars_seen: u64,
     /// Only the text printed live: `chars_seen` also counts buffered
     /// sinks, whose output never reached the terminal.
     live_chars: u64,
+    /// Whether the terminal cursor sits on a half-written content line:
+    /// the last live print did not end in a newline. A step banner drawn
+    /// after it must break the line first, or its `\r` redraws chop the
+    /// content.
+    line_open: bool,
 }
 
 impl DeltaSink {
@@ -124,11 +133,14 @@ impl DeltaSink {
         self.merged.push_str(text);
         if self.live {
             // The spinner and the live reply share one terminal: before
-            // the first delta reaches stdout, retire the spinner — its
-            // \r-redraws would otherwise land inside the streamed lines
-            // and chop them up (issue #62). stop() erases the line and
-            // joins the thread, so the content starts on a clean screen.
-            if let Some(cell) = self.spinner.take() {
+            // this step's first delta reaches stdout, retire whatever
+            // spinner the step started with — its \r-redraws would
+            // otherwise land inside the streamed lines and chop them up
+            // (issue #62). stop() erases the line and joins the thread,
+            // so the content starts on a clean screen. The cell empties;
+            // the handle stays, so a spinner restarted for a later step
+            // (issue #81) retires here exactly the same way.
+            if let Some(cell) = &self.spinner {
                 if let Some(spinner) = cell.borrow_mut().take() {
                     spinner.stop();
                 }
@@ -136,6 +148,10 @@ impl DeltaSink {
             print!("{text}");
             let _ = std::io::stdout().flush();
             self.live_chars += text.chars().count() as u64;
+            // An empty delta prints nothing, so it cannot move the cursor.
+            if !text.is_empty() {
+                self.line_open = !text.ends_with('\n');
+            }
         }
     }
 }
@@ -185,6 +201,32 @@ fn spinner_prefix(resolved: &Resolved) -> String {
         Adapter::Speech => format!("synthesizing speech ({})", resolved.model),
         _ => format!("asking {}", resolved.model),
     }
+}
+
+/// Announce a step on the terminal, spinner-wise. A live sink retires the
+/// spinner at its first delta (issue #62), so a multi-request run's later
+/// steps found the cell empty and went silent — minutes of frozen cursor
+/// between an image's slices (issue #81). `announce_step` restarts the
+/// spinner for such a step; this step's first delta retires it again
+/// exactly like the first one's.
+///
+/// `line_open` says the streamed content stopped mid-line: break it
+/// before drawing, or the fresh spinner's `\r` redraws would chop it. A
+/// non-terminal stderr never restarts — and never breaks the line either:
+/// `2>log` must not gain blank lines inside the content. Only called for
+/// non-quiet runs; a quiet one never starts a spinner to restart.
+fn announce_step(cell: &SharedSpinner, label: &str, stderr_tty: bool, line_open: bool) {
+    if let Some(spinner) = cell.borrow().as_ref() {
+        spinner.set_message(label);
+        return;
+    }
+    if !stderr_tty {
+        return;
+    }
+    if line_open {
+        println!();
+    }
+    *cell.borrow_mut() = Some(Spinner::start(label));
 }
 
 /// Run every step of the plan. Text deltas stream live when the plan says
@@ -374,6 +416,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 spinner: (live && plan.terminal.stdout).then(|| spinner.clone()),
                 chars_seen: 0,
                 live_chars: 0,
+                line_open: false,
             }));
             // A reduce group never merges through a gate: map replies
             // accumulate as sections (the reduce request's material) and
@@ -429,12 +472,10 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
             } else {
                 format!("{prefix}...")
             };
-            // The cell may already be empty: a live sink retired the
-            // spinner at its first delta, and later steps stay quiet so
-            // the streamed content keeps the terminal to itself.
-            if let Some(spinner) = spinner.borrow().as_ref() {
-                spinner.set_message(&label);
-            }
+            // The current group's sink is the terminal's writer: its
+            // `line_open` says where a restarted banner may draw.
+            let line_open = group.as_ref().unwrap().sink.borrow().line_open;
+            announce_step(&spinner, &label, plan.terminal.stderr, line_open);
         }
         // A reduce step's material is its group's collected map replies —
         // placeholders in the plan, filled in here. The task's original
@@ -627,8 +668,9 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     if let Some(g) = group.take() {
         close_group!(g, artifacts, failed_parts);
     }
-    // A live run already retired its spinner at the first delta; this
-    // covers every other path (buffered, batch, no live output).
+    // A live run retired its spinner at the first delta; this covers
+    // every other path (buffered, batch, no live output, and a restarted
+    // step spinner whose reply never streamed).
     if let Some(spinner) = spinner.borrow_mut().take() {
         spinner.set_progress(total_chars);
         spinner.stop();
