@@ -22,7 +22,7 @@ aido tts --text "你好" -o hello.mp3
 cargo install --path .
 ```
 
-> 源码构建需要系统装有 **cmake** 与 C 编译器：`tts` 的协议实现 `kothok-edge-tts` 经由其 `tokio-rustls` 依赖的默认特性引入了 `aws-lc-sys`（C 构建需要 cmake）。运行时 TLS 实际使用 ring，aws-lc 只是构建期的额外成本。`edge-tts` 是 aido 侧的 feature（默认开启），不开 TTS 时可用 `cargo build --no-default-features` 同时甩掉 aws-lc-sys 和 cmake 这两个构建依赖；上游修正特性声明后此要求即可移除（CI 的依赖树检查会在它消失时提醒）。
+> 源码构建需要系统装有 **cmake** 与 C 编译器：`tts` 的协议实现 `kothok-edge-tts` 经由其 `tokio-rustls` 依赖的默认特性引入了 `aws-lc-sys`（C 构建需要 cmake）。运行时 TLS 实际使用 ring，aws-lc 只是构建期的额外成本。`edge-tts` 是 aido 侧的 feature（默认开启），不开 TTS 时可用 `cargo build --no-default-features` 同时甩掉 aws-lc-sys 和 cmake 这两个构建依赖；上游修正特性声明后此要求即可移除（CI 的依赖树检查会在它消失时提醒）。reqwest 0.13 起默认 TLS provider 也换成了 aws-lc，aido 已显式钉住 ring（`rustls-no-provider` + 自配 rustls 配置，见 `api/transport.rs`），reqwest 路径不引入 aws-lc；aws-lc 仍只经 `kothok-edge-tts` 进入默认构建。
 
 ## 快速开始
 

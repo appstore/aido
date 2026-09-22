@@ -3,6 +3,7 @@ use super::edge;
 use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) fn truncate_chars(s: &str, max: usize) -> String {
@@ -121,6 +122,26 @@ pub struct Client {
     adapter: Adapter,
 }
 
+/// The rustls config handed to reqwest. Since 0.13 the `rustls` feature
+/// wires in the aws-lc-rs provider (the 0.13 default) and platform
+/// certificate verification; aido instead builds the config itself — ring
+/// as the crypto provider (the provider the edge-tts stack runs with at
+/// runtime, and what keeps aws-lc out of `--no-default-features` builds)
+/// over the webpki-roots store, matching what the 0.12 `rustls-tls`
+/// feature provided. The config carries no ALPN protocols, so no HTTP/2
+/// is ever negotiated — same as before the upgrade; enabling reqwest's
+/// http2 feature alone would not change that with a preconfigured config.
+fn rustls_client_config() -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth())
+}
+
 impl Client {
     pub fn new(conn: &Connection) -> Result<Self> {
         let base_url = match conn.adapter {
@@ -142,6 +163,7 @@ impl Client {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!("aido/", env!("CARGO_PKG_VERSION")))
+                .tls_backend_preconfigured(rustls_client_config()?)
                 .build()
                 .context("failed to build HTTP client")?,
             base_url,

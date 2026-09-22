@@ -39,7 +39,18 @@ glob = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 kothok-edge-tts = { version = "0.2.10", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+# 0.13 起 rustls 是默认 TLS 后端、默认 crypto provider 换成 aws-lc，且 rustls
+# 相关 feature 更名（rustls-tls → rustls）。aido 用 rustls-no-provider 甩掉默认
+# provider，由下面配套的 rustls（ring）+ webpki-roots 构造 ClientConfig 经
+# tls_backend_preconfigured 传入（api/transport.rs）：--no-default-features
+# 构建由此继续不含 aws-lc，根证书也保持 webpki-roots（0.13 默认已换平台证书库）。
+# system-proxy 在 0.13 属 default features（此处关了 default），不显式开启会
+# 静默失去 HTTP(S)_PROXY 支持；json/multipart 仍按需单开。
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls-no-provider", "system-proxy"] }
+# reqwest 的 TLS 配套（见上）：provider 与 feature 形状（ring/std/tls12）和
+# kothok-edge-tts 经 tokio-rustls 的解析保持一致，全树只编译一份 rustls。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
