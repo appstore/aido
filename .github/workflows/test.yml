@@ -158,6 +158,35 @@ jobs:
           PDFIUM_LIB_DIR: ${{ runner.temp }}/pdfium
         run: cargo test --locked --features pdfium
 
+  audio-decode:
+    # `audio-decode` feature 的离线音频解码模块（src/audio.rs）默认构建
+    # 完全编译不到，唯一能验证它的地方就是这里。纯 Rust 依赖，无需额外
+    # 环境；测试用的 mp3/webm fixture 以 include_bytes! 内嵌。
+    name: audio-decode
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audio-decode
+
+      - name: Clippy (audio-decode)
+        run: cargo clippy --all-targets --locked --features audio-decode -- -D warnings
+
+      - name: Test (audio-decode)
+        run: cargo test --locked --features audio-decode
+
+      # additive-feature 组合没有任何 job 覆盖过（no-default-features job
+      # 不带 audio-decode，audio-decode job 带默认特性），这里补上。
+      - name: Check (audio-decode, no default features)
+        run: cargo check --locked --no-default-features --features audio-decode
+
   musl:
     # x86_64-unknown-linux-musl 是 release 产物目标（全静态 Linux 二进制）。
     # PR 阶段跑 check（会执行 build script、编译 aws-lc-sys 的 C 代码，真实走
