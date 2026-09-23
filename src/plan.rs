@@ -73,12 +73,6 @@ pub struct ExecutionPlan {
     pub transport_stream: bool,
     pub delivery: DeliveryMode,
     pub timeout: Duration,
-    /// Whether `timeout` came from the user (--timeout / settings
-    /// timeout_secs) rather than the built-in default: the local-asr
-    /// adapter treats an explicit timeout as a hard wall, while the
-    /// default — which exists to bound network waits — stretches with the
-    /// audio length.
-    pub timeout_explicit: bool,
     pub total_timeout: Option<Duration>,
     pub record_history: bool,
     pub quiet: bool,
@@ -320,7 +314,6 @@ fn plan_from(
     };
 
     let timeout = Duration::from_secs(cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120));
-    let timeout_explicit = cli.timeout.is_some() || cfg.settings.timeout_secs.is_some();
     let total_timeout = cli
         .total_timeout
         .or(cfg.settings.total_timeout_secs)
@@ -336,17 +329,14 @@ fn plan_from(
         expected_counts.push((*kind, n));
     }
 
-    // Credential reference only: never the value. Adapters that own their
-    // endpoint (edge-tts) or model (local-asr) take no credentials, so
-    // their plans report "none required" instead of pointing at a key that
-    // is never sent — and so does a provider that names no env var at all.
-    // Anything else gets the same judgment the runner's send-time
-    // resolution uses, fallback included, so the dry-run cannot prophesy a
-    // failure the real run would not have.
-    let credentials_available = if matches!(
-        resolved.adapter,
-        crate::api::Adapter::EdgeTts | crate::api::Adapter::LocalAsr
-    ) {
+    // Credential reference only: never the value. The edge-tts adapter
+    // owns its endpoint and takes no credentials, so its plans report
+    // "none required" instead of pointing at a key that is never sent —
+    // and so does a provider that names no env var at all. Anything else
+    // gets the same judgment the runner's send-time resolution uses,
+    // fallback included, so the dry-run cannot prophesy a failure the
+    // real run would not have.
+    let credentials_available = if matches!(resolved.adapter, crate::api::Adapter::EdgeTts) {
         None
     } else {
         resolved
@@ -373,7 +363,6 @@ fn plan_from(
         transport_stream,
         delivery,
         timeout,
-        timeout_explicit,
         total_timeout,
         record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(DEFAULT_KEEP) > 0,
         quiet: cli.quiet,
@@ -455,14 +444,8 @@ fn validate_adapter_availability(resolved: &Resolved) -> AppResult<()> {
             crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
         ));
     }
-    #[cfg(not(feature = "local-asr"))]
-    if resolved.adapter == crate::api::Adapter::LocalAsr {
-        return Err(AppError::usage(
-            crate::api::LOCAL_ASR_NOT_COMPILED.to_string(),
-        ));
-    }
-    // With the features on there is nothing to check; keep the parameter used.
-    #[cfg(all(feature = "edge-tts", feature = "local-asr"))]
+    // With the feature on there is nothing to check; keep the parameter used.
+    #[cfg(feature = "edge-tts")]
     let _ = resolved;
     Ok(())
 }
@@ -1046,20 +1029,6 @@ pub(crate) fn describe_param_sources(
     out
 }
 
-/// The local-asr model directory for the dry-run's provider line: the
-/// profile's resolved ASR directory when this plan routes to the local
-/// engine, None otherwise (also None in builds without the feature, where
-/// validate_adapter_availability refuses the adapter anyway).
-#[cfg(feature = "local-asr")]
-fn dry_run_model_dir(r: &crate::config::Resolved) -> Option<&std::path::Path> {
-    r.local_models.as_ref().map(|m| m.asr.as_path())
-}
-
-#[cfg(not(feature = "local-asr"))]
-fn dry_run_model_dir(_r: &crate::config::Resolved) -> Option<&std::path::Path> {
-    None
-}
-
 /// Render the sanitized plan for `--dry-run` and debugging.
 pub fn describe(plan: &ExecutionPlan) -> String {
     let mut out = String::new();
@@ -1075,10 +1044,9 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         plan.task.operation
     ));
     out.push_str(&format!("profile:     {}\n", r.profile_name));
-    let shown_url = match (&r.base_url, dry_run_model_dir(r)) {
-        (Some(url), _) => redact_url(url),
-        (None, Some(dir)) => format!("(local model dir: {})", dir.display()),
-        (None, None) => "(endpoint owned by the edge-tts adapter)".to_string(),
+    let shown_url = match &r.base_url {
+        Some(url) => redact_url(url),
+        None => "(endpoint owned by the edge-tts adapter)".to_string(),
     };
     out.push_str(&format!(
         "provider:    {} → {} (route: {})\n",

@@ -1,7 +1,5 @@
 #[cfg(feature = "edge-tts")]
 use super::edge;
-#[cfg(feature = "local-asr")]
-use super::local_asr::{self, LocalModels};
 use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -99,22 +97,11 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
 
 /// Everything the client needs to reach a service. Credentials are
 /// resolved by the caller at send time and never logged. `base_url` is
-/// `None` for adapters that own their endpoint (edge-tts, local-asr).
+/// `None` for adapters that own their endpoint (edge-tts).
 pub struct Connection {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    /// Local model files, consumed only by the local-asr adapter — always
-    /// set when `adapter` is LocalAsr (resolve() builds them), None
-    /// otherwise. The field lives only in feature-on builds.
-    #[cfg(feature = "local-asr")]
-    pub models: Option<LocalModels>,
     pub timeout: Duration,
-    /// Whether `timeout` is the user's explicit budget (see
-    /// ExecutionPlan::timeout_explicit): the local-asr adapter treats it
-    /// as a hard wall instead of stretching with the audio length. The
-    /// field lives only in feature-on builds.
-    #[cfg(feature = "local-asr")]
-    pub timeout_explicit: bool,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
     /// per-request `timeout`.
@@ -126,16 +113,7 @@ pub struct Client {
     http: reqwest::Client,
     base_url: Option<reqwest::Url>,
     api_key: Option<String>,
-    /// Local model files, consumed only by the local-asr adapter — always
-    /// set when `adapter` is LocalAsr. The field lives only in feature-on
-    /// builds.
-    #[cfg(feature = "local-asr")]
-    models: Option<LocalModels>,
     timeout: Duration,
-    /// Consumed only by the local-asr adapter (hard wall vs. stretch) —
-    /// the field lives only in feature-on builds.
-    #[cfg(feature = "local-asr")]
-    timeout_explicit: bool,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
     /// per-request `timeout` — so the field lives only in feature-on builds.
@@ -167,7 +145,7 @@ fn rustls_client_config() -> Result<rustls::ClientConfig> {
 impl Client {
     pub fn new(conn: &Connection) -> Result<Self> {
         let base_url = match conn.adapter {
-            Adapter::EdgeTts | Adapter::LocalAsr => None,
+            Adapter::EdgeTts => None,
             _ => Some(reqwest::Url::parse(
                 conn.base_url
                     .as_deref()
@@ -190,11 +168,7 @@ impl Client {
                 .context("failed to build HTTP client")?,
             base_url,
             api_key: conn.api_key.clone(),
-            #[cfg(feature = "local-asr")]
-            models: conn.models.clone(),
             timeout: conn.timeout,
-            #[cfg(feature = "local-asr")]
-            timeout_explicit: conn.timeout_explicit,
             #[cfg(feature = "edge-tts")]
             total_timeout: conn.total_timeout,
             adapter: conn.adapter,
@@ -208,9 +182,7 @@ impl Client {
             Adapter::Speech => "audio/speech",
             Adapter::Transcription => "audio/transcriptions",
             Adapter::Images => "images/generations",
-            Adapter::EdgeTts | Adapter::LocalAsr => {
-                bail!("the {} adapter does not use HTTP requests", self.adapter)
-            }
+            Adapter::EdgeTts => bail!("the {} adapter does not use HTTP requests", self.adapter),
         };
         let base = self
             .base_url
@@ -225,9 +197,7 @@ impl Client {
             Adapter::Transcription => req.multipart(media::transcription(request)?),
             Adapter::Speech => req.json(&media::encode_speech(request)?),
             Adapter::Images => req.json(&media::encode_images(request)?),
-            Adapter::EdgeTts | Adapter::LocalAsr => {
-                bail!("the {} adapter does not use HTTP requests", self.adapter)
-            }
+            Adapter::EdgeTts => bail!("the {} adapter does not use HTTP requests", self.adapter),
         };
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -255,25 +225,6 @@ impl Client {
             #[cfg(not(feature = "edge-tts"))]
             {
                 bail!(super::EDGE_TTS_NOT_COMPILED);
-            }
-        }
-        if self.adapter == Adapter::LocalAsr {
-            // Same stays-compiled story as edge-tts: a config naming
-            // 'local-asr' parses in any build, only the engine is absent.
-            // resolve() guarantees models for this adapter, so the expect
-            // is an invariant assertion, not input handling.
-            #[cfg(feature = "local-asr")]
-            {
-                let models = self
-                    .models
-                    .as_ref()
-                    .expect("local-asr adapter without resolved models");
-                return local_asr::transcribe(request, self.timeout, self.timeout_explicit, models)
-                    .await;
-            }
-            #[cfg(not(feature = "local-asr"))]
-            {
-                bail!(super::LOCAL_ASR_NOT_COMPILED);
             }
         }
         let resp = self

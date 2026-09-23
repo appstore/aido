@@ -199,9 +199,6 @@ fn spinner_prefix(resolved: &Resolved) -> String {
     match resolved.adapter {
         Adapter::EdgeTts => "synthesizing speech (edge-tts)".into(),
         Adapter::Speech => format!("synthesizing speech ({})", resolved.model),
-        // The local engine never talks to a service, so the model name
-        // would report nothing (issue #72's story again).
-        Adapter::LocalAsr => "transcribing audio (local)".into(),
         _ => format!("asking {}", resolved.model),
     }
 }
@@ -256,11 +253,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
     let conn = Connection {
         base_url: plan.resolved.base_url.clone(),
         api_key,
-        #[cfg(feature = "local-asr")]
-        models: plan.resolved.local_models.clone(),
         timeout: plan.timeout,
-        #[cfg(feature = "local-asr")]
-        timeout_explicit: plan.timeout_explicit,
         total_timeout: plan.total_timeout,
         adapter: plan.resolved.adapter,
     };

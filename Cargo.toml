@@ -28,14 +28,20 @@ pdfium = []
 # 0.0.x version requirements are exact by semver, so this stays pinned
 # until asr-core starts promising compatibility.
 audio-decode = ["dep:asr-core"]
-# Local offline transcription (src/api/local_asr.rs): the sherpa-onnx
-# stack over asr-core's engine. Implies audio-decode (the decode layer is
-# this path's input half). Off by default: sherpa-onnx is a C++ source
-# build that needs cmake and a C++ toolchain, and the binary grows by the
-# native libraries. Builds without the feature keep every config surface
-# (the adapter variant stays compiled) but refuse at run time.
+# The ASR HTTP server (src/serve.rs): one offline engine loaded once,
+# exposed over the OpenAI-compatible transcription API. Implies
+# audio-decode (the decode layer is every request's input half). Pure
+# Rust: the handlers test against a mock engine with no model files, so
+# this feature is cheap enough for every PR to run its full test suite.
+asr-server = ["audio-decode", "dep:axum"]
+# The sherpa-onnx engine behind the ASR server (asr-core's local
+# backend). Implies asr-server: the server is the engine's only consumer.
+# Off by default: sherpa-onnx is a C++ source build that needs cmake and
+# a C++ toolchain, and the binary grows by the native libraries. Builds
+# without the feature keep every config surface but `aido serve asr`
+# refuses at run time.
 local-asr = [
-    "audio-decode",
+    "asr-server",
     "asr-core/backend-sherpa",
     "asr-core/vad-silero",
     "asr-core/punct-sherpa",
@@ -81,7 +87,16 @@ serde_json = "1"
 asr-core = { version = "=0.0.2", default-features = false, features = [
     "decode-symphonia",
 ], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# asr-server feature（见上）：本地转写服务的 HTTP 层。default-features
+# 关掉后只留 http1 + tokio + json + multipart，hyper/tower 本就随 reqwest
+# 在依赖树里，这里只加路由、JSON 与 multipart 提取。
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "multipart",
+], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 toml = "0.8"
 unicode-width = "0.2"
 lopdf = "0.45.0"

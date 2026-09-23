@@ -22,6 +22,7 @@ pub mod output;
 pub mod plan;
 pub mod processors;
 pub mod runner;
+pub mod serve;
 pub mod spinner;
 pub mod tasks;
 pub mod watch;

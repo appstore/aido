@@ -89,23 +89,24 @@ aido transcribe meeting.mp3 -o meeting.txt      # 输入恰好一个音频文件
 aido transcribe voice-note.m4a --copy
 ```
 
-### 离线转写（实验性，`local-asr` feature）
+### 离线转写（实验性，`serve asr`）
 
-云端路由之外的本地引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 模型经 asr-core 在本机推理，零网络。默认构建不包含；源码构建需要 `--features local-asr`（sherpa-onnx 是 C++ 源码构建，要求系统装有 **cmake** 与 C++ 工具链）。
+云端路由之外的本地引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 模型经 asr-core 在本机推理，零网络。本地转写以**常驻服务**形式提供：`aido serve asr` 启动时加载一次模型，以 OpenAI 兼容的 HTTP 接口对外服务——`aido transcribe` 本身零变动（走已有的 openai-transcription 适配器指到本地服务即可），任何会说 OpenAI 协议的工具也都能直接用这个引擎。默认构建不包含；源码构建需要 `--features local-asr`（sherpa-onnx 是 C++ 源码构建，要求系统装有 **cmake** 与 C++ 工具链）。
 
 ```toml
-# 配置目录的 config.toml：加一个 provider，把 transcribe 路由过去；
-# 模型都在 profile 里指定（解压后的 sherpa-onnx 模型归档，如 SenseVoice、
-# Paraformer、FireRedASR、Qwen3-ASR、FunASR-Nano）
-default_profile = "local"
+# 配置目录的 config.toml：一个 provider 指向本地服务，一个 profile 指定
+# 模型（解压后的 sherpa-onnx 模型归档，如 SenseVoice、Paraformer、
+# FireRedASR、Qwen3-ASR、FunASR-Nano）。同一 profile 同时喂
+# `aido serve asr`（读 asr/vad/punct）与 `aido transcribe`（走 HTTP）。
 
-[providers.local]
+[providers.local-asr]
+base_url = "http://127.0.0.1:8080/v1"   # 本地服务，无需 api_key
 
-[providers.local.routes]
-transcribe = "local-asr"
+[providers.local-asr.routes]
+transcribe = "openai-transcription"
 
-[profiles.local]
-provider = "local"
+[profiles.local-asr]
+provider = "local-asr"
 operations = ["transcribe"]
 asr = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # ASR 模型
 vad = "~/models/silero_vad.onnx"                                                  # 离线家族必需
@@ -115,10 +116,16 @@ punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-
 跑起来：
 
 ```bash
-aido transcribe --profile local meeting.mp3 -o meeting.txt
+# 终端 1：模型加载（秒到分钟级）只付一次，之后常驻
+aido serve asr --profile local-asr
+
+# 终端 2：转写走 HTTP，不再每次加载模型
+aido transcribe --profile local-asr meeting.mp3 -o meeting.txt
 ```
 
-规则：三个模型字段都支持 `~` 展开。`asr` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。profile options：`family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`language`、`threads`、`max_audio_secs`（解码预算，默认 3600）。`--model` 对该适配器无效果（引擎由 `asr` 决定）。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
+规则：三个模型字段都支持 `~` 展开。`asr` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。引擎 knobs 是 `aido serve asr` 的 flags（不进 profile options，否则同 profile 的 transcribe 路由过不了 openai-transcription 的选项校验）：`--family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`--language`（启动时固定，引擎运行中不能切换语言）、`--threads`、`--max-audio-secs`（解码预算，默认 3600）、`--bind`（默认 127.0.0.1:8080）、`--max-active-sessions`（默认 8，满员请求回 503）、`--max-body-mb`（默认 512）、`--timeout-secs`（默认按音频时长自适应）。接口：`POST /v1/audio/transcriptions`（multipart，`file` 必填；`model`/`prompt`/`temperature` 接受但忽略；`response_format` 仅支持 `json`）、`GET /health`、`GET /v1/models`。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
+
+> ① **常驻内存是净代价**：以 FireRedASR2 int8 为例峰值约 1.6 GB——换来的是模型加载只付一次；偶尔转一个文件的场景，不值得起服务。② **长音频**要调大 `--timeout` / `settings.timeout_secs`：client 侧超时就是普通 HTTP 超时，服务端默认按音频秒数×3 自适应，但 client 等不了那么久。③ 服务不校验 Authorization（默认只绑 loopback；client 侧若要求 key，设个占位环境变量即可）。
 
 > SenseVoice 自带标点，再叠加标点模型可能出现重复标点（"。，"）——无标点输出的家族（Paraformer 等）更适合配 `punct`。
 
@@ -142,16 +149,16 @@ tar -xjf /tmp/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8
 ```
 
 ```toml
-# 4. 配置目录的 config.toml：provider 路由 + profile 指定全部模型
-default_profile = "local"
+# 4. 配置目录的 config.toml：provider 指向本地服务 + profile 指定全部模型
 
-[providers.local]
+[providers.local-asr]
+base_url = "http://127.0.0.1:8080/v1"
 
-[providers.local.routes]
-transcribe = "local-asr"
+[providers.local-asr.routes]
+transcribe = "openai-transcription"
 
-[profiles.local]
-provider = "local"
+[profiles.local-asr]
+provider = "local-asr"
 operations = ["transcribe"]
 asr = "~/models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
 vad = "~/models/silero_vad.onnx"
@@ -159,11 +166,12 @@ punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-
 ```
 
 ```bash
-# 5. 转写
-aido transcribe --profile local meeting.mp3 -o meeting.txt
+# 5. 起服务 + 转写
+aido serve asr --profile local-asr &
+aido transcribe --profile local-asr meeting.mp3 -o meeting.txt
 ```
 
-这一家族由目录布局自动识别（encoder/decoder + tokens.txt、无 joiner），无需 `family`——需要显式 `family` 的是扁平布局区分不出的 Paraformer / FireRedASR-CTC。中英双语固定，`language` 选项会被拒绝；引擎按运行加载模型、不跨运行缓存，短音频的耗时主要花在加载上。
+这一家族由目录布局自动识别（encoder/decoder + tokens.txt、无 joiner），无需 `--family`——需要显式 `--family` 的是扁平布局区分不出的 Paraformer / FireRedASR-CTC。中英双语固定，请求里的 `language` 与服务启动时未固定的语言不一致会被拒绝。服务常驻期间模型只加载一次，短音频的耗时从此与加载无关。
 
 ### 图片生成
 

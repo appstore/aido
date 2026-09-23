@@ -149,31 +149,3 @@ fn instruction_channel_joins_both_parts() {
     };
     assert_eq!(req.instruction_channel(), "be brief\n\nin english");
 }
-
-#[test]
-fn local_asr_options_validate_seconds_and_threads_separately() {
-    let opts = |pairs: &[(&str, serde_json::Value)]| {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect::<std::collections::BTreeMap<String, serde_json::Value>>()
-    };
-    let adapter = Adapter::LocalAsr;
-    // A realistic decode budget in seconds passes — the default (3600)
-    // must be settable explicitly too.
-    assert!(adapter
-        .validate_options(&opts(&[("max_audio_secs", serde_json::json!(600))]))
-        .is_ok());
-    assert!(adapter
-        .validate_options(&opts(&[("max_audio_secs", serde_json::json!(7200))]))
-        .is_ok());
-    // The day cap holds for the budget, while threads keep their own range.
-    let err = adapter
-        .validate_options(&opts(&[("max_audio_secs", serde_json::json!(86_401))]))
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("1..=86400"), "{err:#}");
-    let err = adapter
-        .validate_options(&opts(&[("threads", serde_json::json!(97))]))
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("1..=96"), "{err:#}");
-}

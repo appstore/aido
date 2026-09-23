@@ -191,13 +191,40 @@ jobs:
       - name: Check (audio-decode, no default features)
         run: cargo check --locked --no-default-features --features audio-decode
 
+  asr-server:
+    # `asr-server` feature 的 ASR 服务层（src/serve.rs）默认构建完全编译
+    # 不到，唯一能验证它的地方就是这里。纯 Rust（axum + symphonia 解码），
+    # handler 测试用 mock 引擎、无需任何模型文件，每个 PR 都跑全量
+    # clippy + test。
+    name: asr-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asr-server
+
+      - name: Clippy (asr-server)
+        run: cargo clippy --all-targets --locked --features asr-server -- -D warnings
+
+      - name: Test (asr-server)
+        run: cargo test --locked --features asr-server
+
+      - name: Check (asr-server, no default features)
+        run: cargo check --locked --no-default-features --features asr-server
+
   local-asr:
-    # `local-asr` feature 的离线转写引擎（api/local_asr.rs）默认构建完全
-    # 编译不到，唯一能验证它的地方就是这里。sherpa-onnx 是 C++ 源码构建
-    # （ubuntu-latest 自带 cmake），首次编译约 5-10 分钟，之后命中
-    # rust-cache 缓存接近增量。为控制每个 PR 的 CI 成本（review #85），
-    # PR 阶段只跑下方 local-asr-check（仅 check）；本 job 的完整 clippy +
-    # test 在 push 到 master 与每周计划任务上验证。
+    # `local-asr` feature 的 sherpa-onnx 引擎（serve 模块的 prepare 半程）
+    # 需要 C++ 源码构建（ubuntu-latest 自带 cmake），首次编译约 5-10 分钟，
+    # 之后命中 rust-cache 缓存接近增量。为控制每个 PR 的 CI 成本（review
+    # #85），PR 阶段只跑下方 local-asr-check（仅 check）；本 job 的完整
+    # clippy + test 在 push 到 master 与每周计划任务上验证。
     name: local-asr (full)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -225,7 +252,8 @@ jobs:
   local-asr-check:
     # PR 阶段的廉价档：仅 check。check 同样要执行 sherpa-onnx 的 C++
     # build script，但 rust-cache 命中后接近增量；clippy 与测试由上方
-    # local-asr (full) 在 master push / weekly 覆盖。
+    # local-asr (full) 在 master push / weekly 覆盖（server 侧的完整测试
+    # 由 asr-server job 在每个 PR 上跑，无需等 sherpa）。
     name: local-asr (check)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
