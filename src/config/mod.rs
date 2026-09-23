@@ -6,6 +6,7 @@
 //! named by environment variable here and resolved only when a request is
 //! about to be sent.
 
+pub(crate) mod path;
 pub mod resolve;
 
 pub use resolve::{resolve, ParamSource, Resolved};
@@ -50,14 +51,14 @@ pub struct Provider {
 pub struct Profile {
     pub provider: Option<String>,
     pub model: Option<String>,
-    /// Local model directory for adapters that load local models
-    /// (local-asr); unused by the others.
+    /// Local model fields for adapters that load local models (local-asr):
+    /// `asr` is the model directory, `vad` the silero VAD file (required
+    /// by the local-asr adapter), `punct` the optional punctuation
+    /// directory. Unused by the other adapters.
     #[serde(default)]
-    pub model_dir: Option<String>,
-    /// Silero VAD model file; required by the local-asr adapter.
+    pub asr: Option<String>,
     #[serde(default)]
     pub vad: Option<String>,
-    /// Punctuation model directory; optional (local-asr).
     #[serde(default)]
     pub punct: Option<String>,
     /// Operations this profile is intended for (capability check).
@@ -303,14 +304,38 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 if uses_local_asr {
                     #[cfg(feature = "local-asr")]
                     {
+                        // Missing required fields are refused by name here
+                        // (a run's resolve() refuses the same way); what is
+                        // present goes through the same detect and cheap
+                        // checks a run performs (no model load).
                         let family = profile.options.get("family").and_then(|v| v.as_str());
-                        let models = crate::api::LocalModels {
-                            asr: profile.model_dir.clone(),
-                            vad: profile.vad.clone(),
-                            punct: profile.punct.clone(),
-                        };
-                        if let Err(error) = crate::api::local_asr::check_model(&models, family) {
-                            issues.push(format!("profile '{name}': {error:#}"));
+                        match (profile.asr.as_deref(), profile.vad.as_deref()) {
+                            (Some(asr), Some(vad)) => {
+                                let models = crate::api::LocalModels {
+                                    asr: path::expand_home(asr),
+                                    vad: path::expand_home(vad),
+                                    punct: profile.punct.as_deref().map(path::expand_home),
+                                };
+                                if let Err(error) =
+                                    crate::api::local_asr::check_model(&models, family)
+                                {
+                                    issues.push(format!("profile '{name}': {error:#}"));
+                                }
+                            }
+                            (asr, vad) => {
+                                let mut missing = Vec::new();
+                                if asr.is_none() {
+                                    missing.push("'asr'");
+                                }
+                                if vad.is_none() {
+                                    missing.push("'vad'");
+                                }
+                                issues.push(format!(
+                                    "profile '{name}': uses the local-asr adapter \
+                                     but sets no {}",
+                                    missing.join(" and ")
+                                ));
+                            }
                         }
                     }
                     #[cfg(not(feature = "local-asr"))]

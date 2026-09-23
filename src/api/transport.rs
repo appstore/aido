@@ -103,11 +103,18 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
 pub struct Connection {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    /// Local model files, consumed only by the local-asr adapter — the
+    /// Local model files, consumed only by the local-asr adapter — always
+    /// set when `adapter` is LocalAsr (resolve() builds them), None
+    /// otherwise. The field lives only in feature-on builds.
+    #[cfg(feature = "local-asr")]
+    pub models: Option<LocalModels>,
+    pub timeout: Duration,
+    /// Whether `timeout` is the user's explicit budget (see
+    /// ExecutionPlan::timeout_explicit): the local-asr adapter treats it
+    /// as a hard wall instead of stretching with the audio length. The
     /// field lives only in feature-on builds.
     #[cfg(feature = "local-asr")]
-    pub models: LocalModels,
-    pub timeout: Duration,
+    pub timeout_explicit: bool,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
     /// per-request `timeout`.
@@ -119,11 +126,16 @@ pub struct Client {
     http: reqwest::Client,
     base_url: Option<reqwest::Url>,
     api_key: Option<String>,
-    /// Local model files, consumed only by the local-asr adapter — the
-    /// field lives only in feature-on builds.
+    /// Local model files, consumed only by the local-asr adapter — always
+    /// set when `adapter` is LocalAsr. The field lives only in feature-on
+    /// builds.
     #[cfg(feature = "local-asr")]
-    models: LocalModels,
+    models: Option<LocalModels>,
     timeout: Duration,
+    /// Consumed only by the local-asr adapter (hard wall vs. stretch) —
+    /// the field lives only in feature-on builds.
+    #[cfg(feature = "local-asr")]
+    timeout_explicit: bool,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
     /// per-request `timeout` — so the field lives only in feature-on builds.
@@ -181,6 +193,8 @@ impl Client {
             #[cfg(feature = "local-asr")]
             models: conn.models.clone(),
             timeout: conn.timeout,
+            #[cfg(feature = "local-asr")]
+            timeout_explicit: conn.timeout_explicit,
             #[cfg(feature = "edge-tts")]
             total_timeout: conn.total_timeout,
             adapter: conn.adapter,
@@ -246,9 +260,16 @@ impl Client {
         if self.adapter == Adapter::LocalAsr {
             // Same stays-compiled story as edge-tts: a config naming
             // 'local-asr' parses in any build, only the engine is absent.
+            // resolve() guarantees models for this adapter, so the expect
+            // is an invariant assertion, not input handling.
             #[cfg(feature = "local-asr")]
             {
-                return local_asr::transcribe(request, self.timeout, &self.models).await;
+                let models = self
+                    .models
+                    .as_ref()
+                    .expect("local-asr adapter without resolved models");
+                return local_asr::transcribe(request, self.timeout, self.timeout_explicit, models)
+                    .await;
             }
             #[cfg(not(feature = "local-asr"))]
             {

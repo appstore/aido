@@ -50,11 +50,11 @@ fn transcribing_profiles_on_a_local_route_are_refused_in_this_binary() {
 #[test]
 fn transcribing_profiles_on_a_local_route_get_the_model_check() {
     // The feature-on counterpart: the profile's own fields go through the
-    // same precheck a run performs — a missing model_dir is the named
+    // same precheck a run performs — a missing 'asr' field is the named
     // issue, without loading any model.
     let issues = check(&local_route_cfg(Some(vec![Operation::Transcribe])));
     assert!(
-        issues.iter().any(|issue| issue.contains("model_dir")),
+        issues.iter().any(|issue| issue.contains("sets no 'asr'")),
         "{issues:?}"
     );
 }

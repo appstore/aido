@@ -159,18 +159,14 @@ fn local_asr_options_validate_seconds_and_threads_separately() {
             .collect::<std::collections::BTreeMap<String, serde_json::Value>>()
     };
     let adapter = Adapter::LocalAsr;
-    // A realistic decode budget in seconds passes — the default (7200)
+    // A realistic decode budget in seconds passes — the default (3600)
     // must be settable explicitly too.
-    assert!(
-        adapter
-            .validate_options(&opts(&[("max_audio_secs", serde_json::json!(600))]))
-            .is_ok()
-    );
-    assert!(
-        adapter
-            .validate_options(&opts(&[("max_audio_secs", serde_json::json!(7200))]))
-            .is_ok()
-    );
+    assert!(adapter
+        .validate_options(&opts(&[("max_audio_secs", serde_json::json!(600))]))
+        .is_ok());
+    assert!(adapter
+        .validate_options(&opts(&[("max_audio_secs", serde_json::json!(7200))]))
+        .is_ok());
     // The day cap holds for the budget, while threads keep their own range.
     let err = adapter
         .validate_options(&opts(&[("max_audio_secs", serde_json::json!(86_401))]))

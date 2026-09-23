@@ -107,7 +107,7 @@ transcribe = "local-asr"
 [profiles.local]
 provider = "local"
 operations = ["transcribe"]
-model_dir = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # ASR 模型
+asr = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # ASR 模型
 vad = "~/models/silero_vad.onnx"                                                  # 离线家族必需
 punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"   # 标点恢复，可选
 ```
@@ -118,7 +118,7 @@ punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-
 aido transcribe --profile local meeting.mp3 -o meeting.txt
 ```
 
-规则：三个模型字段都支持 `~` 展开。`model_dir` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。profile options：`family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`language`、`threads`、`max_audio_secs`（解码预算，默认 7200）。`--model` 对该适配器无效果（引擎由 `model_dir` 决定）。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
+规则：三个模型字段都支持 `~` 展开。`asr` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。profile options：`family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`language`、`threads`、`max_audio_secs`（解码预算，默认 3600）。`--model` 对该适配器无效果（引擎由 `asr` 决定）。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
 
 > SenseVoice 自带标点，再叠加标点模型可能出现重复标点（"。，"）——无标点输出的家族（Paraformer 等）更适合配 `punct`。
 
@@ -153,7 +153,7 @@ transcribe = "local-asr"
 [profiles.local]
 provider = "local"
 operations = ["transcribe"]
-model_dir = "~/models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
+asr = "~/models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
 vad = "~/models/silero_vad.onnx"
 punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
 ```

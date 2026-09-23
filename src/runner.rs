@@ -257,12 +257,10 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         base_url: plan.resolved.base_url.clone(),
         api_key,
         #[cfg(feature = "local-asr")]
-        models: crate::api::LocalModels {
-            asr: plan.resolved.model_dir.clone(),
-            vad: plan.resolved.vad.clone(),
-            punct: plan.resolved.punct.clone(),
-        },
+        models: plan.resolved.local_models.clone(),
         timeout: plan.timeout,
+        #[cfg(feature = "local-asr")]
+        timeout_explicit: plan.timeout_explicit,
         total_timeout: plan.total_timeout,
         adapter: plan.resolved.adapter,
     };

@@ -7,9 +7,8 @@ fn resolved(adapter: Adapter, model: &str) -> Resolved {
         adapter,
         base_url: None,
         api_key_env: None,
-        vad: None,
-        punct: None,
-        model_dir: None,
+        #[cfg(feature = "local-asr")]
+        local_models: None,
         model: model.into(),
         model_source: crate::config::resolve::ParamSource::Profile,
         max_tokens: None,

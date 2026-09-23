@@ -73,6 +73,12 @@ pub struct ExecutionPlan {
     pub transport_stream: bool,
     pub delivery: DeliveryMode,
     pub timeout: Duration,
+    /// Whether `timeout` came from the user (--timeout / settings
+    /// timeout_secs) rather than the built-in default: the local-asr
+    /// adapter treats an explicit timeout as a hard wall, while the
+    /// default — which exists to bound network waits — stretches with the
+    /// audio length.
+    pub timeout_explicit: bool,
     pub total_timeout: Option<Duration>,
     pub record_history: bool,
     pub quiet: bool,
@@ -314,6 +320,7 @@ fn plan_from(
     };
 
     let timeout = Duration::from_secs(cli.timeout.or(cfg.settings.timeout_secs).unwrap_or(120));
+    let timeout_explicit = cli.timeout.is_some() || cfg.settings.timeout_secs.is_some();
     let total_timeout = cli
         .total_timeout
         .or(cfg.settings.total_timeout_secs)
@@ -366,6 +373,7 @@ fn plan_from(
         transport_stream,
         delivery,
         timeout,
+        timeout_explicit,
         total_timeout,
         record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(DEFAULT_KEEP) > 0,
         quiet: cli.quiet,
@@ -1038,6 +1046,20 @@ pub(crate) fn describe_param_sources(
     out
 }
 
+/// The local-asr model directory for the dry-run's provider line: the
+/// profile's resolved ASR directory when this plan routes to the local
+/// engine, None otherwise (also None in builds without the feature, where
+/// validate_adapter_availability refuses the adapter anyway).
+#[cfg(feature = "local-asr")]
+fn dry_run_model_dir(r: &crate::config::Resolved) -> Option<&std::path::Path> {
+    r.local_models.as_ref().map(|m| m.asr.as_path())
+}
+
+#[cfg(not(feature = "local-asr"))]
+fn dry_run_model_dir(_r: &crate::config::Resolved) -> Option<&std::path::Path> {
+    None
+}
+
 /// Render the sanitized plan for `--dry-run` and debugging.
 pub fn describe(plan: &ExecutionPlan) -> String {
     let mut out = String::new();
@@ -1053,9 +1075,9 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         plan.task.operation
     ));
     out.push_str(&format!("profile:     {}\n", r.profile_name));
-    let shown_url = match (r.base_url.as_deref(), r.model_dir.as_deref()) {
+    let shown_url = match (&r.base_url, dry_run_model_dir(r)) {
         (Some(url), _) => redact_url(url),
-        (None, Some(dir)) => format!("(local model dir: {dir})"),
+        (None, Some(dir)) => format!("(local model dir: {})", dir.display()),
         (None, None) => "(endpoint owned by the edge-tts adapter)".to_string(),
     };
     out.push_str(&format!(

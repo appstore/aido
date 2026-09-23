@@ -2,38 +2,102 @@
 //!
 //! The heavy lifting — model loading, VAD segmentation, inference,
 //! punctuation — is `Engine::transcribe`; this module owns what aido adds
-//! on top: the profile's model files (ASR directory, silero VAD,
-//! punctuation), the profile options (family/language/threads/
-//! max_audio_secs), the sample budget handed to the decode layer, and the
-//! deadline policy (local inference is usually faster than real time, so
-//! the deadline never bites before `--timeout` would). Every run prepares
-//! its own engine: a CLI run is one task, and model reuse across runs is
-//! EngineManager territory, not this adapter's.
+//! on top: wiring the profile's already-resolved model files (ASR
+//! directory, silero VAD, punctuation) and options (family/language/
+//! threads/max_audio_secs) into an engine config, the sample budget handed
+//! to the decode layer, and the deadline policy. Engine supply goes
+//! through [`EngineProvider`]: the production [`FreshEngineProvider`]
+//! prepares one engine per run (a CLI run is one task; model reuse across
+//! runs is EngineManager territory and would be another impl of the same
+//! trait, not a redesign of this adapter).
 
 use super::{single_audio, GenerateRequest, GenerateResult};
 use anyhow::{bail, Context, Result};
 use asr_core::utils::models::{detect, LocalModel};
 use asr_core::{
-    Engine, EngineConfig, EngineOptions, OfflineConfig, OfflineFamily, PunctConfig, SessionOptions,
-    VadConfig,
+    AudioBuffer, Engine, EngineConfig, EngineOptions, OfflineConfig, OfflineFamily, PunctConfig,
+    SessionOptions, SessionResult, VadConfig,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The local-asr adapter's model files, resolved from the profile (tilde
-/// expanded at resolve time). The ASR directory and the silero VAD file
-/// are required for a run; the punctuation directory is optional.
+/// The local-asr adapter's model files, fully resolved: the config layer
+/// expands tildes and refuses a profile that leaves the required fields
+/// out, so a run never re-checks them. The ASR directory and the silero
+/// VAD file are required; the punctuation directory is optional.
 #[derive(Debug, Clone)]
 pub struct LocalModels {
-    pub asr: Option<String>,
-    pub vad: Option<String>,
-    pub punct: Option<String>,
+    pub asr: PathBuf,
+    pub vad: PathBuf,
+    pub punct: Option<PathBuf>,
+}
+
+/// The engine face this adapter consumes, as a trait so the sherpa stack
+/// can stand down in tests (a mock needs no model load). asr-core's
+/// `Engine` is the production implementor.
+pub(crate) trait PreparedEngine: Send + Sync {
+    fn transcribe(
+        &self,
+        buffer: &AudioBuffer,
+        options: SessionOptions,
+        deadline: Instant,
+    ) -> SessionResult;
+}
+
+impl PreparedEngine for Engine {
+    fn transcribe(
+        &self,
+        buffer: &AudioBuffer,
+        options: SessionOptions,
+        deadline: Instant,
+    ) -> SessionResult {
+        Engine::transcribe(self, buffer, options, deadline)
+    }
+}
+
+/// Supplies the prepared engine for a run's configuration. The seam where
+/// a caching provider (a `HashMap`-keyed model cache) would plug in later;
+/// nothing else in the adapter may touch `Engine::prepare`.
+pub(crate) trait EngineProvider: Send + Sync {
+    fn engine(&self, config: EngineConfig) -> Result<Arc<dyn PreparedEngine>>;
+}
+
+/// The production provider: every run prepares its own engine. Model load
+/// is seconds-to-minutes of CPU, which is exactly why the seam exists —
+/// a future cached provider swaps in without touching this adapter again.
+pub(crate) struct FreshEngineProvider;
+
+impl EngineProvider for FreshEngineProvider {
+    fn engine(&self, config: EngineConfig) -> Result<Arc<dyn PreparedEngine>> {
+        let engine = Engine::prepare(config, EngineOptions::default())
+            .context("failed to load the local ASR model")?;
+        Ok(Arc::new(engine))
+    }
 }
 
 pub(super) async fn transcribe(
     request: &GenerateRequest<'_>,
     timeout: Duration,
+    timeout_explicit: bool,
     models: &LocalModels,
+) -> Result<GenerateResult> {
+    transcribe_with(
+        request,
+        timeout,
+        timeout_explicit,
+        models,
+        Arc::new(FreshEngineProvider),
+    )
+    .await
+}
+
+async fn transcribe_with(
+    request: &GenerateRequest<'_>,
+    timeout: Duration,
+    timeout_explicit: bool,
+    models: &LocalModels,
+    provider: Arc<dyn EngineProvider>,
 ) -> Result<GenerateResult> {
     let part = single_audio(request.inputs)?;
     let bytes = match &part.content {
@@ -51,22 +115,25 @@ pub(super) async fn transcribe(
     let family = opt_str("family");
     let language = opt_str("language");
     let threads = opt_u64("threads").map(|v| v as usize);
-    let max_audio_secs = opt_u64("max_audio_secs").unwrap_or(7200) as usize;
-    // The resolve layer guarantees asr/vad are present for this adapter;
-    // run() re-checks as a backstop.
+    let max_audio_secs = opt_u64("max_audio_secs").unwrap_or(3600) as usize;
     let models = models.clone();
 
     // The engine calls are synchronous and can hold a CPU for minutes;
     // keep them off the tokio workers.
     let outcome = tokio::task::spawn_blocking(move || {
+        let knobs = EngineKnobs {
+            family,
+            language,
+            threads,
+            max_samples: max_audio_secs * 48_000,
+        };
         run(
             &bytes,
             &models,
-            family.as_deref(),
-            language,
-            threads,
-            max_audio_secs * 48_000,
+            &knobs,
             timeout,
+            timeout_explicit,
+            &*provider,
         )
     })
     .await
@@ -76,69 +143,63 @@ pub(super) async fn transcribe(
     ))
 }
 
-/// Expand a leading `~/` to the home directory (config paths keep their
-/// tilde until they meet the filesystem). Other forms pass through.
-pub(crate) fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
+/// The request's option map, extracted to typed engine knobs before the
+/// blocking section.
+struct EngineKnobs {
+    family: Option<String>,
+    language: Option<String>,
+    threads: Option<usize>,
+    max_samples: usize,
 }
 
 /// The synchronous half: decode → detect → configure → precheck → prepare
-/// → transcribe. `Engine::prepare` stays the authority on the model
-/// directory; `utils::precheck::validate` runs the same cheap checks first
+/// → transcribe. `utils::precheck::validate` runs the cheap checks first
 /// so misconfiguration fails with a named problem before any model load.
 fn run(
     bytes: &[u8],
     models: &LocalModels,
-    family: Option<&str>,
-    language: Option<String>,
-    threads: Option<usize>,
-    max_samples: usize,
+    knobs: &EngineKnobs,
     timeout: Duration,
+    timeout_explicit: bool,
+    provider: &dyn EngineProvider,
 ) -> Result<asr_core::SessionOutcome> {
-    let buffer = crate::audio::decode_mono(bytes, max_samples)
+    let buffer = crate::audio::decode_mono(bytes, knobs.max_samples)
         .context("audio decoding for the offline engine failed")?;
-    // The resolve layer guarantees the ASR directory and VAD file are set
-    // for this adapter; this is a backstop, not the user-facing message.
-    let model_dir = models
-        .asr
-        .as_deref()
-        .context("the local-asr adapter has no model_dir")?;
-    let vad = models
-        .vad
-        .as_deref()
-        .context("the local-asr adapter has no vad")?;
-    let model_dir = expand_home(model_dir);
-    let detected = detect(&model_dir).with_context(|| {
+    let detected = detect(&models.asr).with_context(|| {
         format!(
             "'{}' is not a usable ASR model directory",
-            model_dir.display()
+            models.asr.display()
         )
     })?;
-    let family = resolve_family(detected, family)?;
-    let vad_path = ensure_vad(vad)?;
-    let punct_path = models.punct.as_deref().map(expand_home);
-    let mut config = OfflineConfig::new(&model_dir, family, VadConfig::new(&vad_path));
-    config.language = language;
-    config.punctuation = punct_path.map(PunctConfig::new);
-    if let Some(threads) = threads {
+    let family = resolve_family(detected, knobs.family.as_deref())?;
+    let vad_path = ensure_vad(&models.vad)?;
+    let mut config = OfflineConfig::new(&models.asr, family, VadConfig::new(&vad_path));
+    config.language = knobs.language.clone();
+    config.punctuation = models.punct.as_deref().map(PunctConfig::new);
+    if let Some(threads) = knobs.threads {
         config.num_threads = threads;
     }
     let engine_config = EngineConfig::Offline(config);
     asr_core::utils::precheck::validate(&engine_config)
         .context("the local ASR configuration failed the engine precheck")?;
-    let engine = Engine::prepare(engine_config, EngineOptions::default())
-        .context("failed to load the local ASR model")?;
+    let engine = provider.engine(engine_config)?;
 
     let audio_secs = buffer.samples.len() as u64 / u64::from(buffer.spec.sample_rate.max(1));
     let mut options = SessionOptions::new(buffer.spec);
     options.max_duration = Duration::from_secs(audio_secs + 60);
     options.max_transcript_bytes = 2 * 1024 * 1024;
-    let deadline = Instant::now() + timeout.max(Duration::from_secs(audio_secs));
+    // The budget an explicit `--timeout`/`settings.timeout_secs` buys is
+    // the hard wall — no silent stretching: a 3-hour recording under a
+    // 30s timeout fails at 30s. Only the built-in default (which exists
+    // to bound network waits) yields, stretching with the audio: local
+    // inference usually runs faster than real time, so audio_secs * 3
+    // keeps slack for the model load and never bites before that would.
+    let budget = if timeout_explicit {
+        timeout
+    } else {
+        timeout.max(Duration::from_secs(audio_secs * 3))
+    };
+    let deadline = Instant::now() + budget;
     engine
         .transcribe(&buffer, options, deadline)
         .map_err(|failure| anyhow::anyhow!("local transcription failed: {failure}"))
@@ -147,16 +208,15 @@ fn run(
 /// The VAD file must exist — its absence is a named request (place the
 /// file / fix the profile field) instead of a precheck error about empty
 /// files.
-fn ensure_vad(vad: &str) -> Result<PathBuf> {
-    let path = expand_home(vad);
-    if !path.is_file() {
+fn ensure_vad(vad: &std::path::Path) -> Result<PathBuf> {
+    if !vad.is_file() {
         bail!(
             "VAD model not found at {}; download silero_vad.onnx there or \
              point the profile's 'vad' field at the file",
-            path.display()
+            vad.display()
         );
     }
-    Ok(path)
+    Ok(vad.to_path_buf())
 }
 
 /// Directory layout → engine family. `detect` decides from the file layout
@@ -177,9 +237,9 @@ fn resolve_family(detected: LocalModel, requested: Option<&str>) -> Result<Offli
              option 'family' to one of: paraformer, firered-ctc"
         ),
         (LocalModel::Punct, _) => bail!(
-            "model_dir contains a punctuation model, not an ASR model; \
-             point model_dir at a speech model and set the profile's \
-             'punct' field to the punctuation directory"
+            "the 'asr' field points at a punctuation model, not an ASR model; \
+             point 'asr' at a speech model and set the profile's 'punct' \
+             field to the punctuation directory"
         ),
         (detected, Some(other)) => bail!(
             "model directory was detected as {detected:?}, but option \
@@ -195,32 +255,22 @@ fn resolve_family(detected: LocalModel, requested: Option<&str>) -> Result<Offli
 }
 
 /// Config-check precheck of a local-asr profile: the same detect and
-/// cheap checks a run performs. The model files (tilde-expanded here) and
-/// the profile's `family` option travel along. Any failure is a config
-/// issue.
+/// cheap checks a run performs (no model load). The caller — `config
+/// check` — has already refused a profile missing the required fields;
+/// any failure left is a model-layout issue.
 pub(crate) fn check_model(models: &LocalModels, family: Option<&str>) -> Result<()> {
-    let asr = models
-        .asr
-        .as_deref()
-        .context("the profile sets no model_dir")?;
-    let vad = models
-        .vad
-        .as_deref()
-        .context("the profile sets no vad model")?;
-    let model_dir = expand_home(asr);
-    let detected = detect(&model_dir).with_context(|| {
+    let detected = detect(&models.asr).with_context(|| {
         format!(
             "'{}' is not a usable ASR model directory",
-            model_dir.display()
+            models.asr.display()
         )
     })?;
     let family = resolve_family(detected, family)?;
-    let vad_path = ensure_vad(vad)?;
-    let punct = models.punct.as_deref().map(expand_home);
-    let mut offline = OfflineConfig::new(&model_dir, family, VadConfig::new(&vad_path));
-    offline.punctuation = punct.map(PunctConfig::new);
+    let vad_path = ensure_vad(&models.vad)?;
+    let mut offline = OfflineConfig::new(&models.asr, family, VadConfig::new(&vad_path));
+    offline.punctuation = models.punct.as_deref().map(PunctConfig::new);
     asr_core::utils::precheck::validate(&EngineConfig::Offline(offline))
-        .context("model_dir failed the engine precheck")
+        .context("the 'asr' directory failed the engine precheck")
 }
 
 #[cfg(test)]

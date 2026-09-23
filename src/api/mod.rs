@@ -87,7 +87,7 @@ impl Adapter {
             // any placeholder without a `config check` warning.
             Self::EdgeTts => "edge",
             // Same placeholder story: the local engine is picked by the
-            // provider's model_dir, not by a model name.
+            // profile's asr field, not by a model name.
             Self::LocalAsr => "local",
             _ => "gpt-4o-mini",
         }
@@ -128,7 +128,7 @@ impl Adapter {
                     }
                 }
                 // A decode budget in seconds, not a core count: the default
-                // is 7200, so the cap is one day.
+                // is 3600, so the cap is one day.
                 "max_audio_secs" => {
                     if !value.as_u64().is_some_and(|v| (1..=86_400).contains(&v)) {
                         bail!("option '{key}' must be a positive integer (1..=86400)");

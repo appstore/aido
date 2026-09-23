@@ -39,13 +39,12 @@ pub struct Resolved {
     /// None for adapters that own their endpoint (edge-tts, local-asr).
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
-    /// Local model directory; only for adapters that load local models
-    /// (local-asr).
-    pub model_dir: Option<String>,
-    /// Local model files (local-asr): silero VAD (required) and the
-    /// punctuation directory (optional). None outside that adapter.
-    pub vad: Option<String>,
-    pub punct: Option<String>,
+    /// The local engine's model files, fully resolved (tilde expanded,
+    /// required fields enforced here so a run never re-checks them); only
+    /// for the local-asr adapter, and only present in builds with the
+    /// feature.
+    #[cfg(feature = "local-asr")]
+    pub local_models: Option<crate::api::LocalModels>,
     pub model: String,
     pub model_source: ParamSource,
     /// None = "do not send a token limit".
@@ -104,11 +103,9 @@ pub(super) fn effective_adapter(operation: Operation, provider: &Provider) -> Ad
 /// Expand a configured local-model path (`~` plus absolute/relative) or
 /// name the profile field that is missing.
 #[cfg(feature = "local-asr")]
-fn expand_local_path(raw: Option<&str>, missing: &str) -> Result<String> {
+fn expand_local_path(raw: Option<&str>, missing: &str) -> Result<std::path::PathBuf> {
     let raw = raw.with_context(|| missing.to_string())?;
-    Ok(crate::api::local_asr::expand_home(raw)
-        .to_string_lossy()
-        .into_owned())
+    Ok(super::path::expand_home(raw))
 }
 
 pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
@@ -202,42 +199,31 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     };
 
     // The local engine's models: required on the profile for the local-asr
-    // adapter (ASR directory and silero VAD; punctuation optional), and
-    // shown by the dry-run as the exact paths a run would load (tilde
-    // expanded).
-    let (model_dir, vad, punct) = match adapter {
+    // adapter (ASR directory and silero VAD; punctuation optional). The
+    // resolver turns the raw strings into the adapter's contract — tilde
+    // expanded, required fields enforced — so the adapter never re-checks
+    // them at run time.
+    #[cfg(feature = "local-asr")]
+    let local_models = match adapter {
         Adapter::LocalAsr => {
-            #[cfg(feature = "local-asr")]
-            {
-                let model_dir = expand_local_path(
-                    profile.model_dir.as_deref(),
-                    &format!(
-                        "profile '{profile_name}' uses the local-asr adapter \
-                         but sets no model_dir"
-                    ),
-                )?;
-                let vad = expand_local_path(
-                    profile.vad.as_deref(),
-                    &format!(
-                        "profile '{profile_name}' uses the local-asr adapter \
-                         but sets no vad"
-                    ),
-                )?;
-                let punct = profile.punct.as_deref().map(|p| {
-                    crate::api::local_asr::expand_home(p)
-                        .to_string_lossy()
-                        .into_owned()
-                });
-                (Some(model_dir), Some(vad), punct)
-            }
-            #[cfg(not(feature = "local-asr"))]
-            {
-                // validate_adapter_availability refuses this adapter right
-                // after resolve(); nothing to resolve in this build.
-                (None, None, None)
-            }
+            let asr = expand_local_path(
+                profile.asr.as_deref(),
+                &format!(
+                    "profile '{profile_name}' uses the local-asr adapter \
+                     but sets no 'asr' (the ASR model directory)"
+                ),
+            )?;
+            let vad = expand_local_path(
+                profile.vad.as_deref(),
+                &format!(
+                    "profile '{profile_name}' uses the local-asr adapter \
+                     but sets no 'vad' (the silero VAD file)"
+                ),
+            )?;
+            let punct = profile.punct.as_deref().map(super::path::expand_home);
+            Some(crate::api::LocalModels { asr, vad, punct })
         }
-        _ => (None, None, None),
+        _ => None,
     };
 
     // Capability envelope: constraints intersect, they are not overridden.
@@ -376,9 +362,8 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         adapter,
         base_url,
         api_key_env: provider.api_key_env.clone(),
-        model_dir,
-        vad,
-        punct,
+        #[cfg(feature = "local-asr")]
+        local_models,
         model,
         model_source,
         max_tokens,

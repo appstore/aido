@@ -80,9 +80,8 @@ fn chat_resolved() -> Resolved {
         adapter: crate::api::Adapter::Chat,
         base_url: None,
         api_key_env: None,
-        vad: None,
-        punct: None,
-        model_dir: None,
+        #[cfg(feature = "local-asr")]
+        local_models: None,
         model: "m".into(),
         model_source: crate::config::resolve::ParamSource::Default,
         max_tokens: None,
