@@ -50,6 +50,16 @@ pub struct Provider {
 pub struct Profile {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Local model directory for adapters that load local models
+    /// (local-asr); unused by the others.
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// Silero VAD model file; required by the local-asr adapter.
+    #[serde(default)]
+    pub vad: Option<String>,
+    /// Punctuation model directory; optional (local-asr).
+    #[serde(default)]
+    pub punct: Option<String>,
     /// Operations this profile is intended for (capability check).
     pub operations: Option<Vec<crate::tasks::Operation>>,
     pub input_types: Option<Vec<MediaKind>>,
@@ -246,9 +256,12 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 // operations fall back to conventional adapters, so an
                 // edge-only route table does not cover them.
                 let allowed = profile.operations.as_deref().unwrap_or(&Operation::ALL);
-                let needs_base = allowed
-                    .iter()
-                    .any(|&op| resolve::effective_adapter(op, provider) != Adapter::EdgeTts);
+                let needs_base = allowed.iter().any(|&op| {
+                    !matches!(
+                        resolve::effective_adapter(op, provider),
+                        Adapter::EdgeTts | Adapter::LocalAsr
+                    )
+                });
                 if needs_base && provider.base_url.is_none() {
                     issues.push(format!(
                         "provider '{provider_name}' (used by '{name}'): missing base_url"
@@ -273,6 +286,36 @@ pub fn check(cfg: &Config) -> Vec<String> {
                             "provider '{provider_name}': route '{key}' names the \
                              edge-tts adapter, which this binary does not include \
                              (rebuild with --features edge-tts)"
+                        ));
+                    }
+                }
+                // The local-asr adapter's model files: with the feature
+                // compiled in, run the same detect and cheap checks a run
+                // performs (no model load) — absent files or a broken
+                // directory surface here, while the user is editing the
+                // config.
+                for adapter in provider.routes.values() {
+                    if *adapter != Adapter::LocalAsr {
+                        continue;
+                    }
+                    #[cfg(feature = "local-asr")]
+                    {
+                        let family = profile.options.get("family").and_then(|v| v.as_str());
+                        let models = crate::api::LocalModels {
+                            asr: profile.model_dir.clone(),
+                            vad: profile.vad.clone(),
+                            punct: profile.punct.clone(),
+                        };
+                        if let Err(error) = crate::api::local_asr::check_model(&models, family) {
+                            issues.push(format!("profile '{name}': {error:#}"));
+                        }
+                    }
+                    #[cfg(not(feature = "local-asr"))]
+                    {
+                        issues.push(format!(
+                            "provider '{provider_name}' has a local-asr route, \
+                             but this binary does not include the local-asr \
+                             adapter (rebuild with --features local-asr)"
                         ));
                     }
                 }

@@ -89,6 +89,82 @@ aido transcribe meeting.mp3 -o meeting.txt      # 输入恰好一个音频文件
 aido transcribe voice-note.m4a --copy
 ```
 
+### 离线转写（实验性，`local-asr` feature）
+
+云端路由之外的本地引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 模型经 asr-core 在本机推理，零网络。默认构建不包含；源码构建需要 `--features local-asr`（sherpa-onnx 是 C++ 源码构建，要求系统装有 **cmake** 与 C++ 工具链）。
+
+```toml
+# 配置目录的 config.toml：加一个 provider，把 transcribe 路由过去；
+# 模型都在 profile 里指定（解压后的 sherpa-onnx 模型归档，如 SenseVoice、
+# Paraformer、FireRedASR、Qwen3-ASR、FunASR-Nano）
+default_profile = "local"
+
+[providers.local]
+
+[providers.local.routes]
+transcribe = "local-asr"
+
+[profiles.local]
+provider = "local"
+operations = ["transcribe"]
+model_dir = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # ASR 模型
+vad = "~/models/silero_vad.onnx"                                                  # 离线家族必需
+punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"   # 标点恢复，可选
+```
+
+跑起来：
+
+```bash
+aido transcribe --profile local meeting.mp3 -o meeting.txt
+```
+
+规则：三个模型字段都支持 `~` 展开。`model_dir` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。profile options：`family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`language`、`threads`、`max_audio_secs`（解码预算，默认 7200）。`--model` 对该适配器无效果（引擎由 `model_dir` 决定）。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
+
+> SenseVoice 自带标点，再叠加标点模型可能出现重复标点（"。，"）——无标点输出的家族（Paraformer 等）更适合配 `punct`。
+
+#### 端到端示例：FireRedASR-AED
+
+以 FireRedASR2 的 AED 导出为例从零跑通（中英离线，int8 量化，解压后约 1.2 GB 磁盘、运行峰值内存约 1.6 GB；同一目录布局也兼容 FireRedASR 1.0-AED-L 的 sherpa-onnx 导出）：
+
+```bash
+# 1. 模型归档解压（HF 上的 sherpa-onnx 导出；
+#    国内网络可把 huggingface.co 整体换成 hf-mirror.com 镜像）
+mkdir -p ~/models
+wget -P /tmp https://huggingface.co/csukuangfj2/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/resolve/main/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2
+tar -xjf /tmp/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2 -C ~/models
+
+# 2. silero VAD：离线家族必需，位置随意（profile 的 vad 字段指向它即可）
+wget -O ~/models/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+
+# 3. 标点模型（可选，推荐）：FireRedASR 原始输出没有标点，配标点恢复正合适
+wget -P /tmp https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2
+tar -xjf /tmp/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2 -C ~/models
+```
+
+```toml
+# 4. 配置目录的 config.toml：provider 路由 + profile 指定全部模型
+default_profile = "local"
+
+[providers.local]
+
+[providers.local.routes]
+transcribe = "local-asr"
+
+[profiles.local]
+provider = "local"
+operations = ["transcribe"]
+model_dir = "~/models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
+vad = "~/models/silero_vad.onnx"
+punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+```
+
+```bash
+# 5. 转写
+aido transcribe --profile local meeting.mp3 -o meeting.txt
+```
+
+这一家族由目录布局自动识别（encoder/decoder + tokens.txt、无 joiner），无需 `family`——需要显式 `family` 的是扁平布局区分不出的 Paraformer / FireRedASR-CTC。中英双语固定，`language` 选项会被拒绝；引擎按运行加载模型、不跨运行缓存，短音频的耗时主要花在加载上。
+
 ### 图片生成
 
 ```bash

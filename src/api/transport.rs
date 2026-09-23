@@ -1,5 +1,7 @@
 #[cfg(feature = "edge-tts")]
 use super::edge;
+#[cfg(feature = "local-asr")]
+use super::local_asr::{self, LocalModels};
 use super::{chat, media, responses, sse::SseDecoder, Adapter, GenerateRequest, GenerateResult};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -97,10 +99,14 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
 
 /// Everything the client needs to reach a service. Credentials are
 /// resolved by the caller at send time and never logged. `base_url` is
-/// `None` for adapters that own their endpoint (edge-tts).
+/// `None` for adapters that own their endpoint (edge-tts, local-asr).
 pub struct Connection {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    /// Local model files, consumed only by the local-asr adapter — the
+    /// field lives only in feature-on builds.
+    #[cfg(feature = "local-asr")]
+    pub models: LocalModels,
     pub timeout: Duration,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
@@ -113,6 +119,10 @@ pub struct Client {
     http: reqwest::Client,
     base_url: Option<reqwest::Url>,
     api_key: Option<String>,
+    /// Local model files, consumed only by the local-asr adapter — the
+    /// field lives only in feature-on builds.
+    #[cfg(feature = "local-asr")]
+    models: LocalModels,
     timeout: Duration,
     /// Whole-run budget. Consumed today only by the edge-tts adapter (it
     /// bounds all chunks of one synthesis); HTTP adapters enforce only the
@@ -145,7 +155,7 @@ fn rustls_client_config() -> Result<rustls::ClientConfig> {
 impl Client {
     pub fn new(conn: &Connection) -> Result<Self> {
         let base_url = match conn.adapter {
-            Adapter::EdgeTts => None,
+            Adapter::EdgeTts | Adapter::LocalAsr => None,
             _ => Some(reqwest::Url::parse(
                 conn.base_url
                     .as_deref()
@@ -168,6 +178,8 @@ impl Client {
                 .context("failed to build HTTP client")?,
             base_url,
             api_key: conn.api_key.clone(),
+            #[cfg(feature = "local-asr")]
+            models: conn.models.clone(),
             timeout: conn.timeout,
             #[cfg(feature = "edge-tts")]
             total_timeout: conn.total_timeout,
@@ -182,7 +194,9 @@ impl Client {
             Adapter::Speech => "audio/speech",
             Adapter::Transcription => "audio/transcriptions",
             Adapter::Images => "images/generations",
-            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
+            Adapter::EdgeTts | Adapter::LocalAsr => {
+                bail!("the {} adapter does not use HTTP requests", self.adapter)
+            }
         };
         let base = self
             .base_url
@@ -197,7 +211,9 @@ impl Client {
             Adapter::Transcription => req.multipart(media::transcription(request)?),
             Adapter::Speech => req.json(&media::encode_speech(request)?),
             Adapter::Images => req.json(&media::encode_images(request)?),
-            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
+            Adapter::EdgeTts | Adapter::LocalAsr => {
+                bail!("the {} adapter does not use HTTP requests", self.adapter)
+            }
         };
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -225,6 +241,18 @@ impl Client {
             #[cfg(not(feature = "edge-tts"))]
             {
                 bail!(super::EDGE_TTS_NOT_COMPILED);
+            }
+        }
+        if self.adapter == Adapter::LocalAsr {
+            // Same stays-compiled story as edge-tts: a config naming
+            // 'local-asr' parses in any build, only the engine is absent.
+            #[cfg(feature = "local-asr")]
+            {
+                return local_asr::transcribe(request, self.timeout, &self.models).await;
+            }
+            #[cfg(not(feature = "local-asr"))]
+            {
+                bail!(super::LOCAL_AS_NOT_COMPILED);
             }
         }
         let resp = self

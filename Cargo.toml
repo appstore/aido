@@ -28,6 +28,18 @@ pdfium = []
 # 0.0.x version requirements are exact by semver, so this stays pinned
 # until asr-core starts promising compatibility.
 audio-decode = ["dep:asr-core"]
+# Local offline transcription (src/api/local_asr.rs): the sherpa-onnx
+# stack over asr-core's engine. Implies audio-decode (the decode layer is
+# this path's input half). Off by default: sherpa-onnx is a C++ source
+# build that needs cmake and a C++ toolchain, and the binary grows by the
+# native libraries. Builds without the feature keep every config surface
+# (the adapter variant stays compiled) but refuse at run time.
+local-asr = [
+    "audio-decode",
+    "asr-core/backend-sherpa",
+    "asr-core/vad-silero",
+    "asr-core/punct-sherpa",
+]
 
 [dependencies]
 # Office/OpenDocument/RTF/CSV → markdown 转换后端（materialize/document.rs）。
@@ -92,6 +104,7 @@ flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rust_xlsxwriter = "0.99.1"
 serde_json = "1"
+tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

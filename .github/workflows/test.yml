@@ -187,6 +187,35 @@ jobs:
       - name: Check (audio-decode, no default features)
         run: cargo check --locked --no-default-features --features audio-decode
 
+  local-asr:
+    # `local-asr` feature 的离线转写引擎（api/local_asr.rs）默认构建完全
+    # 编译不到，唯一能验证它的地方就是这里。sherpa-onnx 是 C++ 源码构建
+    # （ubuntu-latest 自带 cmake），首次编译约 5-10 分钟；模型文件不进
+    # 仓库，引擎路径的测试是配置/解析层的布局 fixture，真模型端到端在
+    # 本地手动做。
+    name: local-asr
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: local-asr
+
+      - name: Clippy (local-asr)
+        run: cargo clippy --all-targets --locked --features local-asr -- -D warnings
+
+      - name: Test (local-asr)
+        run: cargo test --locked --features local-asr
+
+      - name: Check (local-asr, no default features)
+        run: cargo check --locked --no-default-features --features local-asr
+
   musl:
     # x86_64-unknown-linux-musl 是 release 产物目标（全静态 Linux 二进制）。
     # PR 阶段跑 check（会执行 build script、编译 aws-lc-sys 的 C 代码，真实走

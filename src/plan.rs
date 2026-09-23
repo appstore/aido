@@ -330,13 +330,16 @@ fn plan_from(
     }
 
     // Credential reference only: never the value. Adapters that own their
-    // endpoint (edge-tts) take no credentials, so their plans report
-    // "none required" instead of pointing at a key that is never sent —
-    // and so does a provider that names no env var at all. Anything else
-    // gets the same judgment the runner's send-time resolution uses,
-    // fallback included, so the dry-run cannot prophesy a failure the
-    // real run would not have.
-    let credentials_available = if resolved.adapter == crate::api::Adapter::EdgeTts {
+    // endpoint (edge-tts) or model (local-asr) take no credentials, so
+    // their plans report "none required" instead of pointing at a key that
+    // is never sent — and so does a provider that names no env var at all.
+    // Anything else gets the same judgment the runner's send-time
+    // resolution uses, fallback included, so the dry-run cannot prophesy a
+    // failure the real run would not have.
+    let credentials_available = if matches!(
+        resolved.adapter,
+        crate::api::Adapter::EdgeTts | crate::api::Adapter::LocalAsr
+    ) {
         None
     } else {
         resolved
@@ -444,8 +447,14 @@ fn validate_adapter_availability(resolved: &Resolved) -> AppResult<()> {
             crate::api::EDGE_TTS_NOT_COMPILED.to_string(),
         ));
     }
-    // With the feature on there is nothing to check; keep the parameter used.
-    #[cfg(feature = "edge-tts")]
+    #[cfg(not(feature = "local-asr"))]
+    if resolved.adapter == crate::api::Adapter::LocalAsr {
+        return Err(AppError::usage(
+            crate::api::LOCAL_AS_NOT_COMPILED.to_string(),
+        ));
+    }
+    // With the features on there is nothing to check; keep the parameter used.
+    #[cfg(all(feature = "edge-tts", feature = "local-asr"))]
     let _ = resolved;
     Ok(())
 }
@@ -1044,11 +1053,11 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         plan.task.operation
     ));
     out.push_str(&format!("profile:     {}\n", r.profile_name));
-    let shown_url = r
-        .base_url
-        .as_deref()
-        .map(redact_url)
-        .unwrap_or_else(|| "(endpoint owned by the edge-tts adapter)".to_string());
+    let shown_url = match (r.base_url.as_deref(), r.model_dir.as_deref()) {
+        (Some(url), _) => redact_url(url),
+        (None, Some(dir)) => format!("(local model dir: {dir})"),
+        (None, None) => "(endpoint owned by the edge-tts adapter)".to_string(),
+    };
     out.push_str(&format!(
         "provider:    {} → {} (route: {})\n",
         r.provider_name, shown_url, r.adapter

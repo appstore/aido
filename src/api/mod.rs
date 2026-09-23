@@ -2,6 +2,10 @@
 mod chat;
 #[cfg(feature = "edge-tts")]
 mod edge;
+#[cfg(feature = "local-asr")]
+pub(crate) mod local_asr;
+#[cfg(feature = "local-asr")]
+pub(crate) use local_asr::LocalModels;
 mod media;
 mod responses;
 mod sse;
@@ -37,6 +41,9 @@ pub enum Adapter {
     #[serde(rename = "edge-tts")]
     #[value(name = "edge-tts")]
     EdgeTts,
+    #[serde(rename = "local-asr")]
+    #[value(name = "local-asr")]
+    LocalAsr,
 }
 
 impl std::fmt::Display for Adapter {
@@ -48,6 +55,7 @@ impl std::fmt::Display for Adapter {
             Self::Transcription => "openai-transcription",
             Self::Images => "openai-images",
             Self::EdgeTts => "edge-tts",
+            Self::LocalAsr => "local-asr",
         })
     }
 }
@@ -58,13 +66,13 @@ impl Adapter {
         match self {
             Self::Chat | Self::Responses => &[Text, Image],
             Self::Speech | Self::EdgeTts | Self::Images => &[Text],
-            Self::Transcription => &[Audio],
+            Self::Transcription | Self::LocalAsr => &[Audio],
         }
     }
     pub fn outputs(self) -> &'static [MediaKind] {
         use MediaKind::*;
         match self {
-            Self::Chat | Self::Transcription => &[Text],
+            Self::Chat | Self::Transcription | Self::LocalAsr => &[Text],
             Self::Responses => &[Text, Image],
             Self::Speech | Self::EdgeTts => &[Audio],
             Self::Images => &[Image],
@@ -78,6 +86,9 @@ impl Adapter {
             // Edge TTS ignores the model entirely; the profile slot accepts
             // any placeholder without a `config check` warning.
             Self::EdgeTts => "edge",
+            // Same placeholder story: the local engine is picked by the
+            // provider's model_dir, not by a model name.
+            Self::LocalAsr => "local",
             _ => "gpt-4o-mini",
         }
     }
@@ -94,6 +105,7 @@ impl Adapter {
             Self::Speech | Self::EdgeTts => &["voice", "format", "speed"],
             Self::Transcription => &["language"],
             Self::Images => &["format", "size", "quality", "background", "n"],
+            Self::LocalAsr => &["family", "language", "threads", "max_audio_secs"],
         };
         for (key, value) in options {
             if !allowed.contains(&key.as_str()) {
@@ -108,6 +120,25 @@ impl Adapter {
                 "n" => {
                     if !value.as_u64().is_some_and(|v| (1..=10).contains(&v)) {
                         bail!("n must be an integer between 1 and 10");
+                    }
+                }
+                "threads" | "max_audio_secs" => {
+                    if !value.as_u64().is_some_and(|v| (1..=96).contains(&v)) {
+                        bail!("option '{key}' must be a positive integer (1..=96)");
+                    }
+                }
+                "family" => {
+                    const FAMILIES: &[&str] = &[
+                        "sensevoice",
+                        "paraformer",
+                        "transducer",
+                        "qwen3-asr",
+                        "funasr-nano",
+                        "firered-aed",
+                        "firered-ctc",
+                    ];
+                    if !value.as_str().is_some_and(|s| FAMILIES.contains(&s)) {
+                        bail!("option 'family' must be one of: {}", FAMILIES.join(", "));
                     }
                 }
                 _ => {
@@ -146,6 +177,15 @@ pub(crate) const EDGE_NO_INSTRUCTION_CHANNEL: &str =
 pub(crate) const EDGE_TTS_NOT_COMPILED: &str =
     "the 'edge-tts' adapter is not compiled into this binary (rebuild with \
      --features edge-tts, or use the openai-speech route)";
+
+/// Refusal for the local-asr route in a binary built without the
+/// `local-asr` feature. The enum variant stays compiled (so configs naming
+/// `local-asr` still parse); the plan-time guard and the transport's
+/// send-time defense must stay worded identically.
+#[cfg(not(feature = "local-asr"))]
+pub(crate) const LOCAL_AS_NOT_COMPILED: &str =
+    "the 'local-asr' adapter is not compiled into this binary (rebuild with \
+     --features local-asr)";
 
 /// One request to one adapter. `instruction` is the task's fixed direction,
 /// `requirement` is this run's -p; they stay separate until the adapter

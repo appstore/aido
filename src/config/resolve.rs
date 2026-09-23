@@ -36,9 +36,16 @@ pub struct Resolved {
     pub profile_name: String,
     pub provider_name: String,
     pub adapter: Adapter,
-    /// None for adapters that own their endpoint (edge-tts).
+    /// None for adapters that own their endpoint (edge-tts, local-asr).
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Local model directory; only for adapters that load local models
+    /// (local-asr).
+    pub model_dir: Option<String>,
+    /// Local model files (local-asr): silero VAD (required) and the
+    /// punctuation directory (optional). None outside that adapter.
+    pub vad: Option<String>,
+    pub punct: Option<String>,
     pub model: String,
     pub model_source: ParamSource,
     /// None = "do not send a token limit".
@@ -92,6 +99,16 @@ pub(super) fn effective_adapter(operation: Operation, provider: &Provider) -> Ad
         .get(&operation.to_string())
         .copied()
         .unwrap_or_else(|| conventional_adapter(operation))
+}
+
+/// Expand a configured local-model path (`~` plus absolute/relative) or
+/// name the profile field that is missing.
+#[cfg(feature = "local-asr")]
+fn expand_local_path(raw: Option<&str>, missing: &str) -> Result<String> {
+    let raw = raw.with_context(|| missing.to_string())?;
+    Ok(crate::api::local_asr::expand_home(raw)
+        .to_string_lossy()
+        .into_owned())
 }
 
 pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
@@ -149,9 +166,10 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         })?;
     // The operation's route first: explicit provider route, else the
     // operation's conventional adapter. It decides whether a base URL is
-    // required at all — the edge-tts adapter owns its endpoint.
+    // required at all — the edge-tts adapter owns its endpoint, and the
+    // local-asr adapter owns its model directory instead.
     let adapter = effective_adapter(task.operation, &provider);
-    let base_url = if adapter == Adapter::EdgeTts {
+    let base_url = if matches!(adapter, Adapter::EdgeTts | Adapter::LocalAsr) {
         None
     } else {
         let raw = provider
@@ -181,6 +199,45 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         (m.clone(), ParamSource::Profile)
     } else {
         (adapter.default_model().to_string(), ParamSource::Default)
+    };
+
+    // The local engine's models: required on the profile for the local-asr
+    // adapter (ASR directory and silero VAD; punctuation optional), and
+    // shown by the dry-run as the exact paths a run would load (tilde
+    // expanded).
+    let (model_dir, vad, punct) = match adapter {
+        Adapter::LocalAsr => {
+            #[cfg(feature = "local-asr")]
+            {
+                let model_dir = expand_local_path(
+                    profile.model_dir.as_deref(),
+                    &format!(
+                        "profile '{profile_name}' uses the local-asr adapter \
+                         but sets no model_dir"
+                    ),
+                )?;
+                let vad = expand_local_path(
+                    profile.vad.as_deref(),
+                    &format!(
+                        "profile '{profile_name}' uses the local-asr adapter \
+                         but sets no vad"
+                    ),
+                )?;
+                let punct = profile.punct.as_deref().map(|p| {
+                    crate::api::local_asr::expand_home(p)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                (Some(model_dir), Some(vad), punct)
+            }
+            #[cfg(not(feature = "local-asr"))]
+            {
+                // validate_adapter_availability refuses this adapter right
+                // after resolve(); nothing to resolve in this build.
+                (None, None, None)
+            }
+        }
+        _ => (None, None, None),
     };
 
     // Capability envelope: constraints intersect, they are not overridden.
@@ -319,6 +376,9 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
         adapter,
         base_url,
         api_key_env: provider.api_key_env.clone(),
+        model_dir,
+        vad,
+        punct,
         model,
         model_source,
         max_tokens,
