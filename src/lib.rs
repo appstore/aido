@@ -8,6 +8,8 @@
 
 pub mod api;
 pub mod app;
+#[cfg(feature = "audio-decode")]
+pub mod audio;
 pub mod chain;
 pub mod cli;
 pub mod clipboard;
