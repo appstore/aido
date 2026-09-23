@@ -450,7 +450,7 @@ fn validate_adapter_availability(resolved: &Resolved) -> AppResult<()> {
     #[cfg(not(feature = "local-asr"))]
     if resolved.adapter == crate::api::Adapter::LocalAsr {
         return Err(AppError::usage(
-            crate::api::LOCAL_AS_NOT_COMPILED.to_string(),
+            crate::api::LOCAL_ASR_NOT_COMPILED.to_string(),
         ));
     }
     // With the features on there is nothing to check; keep the parameter used.

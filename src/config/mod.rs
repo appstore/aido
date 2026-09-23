@@ -293,11 +293,14 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 // compiled in, run the same detect and cheap checks a run
                 // performs (no model load) — absent files or a broken
                 // directory surface here, while the user is editing the
-                // config.
-                for adapter in provider.routes.values() {
-                    if *adapter != Adapter::LocalAsr {
-                        continue;
-                    }
+                // config. Only when one of the profile's own operations
+                // resolves to the adapter (the filter `needs_base` uses) —
+                // a generate-only profile sharing this provider is never
+                // asked for model files its runs would not load.
+                let uses_local_asr = allowed
+                    .iter()
+                    .any(|&op| resolve::effective_adapter(op, provider) == Adapter::LocalAsr);
+                if uses_local_asr {
                     #[cfg(feature = "local-asr")]
                     {
                         let family = profile.options.get("family").and_then(|v| v.as_str());
@@ -505,3 +508,6 @@ model = "{MODEL_PLACEHOLDER}"
 #
 # Then: aido tts --text "你好" -o hello.mp3 --profile edge
 "#;
+
+#[cfg(test)]
+mod tests;

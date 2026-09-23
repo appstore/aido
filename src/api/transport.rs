@@ -252,7 +252,7 @@ impl Client {
             }
             #[cfg(not(feature = "local-asr"))]
             {
-                bail!(super::LOCAL_AS_NOT_COMPILED);
+                bail!(super::LOCAL_ASR_NOT_COMPILED);
             }
         }
         let resp = self

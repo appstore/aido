@@ -122,9 +122,16 @@ impl Adapter {
                         bail!("n must be an integer between 1 and 10");
                     }
                 }
-                "threads" | "max_audio_secs" => {
+                "threads" => {
                     if !value.as_u64().is_some_and(|v| (1..=96).contains(&v)) {
                         bail!("option '{key}' must be a positive integer (1..=96)");
+                    }
+                }
+                // A decode budget in seconds, not a core count: the default
+                // is 7200, so the cap is one day.
+                "max_audio_secs" => {
+                    if !value.as_u64().is_some_and(|v| (1..=86_400).contains(&v)) {
+                        bail!("option '{key}' must be a positive integer (1..=86400)");
                     }
                 }
                 "family" => {
@@ -183,7 +190,7 @@ pub(crate) const EDGE_TTS_NOT_COMPILED: &str =
 /// `local-asr` still parse); the plan-time guard and the transport's
 /// send-time defense must stay worded identically.
 #[cfg(not(feature = "local-asr"))]
-pub(crate) const LOCAL_AS_NOT_COMPILED: &str =
+pub(crate) const LOCAL_ASR_NOT_COMPILED: &str =
     "the 'local-asr' adapter is not compiled into this binary (rebuild with \
      --features local-asr)";
 
