@@ -298,6 +298,7 @@ async fn dispatch(
         Some(Commands::Profiles) => return manage_profiles(),
         Some(Commands::Config { cmd }) => return manage_config(cmd),
         Some(Commands::History { cmd }) => return manage_history(&cli, cmd).await,
+        Some(Commands::Serve { cmd }) => return crate::serve::run(cmd).await,
         Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs).await,
         None => {}
     }

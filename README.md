@@ -89,6 +89,109 @@ aido transcribe meeting.mp3 -o meeting.txt      # 输入恰好一个音频文件
 aido transcribe voice-note.m4a --copy
 ```
 
+长音频默认按 **60 秒**分段，并自动保存恢复进度，通常只需：
+
+```bash
+aido transcribe meeting.mp3 -o meeting.txt
+# 中断或失败后重复同一命令：已完成段直接读取，仅请求未完成段。
+
+# 需要时覆盖默认段长或恢复目录：
+aido transcribe meeting.mp3 --audio-chunk-secs 30 --transcribe-state ./meeting.transcribe -o meeting.txt
+aido transcribe meeting.mp3 --no-split -o meeting.txt  # 关闭分段，整文件发送
+```
+
+`--audio-chunk-secs` 接受 1–600 秒，表示每段最长时长，默认 60 秒；切点优先选最后 5 秒内（不超过半段）的连续约 200ms 静音（RMS < 0.01），没有静音则按时长切开。各段不重叠、不做文本去重，按顺序以段落分隔合并，因此不会误删真实的重复话语；连续说话的硬切点仍可能影响识别质量，可调大段长。每段仍受 `--timeout` 限制，`--total-timeout` 限制本次执行的请求总预算。未显式指定分段参数时，60 秒以内的短音频保留原始编码、只发一次请求。
+
+自动恢复目录位于历史目录的同级目录 `history-transcription/<内容与参数摘要>/`；设置 `AIDO_HISTORY_DIR` 时，在该目录名后追加 `-transcription` 作为恢复根目录。音频内容、实际分段、服务地址、模型、语言及提示等参数共同决定子目录，因此不同输入或参数自动分开保存。`--dry-run` 会显示所选恢复目录，但不创建它。仅多段转写自动保存；`--no-history` 或 `settings.history_keep = 0` 会关闭自动保存及复用，但继续分段。
+
+`--transcribe-state DIR` 可单独使用，覆盖自动目录并采用默认段长，也可与 `--audio-chunk-secs` 一起使用；它是显式保存要求，因此即使 `--no-history` 也保存，包括只有一段的音频。指定目录不匹配当前输入或参数时拒绝复用，请更换目录。每段完整回复原子保存，失败即停止；重跑命令恢复，不自动重试。完成后保留目录便于重新交付，可自行删除；恢复文件包含转写文本，独立于历史清理。不要让多个进程同时处理同一目录，以免重复请求。
+
+分段使用默认构建包含的 `audio-decode`，支持本地解码的 MP3、M4A/AAC、FLAC、OGG/Vorbis、MKV、WAV。默认模式下，本地解码失败（例如 WebM/Opus）会提示并回退为整文件发送；不含 `audio-decode` 的构建也保持整文件发送。显式指定分段或恢复目录时则报错，不静默降级；可转换格式或用 `--features audio-decode` 重新构建。当前解码和分段数据仍驻留内存，单个输入仍受现有 32 MiB 限制（`settings.input_bytes` 只调整总预算，不能放宽单文件限制），这项功能解决长请求和恢复问题，不是流式磁盘解码。
+
+### 离线转写（实验性，`serve asr`）
+
+云端路由之外的本地引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 模型经 asr-core 在本机推理，零网络。本地转写以**常驻服务**形式提供：`aido serve asr` 启动时加载一次模型，以 OpenAI 兼容的 HTTP 接口对外服务——`aido transcribe` 本身零变动（走已有的 openai-transcription 适配器指到本地服务即可），任何会说 OpenAI 协议的工具也都能直接用这个引擎。默认构建不包含；源码构建需要 `--features local-asr`（sherpa-onnx 是 C++ 源码构建，要求系统装有 **cmake** 与 C++ 工具链）。
+
+```toml
+# 配置目录的 config.toml：一个 provider 指向本地服务，一个 profile 指定
+# 模型（解压后的 sherpa-onnx 模型归档，如 SenseVoice、Paraformer、
+# FireRedASR、Qwen3-ASR、FunASR-Nano）。同一 profile 同时喂
+# `aido serve asr`（读 asr/vad/punct）与 `aido transcribe`（走 HTTP）。
+
+[providers.local-asr]
+base_url = "http://127.0.0.1:8080/v1"   # 本地服务，无需 api_key
+
+[providers.local-asr.routes]
+transcribe = "openai-transcription"
+
+[profiles.local-asr]
+provider = "local-asr"
+operations = ["transcribe"]
+asr = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # ASR 模型
+vad = "~/models/silero_vad.onnx"                                                  # 离线家族必需
+punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"   # 标点恢复，可选
+```
+
+跑起来：
+
+```bash
+# 终端 1：模型加载（秒到分钟级）只付一次，之后常驻
+aido serve asr --profile local-asr
+
+# 终端 2：转写走 HTTP，不再每次加载模型
+aido transcribe --profile local-asr meeting.mp3 -o meeting.txt
+```
+
+规则：三个模型字段都支持 `~` 展开。`asr` 指向解压后的模型目录，**必填**（aido 不做任何模型搜索或自动下载）；`vad` 指向 silero VAD 文件，离线家族**必需**；`punct` 指向标点模型目录，可选，缺省不启用。引擎 knobs 是 `aido serve asr` 的 flags（不进 profile options，否则同 profile 的 transcribe 路由过不了 openai-transcription 的选项校验）：`--family`（目录布局无法区分 Paraformer/FireRedASR-CTC 时必填）、`--language`（启动时固定，引擎运行中不能切换语言）、`--threads`、`--max-audio-secs`（解码预算，默认 3600）、`--bind`（默认 127.0.0.1:8080）、`--max-active-sessions`（默认 8，满员请求回 503）、`--max-body-mb`（默认 512）、`--timeout-secs`（默认按音频时长自适应）。接口：`POST /v1/audio/transcriptions`（multipart，`file` 必填；`model`/`prompt`/`temperature` 接受但忽略；`response_format` 仅支持 `json`）、`GET /health`、`GET /v1/models`。webm/opus（微信式语音）无离线解码器，走云端转写；`.mka`/`.mkv` 音频离线可转。
+
+> ① **常驻内存是净代价**：以 FireRedASR2 int8 为例峰值约 1.6 GB——换来的是模型加载只付一次；偶尔转一个文件的场景，不值得起服务。② **长音频**要调大 `--timeout` / `settings.timeout_secs`：client 侧超时就是普通 HTTP 超时，服务端默认按音频秒数×3 自适应，但 client 等不了那么久。③ 服务不校验 Authorization（默认只绑 loopback；client 侧若要求 key，设个占位环境变量即可）。
+
+> SenseVoice 自带标点，再叠加标点模型可能出现重复标点（"。，"）——无标点输出的家族（Paraformer 等）更适合配 `punct`。
+
+#### 端到端示例：FireRedASR-AED
+
+以 FireRedASR2 的 AED 导出为例从零跑通（中英离线，int8 量化，解压后约 1.2 GB 磁盘、运行峰值内存约 1.6 GB；同一目录布局也兼容 FireRedASR 1.0-AED-L 的 sherpa-onnx 导出）：
+
+```bash
+# 1. 模型归档解压（HF 上的 sherpa-onnx 导出；
+#    国内网络可把 huggingface.co 整体换成 hf-mirror.com 镜像）
+mkdir -p ~/models
+wget -P /tmp https://huggingface.co/csukuangfj2/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/resolve/main/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2
+tar -xjf /tmp/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2 -C ~/models
+
+# 2. silero VAD：离线家族必需，位置随意（profile 的 vad 字段指向它即可）
+wget -O ~/models/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+
+# 3. 标点模型（可选，推荐）：FireRedASR 原始输出没有标点，配标点恢复正合适
+wget -P /tmp https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2
+tar -xjf /tmp/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2 -C ~/models
+```
+
+```toml
+# 4. 配置目录的 config.toml：provider 指向本地服务 + profile 指定全部模型
+
+[providers.local-asr]
+base_url = "http://127.0.0.1:8080/v1"
+
+[providers.local-asr.routes]
+transcribe = "openai-transcription"
+
+[profiles.local-asr]
+provider = "local-asr"
+operations = ["transcribe"]
+asr = "~/models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
+vad = "~/models/silero_vad.onnx"
+punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+```
+
+```bash
+# 5. 起服务 + 转写
+aido serve asr --profile local-asr &
+aido transcribe --profile local-asr meeting.mp3 -o meeting.txt
+```
+
+这一家族由目录布局自动识别（encoder/decoder + tokens.txt、无 joiner），无需 `--family`——需要显式 `--family` 的是扁平布局区分不出的 Paraformer / FireRedASR-CTC。中英双语固定，请求里的 `language` 与服务启动时未固定的语言不一致会被拒绝。服务常驻期间模型只加载一次，短音频的耗时从此与加载无关。
+
 ### 图片生成
 
 ```bash
@@ -325,7 +428,7 @@ Profile 选择顺序：`--profile` → 任务默认 → `AIDO_PROFILE` → `defa
 | `summarize` | generate | text | text | `--no-split` |
 | `code-review` | generate | text | text | |
 | `tts` | speech | text | audio | `--voice` `--speed` |
-| `transcribe` | transcribe | 恰好一个 audio | text | |
+| `transcribe` | transcribe | 恰好一个 audio | text | `--audio-chunk-secs SECS` `--transcribe-state DIR` |
 | `image` | image | text | image | `--count` `--size` |
 | `ask` | generate | 任意（可无材料） | text | |
 

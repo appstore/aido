@@ -7,7 +7,7 @@ rust-version = "1.88"
 description = "Send material to an AI task (OCR, translate, TTS, images, ...) and deliver the result to stdout, files or the clipboard"
 
 [features]
-default = ["edge-tts"]
+default = ["edge-tts", "audio-decode"]
 # Keyless Microsoft Read-Aloud TTS. Optional: closing it drops the whole
 # kothok-edge-tts subtree (and aws-lc-sys, which needs cmake) from the
 # build graph. Build with --no-default-features for an aido without TTS.
@@ -20,7 +20,8 @@ edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
 pdfium = []
 # Offline audio decoding for the transcription pipeline (src/audio.rs):
 # asr-core's decode-symphonia demuxes + decodes material into mono f32
-# samples, the shape the local ASR engine consumes. Off by default; the
+# samples, the shape the local ASR engine consumes. On by default for
+# client-side transcription segmentation; the
 # decode logic, format coverage (mp3, m4a/aac, flac, ogg/vorbis, mkv, wav)
 # and failure philosophy live upstream — this crate keeps only policy
 # (cloud-route guidance, empty results, the sample budget). symphonia's
@@ -28,6 +29,24 @@ pdfium = []
 # 0.0.x version requirements are exact by semver, so this stays pinned
 # until asr-core starts promising compatibility.
 audio-decode = ["dep:asr-core"]
+# The ASR HTTP server (src/serve.rs): one offline engine loaded once,
+# exposed over the OpenAI-compatible transcription API. Implies
+# audio-decode (the decode layer is every request's input half). Pure
+# Rust: the handlers test against a mock engine with no model files, so
+# this feature is cheap enough for every PR to run its full test suite.
+asr-server = ["audio-decode", "dep:axum"]
+# The sherpa-onnx engine behind the ASR server (asr-core's local
+# backend). Implies asr-server: the server is the engine's only consumer.
+# Off by default: sherpa-onnx is a C++ source build that needs cmake and
+# a C++ toolchain, and the binary grows by the native libraries. Builds
+# without the feature keep every config surface but `aido serve asr`
+# refuses at run time.
+local-asr = [
+    "asr-server",
+    "asr-core/backend-sherpa",
+    "asr-core/vad-silero",
+    "asr-core/punct-sherpa",
+]
 
 [dependencies]
 # Office/OpenDocument/RTF/CSV → markdown 转换后端（materialize/document.rs）。
@@ -63,13 +82,23 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # audio-decode feature（见上）：解码逻辑与失败哲学在 asr-core，本 crate 的
 # src/audio.rs 只做策略薄层。asr-core 0.0.2 声明 MSRV 1.88，与 aido 相同；
 # = 锁定为显式契约——0.0.x 不承诺兼容，升级永远是主动行为。
 asr-core = { version = "=0.0.2", default-features = false, features = [
     "decode-symphonia",
 ], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# asr-server feature（见上）：本地转写服务的 HTTP 层。default-features
+# 关掉后只留 http1 + tokio + json + multipart，hyper/tower 本就随 reqwest
+# 在依赖树里，这里只加路由、JSON 与 multipart 提取。
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "multipart",
+], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 toml = "0.8"
 unicode-width = "0.2"
 lopdf = "0.45.0"
@@ -92,6 +121,7 @@ flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rust_xlsxwriter = "0.99.1"
 serde_json = "1"
+tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

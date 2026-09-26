@@ -151,7 +151,7 @@ pub fn resolve(cli: &Cli, cfg: &Config, task: &Task) -> Result<Resolved> {
     // operation's conventional adapter. It decides whether a base URL is
     // required at all — the edge-tts adapter owns its endpoint.
     let adapter = effective_adapter(task.operation, &provider);
-    let base_url = if adapter == Adapter::EdgeTts {
+    let base_url = if matches!(adapter, Adapter::EdgeTts) {
         None
     } else {
         let raw = provider

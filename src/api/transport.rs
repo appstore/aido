@@ -182,7 +182,7 @@ impl Client {
             Adapter::Speech => "audio/speech",
             Adapter::Transcription => "audio/transcriptions",
             Adapter::Images => "images/generations",
-            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
+            Adapter::EdgeTts => bail!("the {} adapter does not use HTTP requests", self.adapter),
         };
         let base = self
             .base_url
@@ -197,7 +197,7 @@ impl Client {
             Adapter::Transcription => req.multipart(media::transcription(request)?),
             Adapter::Speech => req.json(&media::encode_speech(request)?),
             Adapter::Images => req.json(&media::encode_images(request)?),
-            Adapter::EdgeTts => bail!("the edge-tts adapter does not use HTTP requests"),
+            Adapter::EdgeTts => bail!("the {} adapter does not use HTTP requests", self.adapter),
         };
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);

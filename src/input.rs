@@ -741,8 +741,32 @@ fn audio_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
         Some(("audio/ogg", "ogg"))
     } else if bytes.get(4..8) == Some(b"ftyp") {
         Some(("audio/mp4", "m4a"))
-    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+    } else {
+        ebml_flavor(bytes)
+    }
+}
+
+/// EBML magic (`1A 45 DF A3`) plus the DocType element, matched as an
+/// anchored whole: element ID 0x4282, then a size vint, then the string.
+/// MKV and WebM share the magic; only the DocType tells them apart.
+/// Matroska's DocType is "matroska" (8 bytes → vint 0x88), WebM's is
+/// "webm" (4 bytes → vint 0x84).
+fn ebml_flavor(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return None;
+    }
+    let head = &bytes[..bytes.len().min(128)];
+    if head
+        .windows(7)
+        .any(|w| w == [0x42, 0x82, 0x84, b'w', b'e', b'b', b'm'])
+    {
         Some(("audio/webm", "webm"))
+    } else if head.windows(11).any(|w| {
+        w == [
+            0x42, 0x82, 0x88, b'm', b'a', b't', b'r', b'o', b's', b'k', b'a',
+        ]
+    }) {
+        Some(("audio/x-matroska", "mkv"))
     } else {
         None
     }

@@ -6,6 +6,7 @@
 //! named by environment variable here and resolved only when a request is
 //! about to be sent.
 
+pub(crate) mod path;
 pub mod resolve;
 
 pub use resolve::{resolve, ParamSource, Resolved};
@@ -50,6 +51,18 @@ pub struct Provider {
 pub struct Profile {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Local model fields for `aido serve asr` (the ASR server): `asr`
+    /// is the model directory, `vad` the silero VAD file (required by
+    /// the offline engine), `punct` the optional punctuation directory.
+    /// The server loads them from the profile at startup; the run path
+    /// (e.g. `aido transcribe` over the server's HTTP route) never reads
+    /// them, so they are inert for the other adapters.
+    #[serde(default)]
+    pub asr: Option<String>,
+    #[serde(default)]
+    pub vad: Option<String>,
+    #[serde(default)]
+    pub punct: Option<String>,
     /// Operations this profile is intended for (capability check).
     pub operations: Option<Vec<crate::tasks::Operation>>,
     pub input_types: Option<Vec<MediaKind>>,
@@ -278,6 +291,62 @@ pub fn check(cfg: &Config) -> Vec<String> {
                 }
             }
         }
+        // The ASR server's model fields: whenever a profile sets any of
+        // them, judge it as a serve profile — a partial field set is a
+        // config error, and with the engine compiled in, the same detect
+        // and cheap checks startup performs run here (no model load),
+        // while the user is editing the config. Profiles without these
+        // fields are never asked for them.
+        if profile.asr.is_some() || profile.vad.is_some() || profile.punct.is_some() {
+            #[cfg(feature = "local-asr")]
+            match (profile.asr.as_deref(), profile.vad.as_deref()) {
+                (Some(asr), Some(vad)) => {
+                    let models = crate::serve::asr::LocalModels {
+                        asr: path::expand_home(asr),
+                        vad: path::expand_home(vad),
+                        punct: profile.punct.as_deref().map(path::expand_home),
+                    };
+                    match crate::serve::asr::check_model(&models) {
+                        Ok(()) => {}
+                        // The flat layout's family is a --family decision
+                        // made at serve time, unknown here — a note, not
+                        // an issue.
+                        Err(crate::serve::asr::ModelCheckFailure::AmbiguousFamily) => {
+                            eprintln!(
+                                "note: profile '{name}': the 'asr' layout is shared by \
+                                 paraformer and firered-ctc; pass --family to \
+                                 'aido serve asr'"
+                            );
+                        }
+                        Err(crate::serve::asr::ModelCheckFailure::Failed(error)) => {
+                            issues.push(format!("profile '{name}': {error:#}"));
+                        }
+                    }
+                }
+                (asr, vad) => {
+                    let mut missing = Vec::new();
+                    if asr.is_none() {
+                        missing.push("'asr'");
+                    }
+                    if vad.is_none() {
+                        missing.push("'vad'");
+                    }
+                    issues.push(format!(
+                        "profile '{name}': sets local ASR model fields but sets no {} \
+                         (the server requires both)",
+                        missing.join(" and ")
+                    ));
+                }
+            }
+            #[cfg(not(feature = "local-asr"))]
+            {
+                issues.push(format!(
+                    "profile '{name}' sets local ASR model fields, but this binary \
+                     has no local ASR engine to validate them against (rebuild \
+                     with --features local-asr)"
+                ));
+            }
+        }
         // A model-less profile runs on the adapter's default model
         // (resolve() falls back to it), so check must not fail it — a
         // stderr note says as much. Only the placeholder/empty model is a
@@ -461,4 +530,28 @@ model = "{MODEL_PLACEHOLDER}"
 # voice = "zh-CN-XiaoxiaoNeural"   # default; speed 0.25..4 via --speed
 #
 # Then: aido tts --text "你好" -o hello.mp3 --profile edge
+
+# Local offline transcription via `aido serve asr`: one engine load, many
+# requests over an OpenAI-compatible HTTP interface (needs a binary built
+# with --features local-asr). The profile's asr/vad/punct fields are the
+# server's model files; transcribe talks to it over plain HTTP.
+# [providers.local-asr]
+# base_url = "http://127.0.0.1:8080/v1"
+# # no api_key_env: the local server needs no auth
+#
+# [providers.local-asr.routes]
+# transcribe = "openai-transcription"
+#
+# [profiles.local-asr]
+# provider = "local-asr"
+# operations = ["transcribe"]
+# asr = "~/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+# vad = "~/models/silero_vad.onnx"
+# punct = "~/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+#
+# Then: aido serve asr --profile local-asr
+#       aido transcribe --profile local-asr meeting.mp3 -o meeting.txt
 "#;
+
+#[cfg(test)]
+mod tests;

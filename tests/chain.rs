@@ -951,6 +951,45 @@ fn merged_minus_o_encoding_conflict_fails_at_parse_zero_requests() {
 }
 
 #[test]
+fn transcription_flags_on_later_stages_fail_before_any_request() {
+    let cfg = dead_cfg();
+    for (flag, value) in [
+        ("--audio-chunk-secs", "30"),
+        ("--transcribe-state", "state"),
+    ] {
+        let spec = format!("summarize | summarize {flag} {value}");
+        for mut args in [
+            vec![
+                "summarize",
+                "--text",
+                "hi",
+                "--then",
+                "summarize",
+                flag,
+                value,
+            ],
+            vec!["chain", spec.as_str(), "--text", "hi"],
+        ] {
+            for dry_run in [false, true] {
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let out = run_with(&args, b"", &[("AIDO_CONFIG", cfg.to_str().unwrap())], &cfg);
+                // A real run would fail against the dead endpoint if stage 1
+                // were reached; both forms must instead report stage 2's usage error.
+                out.assert_code(2);
+                let stderr = out.stderr();
+                assert!(stderr.contains("stage 2 (summarize)"), "{stderr}");
+                assert!(
+                    stderr.contains("require a single transcription task"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn stream_on_a_nonspeaking_last_stage_fails_at_parse() {
     let cfg = dead_cfg();
     // --stream merges onto the edge-tts stage, whose adapter cannot

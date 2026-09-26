@@ -1,11 +1,15 @@
 name: test
 
 # PR 和 push 到 master：格式检查 + clippy + 测试（Linux/macOS/Windows）+ MSRV 编译检查。
-# 发布流程见 release.yml（只管 release 分支）。
+# 每周一凌晨全量复跑（local-asr 的完整 clippy/test 只在这里与 master push 跑，
+# 见该 job 的注释）。发布流程见 release.yml（只管 release 分支）。
 on:
   pull_request:
   push:
     branches: [master]
+  schedule:
+    # 每周一 03:00 UTC
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
@@ -186,6 +190,88 @@ jobs:
       # 不带 audio-decode，audio-decode job 带默认特性），这里补上。
       - name: Check (audio-decode, no default features)
         run: cargo check --locked --no-default-features --features audio-decode
+
+  asr-server:
+    # `asr-server` feature 的 ASR 服务层（src/serve.rs）默认构建完全编译
+    # 不到，唯一能验证它的地方就是这里。纯 Rust（axum + symphonia 解码），
+    # handler 测试用 mock 引擎、无需任何模型文件，每个 PR 都跑全量
+    # clippy + test。
+    name: asr-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asr-server
+
+      - name: Clippy (asr-server)
+        run: cargo clippy --all-targets --locked --features asr-server -- -D warnings
+
+      - name: Test (asr-server)
+        run: cargo test --locked --features asr-server
+
+      - name: Check (asr-server, no default features)
+        run: cargo check --locked --no-default-features --features asr-server
+
+  local-asr:
+    # `local-asr` feature 的 sherpa-onnx 引擎（serve 模块的 prepare 半程）
+    # 需要 C++ 源码构建（ubuntu-latest 自带 cmake），首次编译约 5-10 分钟，
+    # 之后命中 rust-cache 缓存接近增量。为控制每个 PR 的 CI 成本（review
+    # #85），PR 阶段只跑下方 local-asr-check（仅 check）；本 job 的完整
+    # clippy + test 在 push 到 master 与每周计划任务上验证。
+    name: local-asr (full)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: local-asr
+
+      - name: Clippy (local-asr)
+        run: cargo clippy --all-targets --locked --features local-asr -- -D warnings
+
+      - name: Test (local-asr)
+        run: cargo test --locked --features local-asr
+
+      - name: Check (local-asr, no default features)
+        run: cargo check --locked --no-default-features --features local-asr
+
+  local-asr-check:
+    # PR 阶段的廉价档：仅 check。check 同样要执行 sherpa-onnx 的 C++
+    # build script，但 rust-cache 命中后接近增量；clippy 与测试由上方
+    # local-asr (full) 在 master push / weekly 覆盖（server 侧的完整测试
+    # 由 asr-server job 在每个 PR 上跑，无需等 sherpa）。
+    name: local-asr (check)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: local-asr
+
+      - name: Check (local-asr)
+        run: cargo check --locked --features local-asr
+
+      - name: Check (local-asr, no default features)
+        run: cargo check --locked --no-default-features --features local-asr
 
   musl:
     # x86_64-unknown-linux-musl 是 release 产物目标（全静态 Linux 二进制）。

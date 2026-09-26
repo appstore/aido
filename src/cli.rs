@@ -9,7 +9,7 @@
 
 use crate::domain::MediaKind;
 use anyhow::{anyhow, bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -26,8 +26,8 @@ impl clap::ValueEnum for MediaKind {
 /// Names owned by management commands and helpers; never treated as tasks
 /// (`aido run NAME` reaches a custom task with such a name).
 pub const RESERVED_WORDS: &[&str] = &[
-    "tasks", "profiles", "config", "history", "run", "ask", "last", "watch", "help", "version",
-    "__hold", "chain",
+    "tasks", "profiles", "config", "history", "run", "ask", "last", "watch", "serve", "help",
+    "version", "__hold", "chain",
 ];
 
 /// The recovery pseudo-task behind `aido last`.
@@ -130,6 +130,8 @@ const FLAGS: &[(&str, bool)] = &[
     ("--max-tokens", true),
     ("--temperature", true),
     ("--option", true),
+    ("--audio-chunk-secs", true),
+    ("--transcribe-state", true),
     ("--timeout", true),
     ("--total-timeout", true),
     ("--to", true),
@@ -340,6 +342,17 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     // the normalizer's task discovery cannot reject it (RESERVED_WORDS lists
     // it precisely so it can never be a task name).
     if argv.first().and_then(|t| t.to_str()) == Some("__hold") {
+        return Ok(Normalized::Single {
+            task: None,
+            specs: Vec::new(),
+            argv,
+        });
+    }
+    // `aido serve <SUB> ...` is a management command with its own grammar:
+    // hand the raw argv to clap untouched. The normalizer's flag hoisting
+    // would tear the subcommand's flags away from it (they would land on
+    // the root surface, which does not know `--bind` and friends).
+    if argv.first().and_then(|t| t.to_str()) == Some("serve") {
         return Ok(Normalized::Single {
             task: None,
             specs: Vec::new(),
@@ -610,6 +623,10 @@ fn normalize_stage(argv: Vec<OsString>) -> Result<StageArgv> {
                 // watch must open the command line: flags cannot precede it
                 // the way they precede a task run.
                 bail!("'watch' must be the first word: aido watch DIR -- <TASK> [FLAGS]");
+            } else if word == "serve" {
+                // Same first-word rule as watch: `aido serve` is clap's to
+                // parse whole, not a stage the normalizer reshapes.
+                bail!("'serve' must be the first word: aido serve asr --profile <NAME>");
             } else if prompt_seen {
                 // -p selects `ask`; positionals are files.
                 None
@@ -1359,6 +1376,14 @@ pub struct Cli {
     #[arg(long = "option", value_name = "KEY=VALUE")]
     pub options: Vec<String>,
 
+    /// Maximum transcription segment duration (default 60; --no-split disables)
+    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u32).range(1..=600), conflicts_with = "no_split")]
+    pub audio_chunk_secs: Option<u32>,
+
+    /// Override the automatic transcription recovery directory
+    #[arg(long, value_name = "DIR", conflicts_with = "no_split")]
+    pub transcribe_state: Option<std::path::PathBuf>,
+
     /// Header-wait and network-idle timeout in seconds (default 120)
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
@@ -1403,7 +1428,7 @@ pub struct Cli {
     #[arg(long, value_name = "WxH")]
     pub size: Option<String>,
 
-    /// Send inputs whole instead of slicing/chunking (ocr, summarize, translate)
+    /// Send inputs whole instead of slicing/chunking (ocr, summarize, translate, transcribe)
     #[arg(long)]
     pub no_split: bool,
 
@@ -1429,6 +1454,11 @@ pub enum Commands {
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,
+    },
+    /// Start a long-running server over aido's engines
+    Serve {
+        #[command(subcommand)]
+        cmd: ServeCmd,
     },
     /// Internal: hold clipboard contents in the background (Linux)
     #[command(name = "__hold", hide = true)]
@@ -1476,6 +1506,61 @@ pub enum HistoryCmd {
         // as `None`/`false` while looking real. app.rs reads the flags
         // straight off `Cli`.
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeCmd {
+    /// Local speech recognition over the OpenAI-compatible transcription
+    /// API (one engine load, many requests; needs the local-asr build)
+    Asr(AsrServeArgs),
+}
+
+/// `aido serve asr` arguments. The engine knobs are flags, not profile
+/// options on purpose: the same profile also serves `aido transcribe`
+/// over HTTP, and the openai-transcription adapter validates its options
+/// against its own whitelist (language only) — engine knobs there would
+/// fail that check. `serve` bypasses the normalizer's flag hoisting
+/// (whole argv goes to clap), so these parse after the subcommand word.
+#[derive(Debug, Clone, Args)]
+pub struct AsrServeArgs {
+    /// Profile carrying the model fields (asr, vad, punct)
+    #[arg(long, value_name = "NAME")]
+    pub profile: String,
+
+    /// Address to listen on
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
+    pub bind: String,
+
+    /// ASR family for flat layouts the detector cannot decide
+    /// (paraformer, firered-ctc)
+    #[arg(long, value_name = "FAMILY")]
+    pub family: Option<String>,
+
+    /// Pin the recognition language at startup (the engine cannot switch
+    /// languages at runtime)
+    #[arg(long, value_name = "LANG")]
+    pub language: Option<String>,
+
+    /// ONNX inference threads for the recognizer
+    #[arg(long, value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Decode budget per request in seconds
+    #[arg(long, value_name = "SECS", default_value = "3600")]
+    pub max_audio_secs: u64,
+
+    /// Concurrent recognition sessions; further requests answer 503
+    #[arg(long, value_name = "N", default_value = "8")]
+    pub max_active_sessions: usize,
+
+    /// Request body limit in MiB
+    #[arg(long, value_name = "MB", default_value = "512")]
+    pub max_body_mb: u64,
+
+    /// Per-request hard wall in seconds (default: stretches with the
+    /// audio length)
+    #[arg(long, value_name = "SECS")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[cfg(test)]

@@ -49,6 +49,22 @@ fn mpeg_headers_and_id3_still_classify_as_audio() {
 }
 
 #[test]
+fn ebml_doctype_tells_matroska_from_webm() {
+    // The committed fixtures carry real EBML headers.
+    let webm = include_bytes!("../audio/testdata/tone.webm");
+    assert_eq!(audio_type(webm), Some(("audio/webm", "webm")));
+    let mkv = include_bytes!("../audio/testdata/av.mkv");
+    assert_eq!(audio_type(mkv), Some(("audio/x-matroska", "mkv")));
+    // Shared magic alone classifies as neither: the DocType decides.
+    let bare = [0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x00, 0x00, 0x00];
+    assert_eq!(audio_type(&bare), None);
+    // A matroska file still enters the transcription pipeline as audio.
+    let part = classify("recording.mkv", mkv.to_vec(), InputSource::Stdin, 0).unwrap();
+    assert_eq!(part.kind, MediaKind::Audio);
+    assert_eq!(part.mime, "audio/x-matroska");
+}
+
+#[test]
 fn piped_stdin_alone_is_material() {
     let mut e = env(b"hello\n");
     let parts = gather(&[], true, None, false, &mut e).unwrap();

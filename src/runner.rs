@@ -257,6 +257,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         total_timeout: plan.total_timeout,
         adapter: plan.resolved.adapter,
     };
+    let checkpoint = crate::transcription::Checkpoint::open(plan).map_err(AppError::from)?;
     let client = Client::new(&conn).map_err(AppError::from)?;
 
     // `--total-timeout` caps the whole run, not any single request: one
@@ -520,11 +521,20 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         // `on_delta` borrow) before the reply handling below.
         let result = {
             let send = async {
-                if plan.transport_stream {
-                    client.generate_stream(&request, &mut on_delta).await
-                } else {
-                    client.generate(&request).await
+                if let Some(state) = &checkpoint {
+                    if let Some(reply) = state.load(step.index)? {
+                        return Ok(reply);
+                    }
                 }
+                let reply = if plan.transport_stream {
+                    client.generate_stream(&request, &mut on_delta).await?
+                } else {
+                    client.generate(&request).await?
+                };
+                if let Some(state) = &checkpoint {
+                    state.save(step.index, &reply)?;
+                }
+                Ok(reply)
             };
             // The budget is enforced inside the edge-tts adapter as well
             // (it receives total_timeout through Connection); for edge
@@ -554,6 +564,16 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 }
             }
         };
+        let result = result.map_err(|error| {
+            if let Some(dir) = &plan.transcribe_state {
+                error.context(format!(
+                    "transcription segment {}/{} failed; completed segments are in {}; rerun the same command to resume",
+                    step.index + 1, plan.steps.len(), dir.display()
+                ))
+            } else {
+                error
+            }
+        });
         match result {
             Ok(mut reply) => {
                 steps_done += 1;
