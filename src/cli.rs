@@ -130,6 +130,8 @@ const FLAGS: &[(&str, bool)] = &[
     ("--max-tokens", true),
     ("--temperature", true),
     ("--option", true),
+    ("--audio-chunk-secs", true),
+    ("--transcribe-state", true),
     ("--timeout", true),
     ("--total-timeout", true),
     ("--to", true),
@@ -1374,6 +1376,14 @@ pub struct Cli {
     #[arg(long = "option", value_name = "KEY=VALUE")]
     pub options: Vec<String>,
 
+    /// Maximum transcription segment duration (default 60; --no-split disables)
+    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u32).range(1..=600), conflicts_with = "no_split")]
+    pub audio_chunk_secs: Option<u32>,
+
+    /// Override the automatic transcription recovery directory
+    #[arg(long, value_name = "DIR", conflicts_with = "no_split")]
+    pub transcribe_state: Option<std::path::PathBuf>,
+
     /// Header-wait and network-idle timeout in seconds (default 120)
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
@@ -1418,7 +1428,7 @@ pub struct Cli {
     #[arg(long, value_name = "WxH")]
     pub size: Option<String>,
 
-    /// Send inputs whole instead of slicing/chunking (ocr, summarize, translate)
+    /// Send inputs whole instead of slicing/chunking (ocr, summarize, translate, transcribe)
     #[arg(long)]
     pub no_split: bool,
 

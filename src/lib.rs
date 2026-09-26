@@ -25,6 +25,7 @@ pub mod runner;
 pub mod serve;
 pub mod spinner;
 pub mod tasks;
+mod transcription;
 pub mod watch;
 
 #[cfg(test)]

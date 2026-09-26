@@ -74,6 +74,7 @@ pub struct ExecutionPlan {
     pub delivery: DeliveryMode,
     pub timeout: Duration,
     pub total_timeout: Option<Duration>,
+    pub transcribe_state: Option<std::path::PathBuf>,
     pub record_history: bool,
     pub quiet: bool,
     pub json: bool,
@@ -210,8 +211,38 @@ fn plan_from(
     validate_inputs(task, &resolved, &inputs)?;
     validate_adapter_availability(&resolved)?;
     edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
-    let processor = select_processor(cli, task);
-    let steps = if task.per_part {
+    let explicit_audio_split = cli.audio_chunk_secs.is_some() || cli.transcribe_state.is_some();
+    let transcription = resolved.adapter == crate::api::Adapter::Transcription && !task.per_part;
+    validate_transcription_flags(cli, task, &resolved)?;
+    let audio_steps = if transcription
+        && !cli.no_split
+        && (cfg!(feature = "audio-decode") || explicit_audio_split)
+    {
+        match crate::transcription::plan_steps(&inputs, cli.audio_chunk_secs.unwrap_or(60)) {
+            Ok(steps) if explicit_audio_split || steps.len() > 1 => Some(steps),
+            Ok(_) => None, // Short audio keeps its original encoding and request.
+            Err(error) if !explicit_audio_split => {
+                if !cli.quiet {
+                    eprintln!(
+                        "note: cannot split audio locally; sending the original file ({error:#})"
+                    );
+                }
+                None
+            }
+            Err(error) => return Err(AppError::usage(format!("{error:#}"))),
+        }
+    } else {
+        None
+    };
+    let split_audio = audio_steps.is_some();
+    let processor = if split_audio {
+        ProcessorKind::ChunkJoin
+    } else {
+        select_processor(cli, task)
+    };
+    let steps = if let Some(steps) = audio_steps {
+        Ok(steps)
+    } else if task.per_part {
         processors::perpart::plan_steps(&inputs, processor, cli.quiet)
     } else {
         processors::plan_steps(&inputs, processor, cli.quiet)
@@ -347,7 +378,7 @@ fn plan_from(
 
     let param_sources = describe_param_sources(cli, task, &resolved);
 
-    Ok(ExecutionPlan {
+    let mut plan = ExecutionPlan {
         task: task.clone(),
         resolved,
         instruction,
@@ -364,6 +395,7 @@ fn plan_from(
         delivery,
         timeout,
         total_timeout,
+        transcribe_state: cli.transcribe_state.clone(),
         record_history: !cli.no_history && cfg.settings.history_keep.unwrap_or(DEFAULT_KEEP) > 0,
         quiet: cli.quiet,
         json: cli.json,
@@ -371,7 +403,13 @@ fn plan_from(
         credentials_available,
         terminal,
         stage_label: None,
-    })
+    };
+    if split_audio && plan.steps.len() > 1 && plan.record_history && plan.transcribe_state.is_none()
+    {
+        plan.transcribe_state =
+            Some(crate::transcription::default_state_dir(&plan).map_err(AppError::from)?);
+    }
+    Ok(plan)
 }
 
 /// The runner closes a per-part group whenever the next step's `part`
@@ -467,6 +505,7 @@ pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config, last: bool) 
         resolve::resolve(cli, cfg, task).map_err(|e| AppError::usage(format!("{e:#}")))?;
     apply_param_options(cli, task, &mut resolved)?;
     validate_adapter_availability(&resolved)?;
+    validate_transcription_flags(cli, task, &resolved)?;
     let instruction = compose_instruction(cli, task)?;
     let requirement = cli.prompt.clone().filter(|p| !p.trim().is_empty());
     edge_tts_instruction_check(&resolved, &instruction, requirement.as_deref())?;
@@ -482,6 +521,19 @@ pub(crate) fn preflight_stage(cli: &Cli, task: &Task, cfg: &Config, last: bool) 
     validate_format_outputs(cli, &mut resolved)?;
     if last {
         validate_delivery_outputs(cli, &mut resolved)?;
+    }
+    Ok(())
+}
+
+/// Material-independent validation shared with chain preflight, so invalid
+/// flags on a later stage fail before earlier stages send paid requests.
+fn validate_transcription_flags(cli: &Cli, task: &Task, resolved: &Resolved) -> AppResult<()> {
+    if (cli.audio_chunk_secs.is_some() || cli.transcribe_state.is_some())
+        && (resolved.adapter != crate::api::Adapter::Transcription || task.per_part)
+    {
+        return Err(AppError::usage(
+            "--audio-chunk-secs and --transcribe-state require a single transcription task",
+        ));
     }
     Ok(())
 }
@@ -1154,6 +1206,9 @@ pub fn describe(plan: &ExecutionPlan) -> String {
         out.push_str(&format!("processing:  per-part batch — {strategy}\n"));
     } else {
         out.push_str(&format!("processing:  {strategy}\n"));
+    }
+    if let Some(dir) = &plan.transcribe_state {
+        out.push_str(&format!("transcription state: {}\n", dir.display()));
     }
     out.push_str(&format!(
         "produce:     {}\n",

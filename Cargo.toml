@@ -7,7 +7,7 @@ rust-version = "1.88"
 description = "Send material to an AI task (OCR, translate, TTS, images, ...) and deliver the result to stdout, files or the clipboard"
 
 [features]
-default = ["edge-tts"]
+default = ["edge-tts", "audio-decode"]
 # Keyless Microsoft Read-Aloud TTS. Optional: closing it drops the whole
 # kothok-edge-tts subtree (and aws-lc-sys, which needs cmake) from the
 # build graph. Build with --no-default-features for an aido without TTS.
@@ -20,7 +20,8 @@ edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
 pdfium = []
 # Offline audio decoding for the transcription pipeline (src/audio.rs):
 # asr-core's decode-symphonia demuxes + decodes material into mono f32
-# samples, the shape the local ASR engine consumes. Off by default; the
+# samples, the shape the local ASR engine consumes. On by default for
+# client-side transcription segmentation; the
 # decode logic, format coverage (mp3, m4a/aac, flac, ogg/vorbis, mkv, wav)
 # and failure philosophy live upstream — this crate keeps only policy
 # (cloud-route guidance, empty results, the sample budget). symphonia's
@@ -81,6 +82,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # audio-decode feature（见上）：解码逻辑与失败哲学在 asr-core，本 crate 的
 # src/audio.rs 只做策略薄层。asr-core 0.0.2 声明 MSRV 1.88，与 aido 相同；
 # = 锁定为显式契约——0.0.x 不承诺兼容，升级永远是主动行为。

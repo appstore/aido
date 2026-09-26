@@ -89,6 +89,25 @@ aido transcribe meeting.mp3 -o meeting.txt      # 输入恰好一个音频文件
 aido transcribe voice-note.m4a --copy
 ```
 
+长音频默认按 **60 秒**分段，并自动保存恢复进度，通常只需：
+
+```bash
+aido transcribe meeting.mp3 -o meeting.txt
+# 中断或失败后重复同一命令：已完成段直接读取，仅请求未完成段。
+
+# 需要时覆盖默认段长或恢复目录：
+aido transcribe meeting.mp3 --audio-chunk-secs 30 --transcribe-state ./meeting.transcribe -o meeting.txt
+aido transcribe meeting.mp3 --no-split -o meeting.txt  # 关闭分段，整文件发送
+```
+
+`--audio-chunk-secs` 接受 1–600 秒，表示每段最长时长，默认 60 秒；切点优先选最后 5 秒内（不超过半段）的连续约 200ms 静音（RMS < 0.01），没有静音则按时长切开。各段不重叠、不做文本去重，按顺序以段落分隔合并，因此不会误删真实的重复话语；连续说话的硬切点仍可能影响识别质量，可调大段长。每段仍受 `--timeout` 限制，`--total-timeout` 限制本次执行的请求总预算。未显式指定分段参数时，60 秒以内的短音频保留原始编码、只发一次请求。
+
+自动恢复目录位于历史目录的同级目录 `history-transcription/<内容与参数摘要>/`；设置 `AIDO_HISTORY_DIR` 时，在该目录名后追加 `-transcription` 作为恢复根目录。音频内容、实际分段、服务地址、模型、语言及提示等参数共同决定子目录，因此不同输入或参数自动分开保存。`--dry-run` 会显示所选恢复目录，但不创建它。仅多段转写自动保存；`--no-history` 或 `settings.history_keep = 0` 会关闭自动保存及复用，但继续分段。
+
+`--transcribe-state DIR` 可单独使用，覆盖自动目录并采用默认段长，也可与 `--audio-chunk-secs` 一起使用；它是显式保存要求，因此即使 `--no-history` 也保存，包括只有一段的音频。指定目录不匹配当前输入或参数时拒绝复用，请更换目录。每段完整回复原子保存，失败即停止；重跑命令恢复，不自动重试。完成后保留目录便于重新交付，可自行删除；恢复文件包含转写文本，独立于历史清理。不要让多个进程同时处理同一目录，以免重复请求。
+
+分段使用默认构建包含的 `audio-decode`，支持本地解码的 MP3、M4A/AAC、FLAC、OGG/Vorbis、MKV、WAV。默认模式下，本地解码失败（例如 WebM/Opus）会提示并回退为整文件发送；不含 `audio-decode` 的构建也保持整文件发送。显式指定分段或恢复目录时则报错，不静默降级；可转换格式或用 `--features audio-decode` 重新构建。当前解码和分段数据仍驻留内存，单个输入仍受现有 32 MiB 限制（`settings.input_bytes` 只调整总预算，不能放宽单文件限制），这项功能解决长请求和恢复问题，不是流式磁盘解码。
+
 ### 离线转写（实验性，`serve asr`）
 
 云端路由之外的本地引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 模型经 asr-core 在本机推理，零网络。本地转写以**常驻服务**形式提供：`aido serve asr` 启动时加载一次模型，以 OpenAI 兼容的 HTTP 接口对外服务——`aido transcribe` 本身零变动（走已有的 openai-transcription 适配器指到本地服务即可），任何会说 OpenAI 协议的工具也都能直接用这个引擎。默认构建不包含；源码构建需要 `--features local-asr`（sherpa-onnx 是 C++ 源码构建，要求系统装有 **cmake** 与 C++ 工具链）。
@@ -409,7 +428,7 @@ Profile 选择顺序：`--profile` → 任务默认 → `AIDO_PROFILE` → `defa
 | `summarize` | generate | text | text | `--no-split` |
 | `code-review` | generate | text | text | |
 | `tts` | speech | text | audio | `--voice` `--speed` |
-| `transcribe` | transcribe | 恰好一个 audio | text | |
+| `transcribe` | transcribe | 恰好一个 audio | text | `--audio-chunk-secs SECS` `--transcribe-state DIR` |
 | `image` | image | text | image | `--count` `--size` |
 | `ask` | generate | 任意（可无材料） | text | |
 
