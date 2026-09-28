@@ -295,12 +295,12 @@ default_profile = "vision"
 [providers.cloud]
 base_url = "https://example.invalid/v1"
 api_key_env = "MY_AI_API_KEY"
-
-[providers.cloud.routes]
-generate = "openai-chat"       # 或 openai-responses
-speech = "openai-speech"
-transcribe = "openai-transcription"
-image = "openai-images"
+# 路由键为操作名，值为适配器名（共 6 种）；只写与默认不同的路由：
+#   generate:   openai-chat（默认）或 openai-responses
+#   speech:     openai-speech（默认）或 edge-tts（免密钥，自带端点）
+#   transcribe: openai-transcription（默认）
+#   image:      openai-images（默认）
+routes = { generate = "openai-responses" }
 
 [profiles.vision]
 provider = "cloud"

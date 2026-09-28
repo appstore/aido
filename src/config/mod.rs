@@ -344,9 +344,8 @@ pub fn init() -> Result<()> {
 const SAMPLE_SPEECH_ROUTE: &str = r#"
 # Speech routes to the keyless Edge Read Aloud protocol (Microsoft's
 # unofficial endpoint; the text is sent there, no API key). Delete the
-# speech line to use OpenAI's speech API, which needs the key above.
-[providers.openai.routes]
-speech = "edge-tts"
+# routes line to use OpenAI's speech API, which needs the key above.
+routes = { speech = "edge-tts" }
 "#;
 
 #[cfg(not(feature = "edge-tts"))]
@@ -354,8 +353,7 @@ const SAMPLE_SPEECH_ROUTE: &str = r#"
 # This build excludes the edge-tts adapter, so the keyless speech route
 # below stays commented out (rebuild with --features edge-tts to enable
 # it); speech then uses OpenAI's speech API, which needs the key above.
-# [providers.openai.routes]
-# speech = "edge-tts"
+# routes = { speech = "edge-tts" }
 "#;
 
 /// The sample `config init` writes: head, the feature-gated speech-route
@@ -410,17 +408,17 @@ model = "{MODEL_PLACEHOLDER}"
 #
 # Then: aido ocr shot.png --profile vision
 
-# Speech / transcription / images use the same provider with explicit
-# routes when your server needs a different protocol per operation:
+# Operations can share one provider with a different protocol each.
+# Keys are operations, values are adapters — all six:
+#   generate:   openai-chat (default) or openai-responses
+#   speech:     openai-speech (default) or edge-tts (keyless, own endpoint)
+#   transcribe: openai-transcription (default)
+#   image:      openai-images (default)
+# Only routes that differ from the default need writing:
 # [providers.cloud]
 # base_url = "https://example.invalid/v1"
 # api_key_env = "MY_AI_API_KEY"
-#
-# [providers.cloud.routes]
-# generate = "openai-chat"       # or openai-responses
-# speech = "openai-speech"
-# transcribe = "openai-transcription"
-# image = "openai-images"
+# routes = { generate = "openai-responses" }
 #
 # [profiles.speech]
 # provider = "cloud"
