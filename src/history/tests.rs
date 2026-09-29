@@ -26,6 +26,54 @@ fn only_stamped_names_are_entries() {
     assert!(!is_stamp("20260909-153012"));
 }
 
+/// A manifest's list-view labels: counts and timestamps, never bytes —
+/// the projection `load_meta` serves and the web UI's run list reads.
+#[test]
+fn meta_counts_without_reading_bytes() {
+    let manifest = Manifest {
+        version: 1,
+        run_id: "20260909-153012.123".into(),
+        task: Some("ocr".into()),
+        created_at: "2026-09-09T15:30:12Z".into(),
+        summary: Default::default(),
+        generation: GenerationStatus::Complete,
+        warnings: vec!["part 'b.png' failed: 500".into()],
+        failed_parts: vec![("b.png".into(), "500".into())],
+        parts_total: 2,
+        deliveries: Vec::new(),
+        stages: Vec::new(),
+        last_stage_len: 0,
+        artifacts: vec![
+            ManifestArtifact {
+                id: "a".into(),
+                kind: MediaKind::Text,
+                mime: "text/plain".into(),
+                format: "text".into(),
+                file: "a.txt".into(),
+                size: 3,
+                provenance: None,
+            },
+            ManifestArtifact {
+                id: "b".into(),
+                kind: MediaKind::Text,
+                mime: "text/plain".into(),
+                format: "text".into(),
+                file: "b.txt".into(),
+                size: 0,
+                provenance: None,
+            },
+        ],
+    };
+    let meta = meta_from(&manifest);
+    assert_eq!(meta.task.as_deref(), Some("ocr"));
+    assert_eq!(meta.created_at, "2026-09-09T15:30:12Z");
+    assert_eq!(meta.artifacts, 2);
+    assert_eq!(meta.warnings, 1);
+    assert_eq!(meta.failed_parts, 1);
+    assert_eq!(meta.parts_total, 2);
+    assert!(matches!(meta.generation, GenerationStatus::Complete));
+}
+
 /// The manifest round-trip is what save/load actually do: write_manifest
 /// serializes the Manifest (its artifacts included), read_manifest parses
 /// it back. Provenance must survive that loop, and records written

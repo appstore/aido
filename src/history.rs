@@ -295,6 +295,11 @@ pub struct RunMeta {
     pub generation: GenerationStatus,
     pub failed_parts: usize,
     pub parts_total: usize,
+    /// When the run was recorded (ISO 8601, from the manifest).
+    pub created_at: String,
+    /// Recorded artifacts and warnings, counted without reading bytes.
+    pub artifacts: usize,
+    pub warnings: usize,
 }
 
 /// One run's metadata without its artifact bytes. Same existence and
@@ -304,12 +309,20 @@ pub fn load_meta(run_id: &str) -> Result<Option<RunMeta>> {
     let Some((_, manifest)) = open_manifest(run_id)? else {
         return Ok(None);
     };
-    Ok(Some(RunMeta {
+    Ok(Some(meta_from(&manifest)))
+}
+
+/// The manifest-only projection: counts and labels, never bytes.
+fn meta_from(manifest: &Manifest) -> RunMeta {
+    RunMeta {
         failed_parts: manifest.failed_parts.len(),
         parts_total: manifest.parts_total,
-        task: manifest.task,
-        generation: manifest.generation,
-    }))
+        task: manifest.task.clone(),
+        generation: manifest.generation.clone(),
+        created_at: manifest.created_at.clone(),
+        artifacts: manifest.artifacts.len(),
+        warnings: manifest.warnings.len(),
+    }
 }
 
 /// The most recent complete generation. A damaged entry is skipped (with
