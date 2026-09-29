@@ -299,6 +299,10 @@ async fn dispatch(
         Some(Commands::Config { cmd }) => return manage_config(cmd),
         Some(Commands::History { cmd }) => return manage_history(&cli, cmd).await,
         Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs).await,
+        // The server runs until Ctrl+C; its errors map to exit codes the
+        // same way every other command's do.
+        #[cfg(feature = "ui")]
+        Some(Commands::Ui { port, no_open }) => return crate::ui::serve(*port, *no_open).await,
         None => {}
     }
 

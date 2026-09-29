@@ -7,11 +7,18 @@ rust-version = "1.88"
 description = "Send material to an AI task (OCR, translate, TTS, images, ...) and deliver the result to stdout, files or the clipboard"
 
 [features]
-default = ["edge-tts"]
+default = ["edge-tts", "ui"]
 # Keyless Microsoft Read-Aloud TTS. Optional: closing it drops the whole
 # kothok-edge-tts subtree (and aws-lc-sys, which needs cmake) from the
 # build graph. Build with --no-default-features for an aido without TTS.
 edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
+# The local web UI (`aido ui`): an axum server on 127.0.0.1 serving an
+# SPA embedded via rust-embed. Release builds inline ui/dist at compile
+# time; debug builds read the folder from disk, so a cargo-only checkout
+# (which ships a placeholder index.html) builds and runs without node —
+# CI builds the real assets before release builds. Pure Rust throughout:
+# no new C, and --no-default-features drops it with everything else.
+ui = ["dep:axum", "dep:rust-embed", "tokio/net"]
 # Static pdfium rendering for PDFs aido cannot extract anything from
 # (vector-drawn pages). Off by default: the build needs PDFIUM_LIB_DIR
 # pointing at a static pdfium archive (see build.rs), and the binary
@@ -26,6 +33,10 @@ pdfium = []
 anydoc = "0.2"
 anyhow = "1"
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
+# Web UI 服务器（"ui" feature，默认开启）：axum 自带 hyper/tower 服务栈，
+# 只听 127.0.0.1、不需要 TLS；multipart 供 POST /api/runs 上传文件。纯
+# Rust，无 C 依赖，--no-default-features 构建整体甩掉。
+axum = { version = "0.8", features = ["multipart"], optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
@@ -50,6 +61,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "mul
 # reqwest 的 TLS 配套（见上）：provider 与 feature 形状（ring/std/tls12）和
 # kothok-edge-tts 经 tokio-rustls 的解析保持一致，全树只编译一份 rustls。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# 前端静态资源内嵌（"ui" feature）：release 构建编译期内联 ui/dist，
+# debug 构建运行时读盘（cargo-only 检出凭占位 index.html 也能构建）。
+# 不开 debug-embed，保持 debug 的读盘行为作为前端开发回路。
+rust-embed = { version = "8", optional = true }
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

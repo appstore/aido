@@ -27,7 +27,7 @@ impl clap::ValueEnum for MediaKind {
 /// (`aido run NAME` reaches a custom task with such a name).
 pub const RESERVED_WORDS: &[&str] = &[
     "tasks", "profiles", "config", "history", "run", "ask", "last", "watch", "help", "version",
-    "__hold", "chain",
+    "__hold", "chain", "ui",
 ];
 
 /// The recovery pseudo-task behind `aido last`.
@@ -355,6 +355,25 @@ pub fn normalize(argv: Vec<OsString>) -> Result<Normalized> {
     if argv.first().and_then(|t| t.to_str()) == Some("watch") {
         return normalize_watch(argv);
     }
+    // `aido ui` owns flags that are not top-level run flags (--port,
+    // --no-open); hoisting them ahead of the word — the management
+    // passthrough below — would hand clap `["--no-open", "ui"]` and fail
+    // at the top level. The whole line goes to clap untouched, exactly
+    // like watch's parent argv. Flags written before the word
+    // (`aido --quiet ui`) still ride the passthrough: they are top-level
+    // flags there.
+    if argv.first().and_then(|t| t.to_str()) == Some("ui") {
+        if cfg!(feature = "ui") {
+            return Ok(Normalized::Single {
+                task: None,
+                specs: Vec::new(),
+                argv,
+            });
+        }
+        bail!(
+            "this build has no web UI; rebuild with `--features ui` (the CLI tasks work as usual)"
+        );
+    }
     if let Some(segments) = split_on_then(&argv) {
         let mut stages = Vec::new();
         for segment in segments {
@@ -543,7 +562,13 @@ fn normalize_stage(argv: Vec<OsString>) -> Result<StageArgv> {
     // `last` branch applies; positional/file arguments are clap's to
     // reject (at `usize::MAX` only `--text`/`--paste` survive into specs).
     if let Some(word) = first {
-        if matches!(word, "tasks" | "profiles" | "config" | "history") {
+        // The web UI rides the management passthrough when compiled in;
+        // a build without it says so instead of hunting a task named
+        // "ui".
+        if word == "ui" && !cfg!(feature = "ui") {
+            bail!("this build has no web UI; rebuild with `--features ui` (the CLI tasks work as usual)");
+        }
+        if matches!(word, "tasks" | "profiles" | "config" | "history" | "ui") {
             if prompt_seen {
                 bail!("`-p` has no effect on management commands; pass the instruction to a task run instead");
             }
@@ -1429,6 +1454,16 @@ pub enum Commands {
     History {
         #[command(subcommand)]
         cmd: HistoryCmd,
+    },
+    /// Serve the local web UI on 127.0.0.1
+    #[cfg(feature = "ui")]
+    Ui {
+        /// Port to listen on (default: an ephemeral free one)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the URL without opening a browser
+        #[arg(long)]
+        no_open: bool,
     },
     /// Internal: hold clipboard contents in the background (Linux)
     #[command(name = "__hold", hide = true)]

@@ -374,6 +374,36 @@ fn hold_passes_through_untouched() {
     assert_eq!(n.argv, os(&["__hold", "5", "--image"]));
 }
 
+#[cfg(feature = "ui")]
+#[test]
+fn ui_passes_through_untouched_when_first() {
+    // `aido ui` owns flags that are not top-level run flags (--port,
+    // --no-open); hoisting them ahead of the word — what the management
+    // passthrough does — hands clap `["--no-open", "ui"]` and fails at
+    // the top level. The whole line must reach clap verbatim.
+    let n = crate::cli::normalize(os(&["ui", "--port", "18711", "--no-open"])).unwrap();
+    let Normalized::Single { task, specs, argv } = n else {
+        panic!("ui is a single invocation, not a chain or watch");
+    };
+    assert_eq!(task, None);
+    assert!(specs.is_empty());
+    assert_eq!(argv, os(&["ui", "--port", "18711", "--no-open"]));
+}
+
+#[cfg(feature = "ui")]
+#[test]
+fn ui_after_top_level_flags_rides_the_management_passthrough() {
+    // Top-level flags before the word are Cli flags; the word stays
+    // after them, where clap matches the subcommand.
+    let n = crate::cli::normalize(os(&["--quiet", "ui"])).unwrap();
+    let Normalized::Single { task, argv, .. } = n else {
+        panic!("ui is a single invocation");
+    };
+    assert_eq!(task, None);
+    assert_eq!(argv[0], OsString::from("--quiet"));
+    assert_eq!(argv[1], OsString::from("ui"));
+}
+
 #[test]
 fn flag_values_are_not_mistaken_for_tasks() {
     assert_eq!(task_of(&["--profile", "local", "ocr", "a.png"]), "ocr");

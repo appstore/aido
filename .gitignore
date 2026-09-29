@@ -1,3 +1,9 @@
 __pycache__/
 /target
 /.zcode/
+
+# Web UI frontend: only the placeholder entry page is tracked; the real
+# dist is built by npm (CI does it before release builds).
+ui/node_modules/
+ui/dist/*
+!ui/dist/index.html
