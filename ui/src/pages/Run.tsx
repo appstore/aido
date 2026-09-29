@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ApiError, cancelRun, getRun, listProfiles, listTasks, previewRun, startRun } from '../api';
 import ArtifactViewer from '../components/ArtifactViewer';
+import Deliveries from '../components/Deliveries';
 import Dropzone from '../components/Dropzone';
 import ParamForm, { type ParamValues } from '../components/ParamForm';
 import PlanPreview from '../components/PlanPreview';
@@ -24,6 +25,11 @@ export default function Run() {
   const [model, setModel] = useState('');
   const [advanced, setAdvanced] = useState(false);
   const [noSplit, setNoSplit] = useState(false);
+  // Server-side delivery: a name under aido's deliveries directory (the
+  // whitelist rule); -o and --out-dir conflict on the CLI, so setting
+  // one clears the other here.
+  const [outDir, setOutDir] = useState('');
+  const [outFile, setOutFile] = useState('');
   // What --profile may name: the config's own profiles, or the built-in
   // "default" when the user defined none (the config's own rule).
   const [profileNames, setProfileNames] = useState<string[]>(['default']);
@@ -90,9 +96,11 @@ export default function Run() {
       }
     }
     if (noSplit) body.no_split = true;
+    if (outDir.trim()) body.out_dir = outDir.trim();
+    if (outFile.trim()) body.out_file = outFile.trim();
     if (texts.length > 0) body.texts = texts;
     return body as unknown as RunRequestPayload;
-  }, [task, taskName, params, prompt, profile, model, noSplit, texts]);
+  }, [task, taskName, params, prompt, profile, model, noSplit, outDir, outFile, texts]);
 
   const equivalent = useMemo(() => {
     const parts = ['aido', taskName, ...files.map((f) => f.name)];
@@ -100,6 +108,8 @@ export default function Run() {
     if (profile.trim()) parts.push(`--profile ${profile.trim()}`);
     if (model.trim()) parts.push(`--model ${model.trim()}`);
     if (noSplit) parts.push('--no-split');
+    if (outDir.trim()) parts.push(`--out-dir <deliveries>/${outDir.trim()}`);
+    if (outFile.trim()) parts.push(`-o <deliveries>/${outFile.trim()}`);
     if (task) {
       for (const spec of task.params) {
         const value = (params[spec.name] ?? '').trim();
@@ -119,7 +129,7 @@ export default function Run() {
     }
     for (const text of texts) parts.push(`--text ${JSON.stringify(text)}`);
     return parts.join(' ');
-  }, [task, taskName, params, prompt, profile, model, noSplit, files, texts]);
+  }, [task, taskName, params, prompt, profile, model, noSplit, outDir, outFile, files, texts]);
 
   async function doPreview() {
     setPreviewError('');
@@ -257,6 +267,7 @@ export default function Run() {
               ))}
             </ul>
           )}
+          <Deliveries report={report} />
           <ArtifactViewer
             runId={report.run_id}
             artifacts={report.artifacts}
@@ -356,6 +367,40 @@ export default function Run() {
                 </div>
               </div>
             )}
+          </section>
+
+          <section className="card">
+            <div className="card-title">4 · 交付（可选）</div>
+            <div className="hint-line" style={{ marginBottom: 10 }}>
+              默认交付给浏览器；这里改为写入服务器磁盘 —— 名字只落在 aido
+              的交付目录（deliveries）之内，不能是路径。
+            </div>
+            <div className="param-row">
+              <div className="param">
+                <label htmlFor="out-dir">--out-dir</label>
+                <input
+                  id="out-dir"
+                  value={outDir}
+                  placeholder="子目录名，如 job-1"
+                  onChange={(e) => {
+                    setOutDir(e.target.value);
+                    if (e.target.value.trim()) setOutFile('');
+                  }}
+                />
+              </div>
+              <div className="param">
+                <label htmlFor="out-file">-o 文件名</label>
+                <input
+                  id="out-file"
+                  value={outFile}
+                  placeholder="文件名，如 report.txt"
+                  onChange={(e) => {
+                    setOutFile(e.target.value);
+                    if (e.target.value.trim()) setOutDir('');
+                  }}
+                />
+              </div>
+            </div>
           </section>
 
           <section className="card actions-card">

@@ -85,6 +85,9 @@ export interface RunReport {
   stages?: RunSummary[];
   last_stage_len?: number;
   error?: { kind: string; message: string };
+  // Server-side delivery only: artifact id → absolute saved path (the
+  // done frame carries it; history detail does not).
+  saved?: Record<string, string>;
 }
 
 export interface Preview {
@@ -124,6 +127,10 @@ export interface RunRequestPayload {
   no_split?: boolean;
   timeout_secs?: number;
   total_timeout_secs?: number;
+  // Server-side delivery, the whitelist form: a NAME under aido's
+  // deliveries directory, never a free-form path.
+  out_dir?: string;
+  out_file?: string;
   texts?: string[];
 }
 

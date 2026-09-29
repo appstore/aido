@@ -494,17 +494,21 @@ async fn parse_multipart<T: serde::de::DeserializeOwned>(
 
 /// Land the uploads and build the plan — the blocking half of starting
 /// a run, off the async workers. Returns Err with the message the CLI
-/// would have printed for the same mistake.
+/// would have printed for the same mistake, plus whether the request
+/// asked for server-side delivery (the whitelist's `out_dir`/`out_file`
+/// — the plan alone cannot say, its per-part placeholder is also a
+/// directory destination).
 fn prepare(
     request: RunRequest,
     files: Vec<(String, Vec<u8>)>,
-) -> Result<crate::plan::ExecutionPlan, AppError> {
+) -> Result<(crate::plan::ExecutionPlan, bool), AppError> {
+    let deliver = request.out_dir.is_some() || request.out_file.is_some();
     let (landed, paths) = invoke::land_uploads(files)?;
     let invocation = invoke::parse(&request, &paths)?;
     let plan = invoke::build_plan(&invocation)?;
     // The plan holds the gathered inputs; the landed copies can go.
     drop(landed);
-    Ok(plan)
+    Ok((plan, deliver))
 }
 
 /// Start a run. The plan (validation included) is built here, so every
@@ -517,8 +521,8 @@ async fn runs_create(State(state): State<Arc<UiState>>, multipart: Multipart) ->
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
     let built = tokio::task::spawn_blocking(move || prepare(request, files)).await;
-    let plan = match built {
-        Ok(Ok(plan)) => plan,
+    let (plan, deliver) = match built {
+        Ok(Ok(built)) => built,
         Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     };
@@ -527,7 +531,7 @@ async fn runs_create(State(state): State<Arc<UiState>>, multipart: Multipart) ->
     } else {
         history::stamp_now()
     };
-    runs::spawn(plan, state.runs.clone(), run_id.clone());
+    runs::spawn(plan, state.runs.clone(), run_id.clone(), deliver);
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "run_id": run_id })),

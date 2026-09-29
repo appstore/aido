@@ -661,9 +661,123 @@ async fn preview_describes_the_plan_without_running_it() {
 #[tokio::test]
 async fn unknown_request_fields_are_refused() {
     let server = UiServer::start(&[("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history")]);
-    let request = serde_json::json!({ "task": "summarize", "out_dir": "/tmp" });
+    let request = serde_json::json!({ "task": "summarize", "output": "/tmp/x" });
     let posted = post_run(&server, &request, &[]).await;
     assert_eq!(posted.status(), 400);
+}
+
+/// Server-side delivery is a whitelist, not an open path: `out_dir`
+/// names a component under aido's deliveries directory, and anything
+/// that could escape it answers with the CLI's own usage voice. The
+/// happy path then lands real files in that root only.
+#[tokio::test]
+async fn whitelisted_delivery_lands_under_the_deliveries_root() {
+    // Two runs, two replies, one port: the second run must talk to the
+    // same provider the server's config names.
+    let provider = MultiServer::start(&[chat_body("DELIVERED"), chat_body("FILE BODY")]);
+    let dir = temp_dir("ui-deliver");
+    let root = temp_dir("ui-deliveries");
+    let cfg = chat_cfg(&provider.url());
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ("AIDO_DELIVERY_DIR", root.to_str().unwrap()),
+    ]);
+
+    // A traversal-shaped name never becomes a path.
+    let sneaky = serde_json::json!({ "task": "summarize", "out_dir": "../escape" });
+    let refused = post_run(&server, &sneaky, &[("note.txt", b"hi")]).await;
+    assert_eq!(refused.status(), 400);
+    let message: String = refused.json::<serde_json::Value>().await.unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("deliveries"), "{message}");
+
+    // The real thing: a run with out_dir lands the artifact set plus
+    // its manifest inside the root, and the record carries the
+    // per-destination state.
+    let request = serde_json::json!({ "task": "summarize", "profile": "test", "out_dir": "job-1" });
+    let posted = post_run(&server, &request, &[("note.txt", b"hello")]).await;
+    assert_eq!(posted.status(), 202);
+    let run_id: String = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = poll_until(&server, &run_id, |d| {
+        !d["deliveries"].as_array().unwrap_or(&vec![]).is_empty()
+    })
+    .await;
+    let deliveries = detail["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1, "{detail}");
+    assert_eq!(deliveries[0]["status"], "succeeded", "{detail}");
+    assert_eq!(deliveries[0]["destination"]["type"], "directory");
+    let delivered_path = deliveries[0]["destination"]["path"].as_str().unwrap();
+    assert!(delivered_path.ends_with("job-1"), "{delivered_path}");
+    assert!(
+        std::path::Path::new(delivered_path).starts_with(&root),
+        "{delivered_path} vs {}",
+        root.display()
+    );
+    let job = root.join("job-1");
+    assert!(job.join("manifest.json").is_file());
+    assert_eq!(
+        std::fs::read_to_string(job.join("text.txt")).unwrap(),
+        "DELIVERED"
+    );
+
+    // `-o` as a file name: exactly one artifact, written under the same
+    // root; a second run at the same name is the CLI's knowable
+    // collision (usage, before any request).
+    let file_request =
+        serde_json::json!({ "task": "summarize", "profile": "test", "out_file": "report.txt" });
+    let posted = post_run(&server, &file_request, &[("note.txt", b"hi")]).await;
+    assert_eq!(posted.status(), 202);
+    let run_id: String = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = poll_until(&server, &run_id, |d| {
+        !d["deliveries"].as_array().unwrap_or(&vec![]).is_empty()
+    })
+    .await;
+    assert_eq!(detail["deliveries"][0]["status"], "succeeded", "{detail}");
+    assert_eq!(detail["deliveries"][0]["destination"]["type"], "file");
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "FILE BODY"
+    );
+
+    let collision = post_run(&server, &file_request, &[("note.txt", b"again")]).await;
+    assert_eq!(collision.status(), 400);
+    let message: String = collision.json::<serde_json::Value>().await.unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("already exists"), "{message}");
+}
+
+/// Poll the detail endpoint until the predicate holds (a finishing run
+/// records, delivers and updates its manifest in that order); returns
+/// the first detail that satisfies it.
+async fn poll_until(
+    server: &UiServer,
+    run_id: &str,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        let detail: serde_json::Value = server
+            .get(&format!("/api/runs/{run_id}"))
+            .await
+            .json()
+            .await
+            .unwrap();
+        if ready(&detail) {
+            return detail;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the run never reached the expected state");
 }
 
 #[tokio::test]

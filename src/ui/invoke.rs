@@ -15,9 +15,12 @@ use crate::input::InputEnv;
 use crate::plan::{ExecutionPlan, TerminalInfo};
 
 /// What the UI may ask a run to do — a deliberate whitelist. Delivery
-/// destinations (`-o`, `--copy`, `--out-dir`) are absent on purpose: the
-/// browser is the destination. Unknown fields are rejected so the
-/// contract stays honest.
+/// destinations are narrowed, not open: `out_dir`/`out_file` name a
+/// component under aido's dedicated deliveries directory (see
+/// [`delivery_path`]), never a free-form path — the browser stays the
+/// default destination, and the server's disk is only ever touched
+/// inside that one root. Unknown fields are rejected so the contract
+/// stays honest.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
@@ -34,9 +37,54 @@ pub struct RunRequest {
     pub no_split: bool,
     pub timeout_secs: Option<u64>,
     pub total_timeout_secs: Option<u64>,
+    /// `--out-dir` as a name under the deliveries directory.
+    pub out_dir: Option<String>,
+    /// `-o` as a file name under the deliveries directory.
+    pub out_file: Option<String>,
     /// Literal text material, in order, alongside the files.
     #[serde(default)]
     pub texts: Vec<String>,
+}
+
+/// The one directory server-side deliveries may land in: loopback UI or
+/// not, a browser request must never choose where files are written.
+pub fn deliveries_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("AIDO_DELIVERY_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    dirs::data_local_dir().map(|d| d.join("aido").join("deliveries"))
+}
+
+/// Resolve a requested delivery name into its one true path under
+/// [`deliveries_dir`]: a single path component (no separators, no `..`,
+/// no leading dot), so the request cannot escape the root. The name
+/// lands on disk verbatim — it is the file's name, not an id to
+/// sanitize.
+fn delivery_path(field: &str, name: &str) -> AppResult<PathBuf> {
+    let name = name.trim();
+    let bad = |why: &str| {
+        AppError::usage(format!(
+            "'{name}' is not a usable {field} name ({why}); it names a file under \
+             the deliveries directory"
+        ))
+    };
+    if name.is_empty() {
+        return Err(bad("empty"));
+    }
+    if name.len() > 128 {
+        return Err(bad("at most 128 bytes"));
+    }
+    if name.contains(['/', '\\']) || name == ".." || name.starts_with('.') || name.contains('\0') {
+        return Err(bad("one path component, not starting with '.'"));
+    }
+    let Some(root) = deliveries_dir() else {
+        return Err(AppError::usage(
+            "cannot determine the deliveries directory on this platform",
+        ));
+    };
+    Ok(root.join(name))
 }
 
 /// One parsed invocation: the same triple `app::dispatch` feeds
@@ -108,8 +156,9 @@ pub fn land_uploads(files: Vec<(String, Vec<u8>)>) -> AppResult<(Landed, Vec<Pat
 
 /// The argv a user could have typed: task first, flags (combined
 /// `--flag=value` form, so values that start with '-' stay values),
-/// then the material in order.
-fn argv_for(request: &RunRequest, files: &[PathBuf]) -> Vec<std::ffi::OsString> {
+/// then the material in order. Delivery names resolve to their true
+/// paths here — one place, so the preview and the run agree.
+fn argv_for(request: &RunRequest, files: &[PathBuf]) -> AppResult<Vec<std::ffi::OsString>> {
     let mut argv: Vec<std::ffi::OsString> = vec![request.task.clone().into()];
     let flag = |argv: &mut Vec<std::ffi::OsString>, name: &str, value: &str| {
         argv.push(format!("--{name}={value}").into());
@@ -147,6 +196,14 @@ fn argv_for(request: &RunRequest, files: &[PathBuf]) -> Vec<std::ffi::OsString> 
     if let Some(value) = request.total_timeout_secs {
         flag(&mut argv, "total-timeout", &value.to_string());
     }
+    if let Some(name) = &request.out_dir {
+        let path = delivery_path("out_dir", name)?;
+        flag(&mut argv, "out-dir", &path.to_string_lossy());
+    }
+    if let Some(name) = &request.out_file {
+        let path = delivery_path("out_file", name)?;
+        flag(&mut argv, "output", &path.to_string_lossy());
+    }
     for text in &request.texts {
         argv.push("--text".into());
         argv.push(text.into());
@@ -154,12 +211,12 @@ fn argv_for(request: &RunRequest, files: &[PathBuf]) -> Vec<std::ffi::OsString> 
     for file in files {
         argv.push(file.as_os_str().to_os_string());
     }
-    argv
+    Ok(argv)
 }
 
 pub fn parse(request: &RunRequest, files: &[PathBuf]) -> AppResult<Invocation> {
     check_task_name(&request.task)?;
-    let argv = argv_for(request, files);
+    let argv = argv_for(request, files)?;
     let normalized = cli::normalize(argv).map_err(|e| AppError::usage(format!("{e}")))?;
     let Normalized::Single { task, specs, argv } = &normalized else {
         return Err(AppError::usage(
@@ -225,7 +282,7 @@ pub fn build_plan(invocation: &Invocation) -> AppResult<ExecutionPlan> {
         ))
     };
     let mut env = InputEnv::custom(&mut empty, &mut probe, &mut no_clipboard);
-    match crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env) {
+    let plan = match crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env) {
         Ok(plan) => Ok(plan),
         // A per-part batch hard-requires `--out-dir`, which the UI's
         // request whitelist deliberately does not offer — the browser is
@@ -241,7 +298,12 @@ pub fn build_plan(invocation: &Invocation) -> AppResult<ExecutionPlan> {
             crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env)
         }
         Err(e) => Err(e),
-    }
+    }?;
+    // An `-o` target that already exists is knowable here (the plan
+    // names the file exactly); it fails as usage in the response, the
+    // same message and exit-2 semantics a CLI run would print.
+    crate::output::precheck_file_targets(&plan.destinations, cli.overwrite)?;
+    Ok(plan)
 }
 
 /// One chain stage as the UI sends it — the same whitelist as a single
@@ -291,6 +353,10 @@ impl StageRequest {
             no_split: self.no_split,
             timeout_secs: self.timeout_secs,
             total_timeout_secs: self.total_timeout_secs,
+            // Chains deliver nothing server-side in v1: the last stage
+            // hands the browser its artifacts through history.
+            out_dir: None,
+            out_file: None,
             texts,
         }
     }
@@ -318,7 +384,7 @@ fn chain_argv(request: &ChainRequest, files: &[PathBuf]) -> AppResult<Vec<std::f
             Vec::new()
         };
         let stage_files: &[PathBuf] = if index == 0 { files } else { &[] };
-        argv.extend(argv_for(&stage.as_run_request(texts), stage_files));
+        argv.extend(argv_for(&stage.as_run_request(texts), stage_files)?);
     }
     Ok(argv)
 }

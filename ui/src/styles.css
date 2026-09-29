@@ -785,3 +785,18 @@ button.danger {
 .link.danger-link {
   color: var(--bad);
 }
+
+/* --- server-side delivery ------------------------------------------------ */
+
+.delivery-box {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.delivery-path {
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-all;
+}

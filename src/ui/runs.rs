@@ -177,8 +177,11 @@ where
 }
 
 /// Start a run: register it, then execute on a dedicated thread. The
-/// caller answers `202 {run_id}` as soon as this returns.
-pub fn spawn(plan: ExecutionPlan, runs: Arc<Runs>, run_id: String) {
+/// caller answers `202 {run_id}` as soon as this returns. `deliver` is
+/// the request's own server-side delivery intent (`out_dir`/`out_file`
+/// in the whitelist) — a plan may carry a Directory destination without
+/// it (the per-part batch placeholder), which must never be written.
+pub fn spawn(plan: ExecutionPlan, runs: Arc<Runs>, run_id: String, deliver: bool) {
     let record_history = plan.record_history;
     let (keep, budget) = retention();
     let name = format!("aido-ui-run-{run_id}");
@@ -193,6 +196,7 @@ pub fn spawn(plan: ExecutionPlan, runs: Arc<Runs>, run_id: String) {
                 record_history,
                 keep,
                 budget,
+                deliver,
                 events: events.clone(),
             };
             let sink: EventSink = {
@@ -255,6 +259,9 @@ pub fn spawn_chain(
                 record_history,
                 keep,
                 budget,
+                // Chains deliver nothing server-side in v1: the last
+                // stage's artifacts reach the browser through history.
+                deliver: false,
                 events: events.clone(),
             };
             let sink: EventSink = {
@@ -402,21 +409,25 @@ fn retention() -> (usize, u64) {
 }
 
 /// What a finishing run needs from its thread: its identity, its
-/// history policy, and its event feed.
+/// history policy, its delivery intent, and its event feed.
 struct RunContext {
     run_id: String,
     record_history: bool,
     keep: usize,
     budget: u64,
+    deliver: bool,
     events: broadcast::Sender<SseEvent>,
 }
 
 /// Record, save and report a finished generation — `finish_run`'s
-/// decisions without its delivery (the browser is the destination) and
-/// without its exit codes (the HTTP status is always "the run happened";
-/// `error` inside the frame says how it went). A chain passes its
-/// deliverable split and per-stage summaries, exactly as `finish_run`
-/// receives them from `run_chain`.
+/// decisions without its stdout/clipboard delivery (the browser is the
+/// destination) and without its exit codes (the HTTP status is always
+/// "the run happened"; `error` inside the frame says how it went). A
+/// chain passes its deliverable split and per-stage summaries, exactly
+/// as `finish_run` receives them from `run_chain`. A run the request
+/// gave a whitelisted `out_dir`/`out_file` delivers through the same
+/// `output::deliver` the CLI walks, and its per-destination states ride
+/// the record and the report.
 fn finish(
     task_label: &str,
     plan: &ExecutionPlan,
@@ -435,23 +446,86 @@ fn finish(
         stage_summaries,
         &ctx.run_id,
     );
+    let mut record = assembled.record;
     if record_history {
         // finish_run's rule: a complete generation saves normally; an
         // incomplete one keeps whatever arrived when it is worth
         // keeping (validated artifacts of an unsatisfied run, a chain's
         // upstream artifacts, or text that streamed before a request
         // died).
-        let keep_artifacts = if assembled.record.generation.is_complete() {
+        let keep_artifacts = if record.generation.is_complete() {
             false
         } else {
             assembled.keep_artifacts
         };
-        best_effort_save(&assembled.record, keep_artifacts);
+        best_effort_save(&record, keep_artifacts);
+    }
+    // Server-side delivery, only when the request asked for it (the
+    // plan alone cannot say: the per-part batch placeholder is also a
+    // Directory destination, and it must never be written). The same
+    // call `finish_run` makes — quiet, never json, so nothing reaches
+    // the server's own stdout.
+    let mut saved = std::collections::BTreeMap::new();
+    let mut delivery_error: Option<crate::domain::AppError> = None;
+    if ctx.deliver {
+        let hold_secs = crate::config::load()
+            .ok()
+            .and_then(|c| c.settings.hold_secs)
+            .unwrap_or(crate::config::DEFAULT_HOLD_SECS);
+        let failed_parts: Vec<(String, String)> = output
+            .failed_parts
+            .iter()
+            .map(|f| (f.name.clone(), f.error.clone()))
+            .collect();
+        let args = crate::output::DeliverArgs {
+            artifacts: &record.artifacts,
+            produce: &plan.resolved.produce,
+            destinations: &plan.destinations,
+            overwrite: false,
+            live_stdout: false,
+            hold_secs,
+            quiet: true,
+            json: false,
+            run_id: &ctx.run_id,
+            task: Some(task_label),
+            failed_parts: &failed_parts,
+            dir_extras: &[],
+        };
+        let outcome = crate::output::deliver(&args);
+        record.deliveries = outcome.states;
+        if record_history {
+            best_effort(
+                crate::history::update_deliveries(&record),
+                "failed to update the run record",
+            );
+        }
+        saved = outcome.saved;
+        delivery_error = outcome.error;
+    }
+    if record_history {
         history_prune(keep, budget);
     }
-    let mut report = run_dto(&assembled.record);
-    if let Some(error) = error_of(&assembled, &output) {
+    let mut report = run_dto(&record);
+    if !saved.is_empty() {
+        report["saved"] = serde_json::json!(saved
+            .iter()
+            .map(|(k, v)| (k.clone(), v.display().to_string()))
+            .collect::<std::collections::BTreeMap<String, String>>());
+    }
+    if let Some(error) = error_of(
+        &record,
+        assembled.unsatisfied.as_deref(),
+        assembled.batch_partial,
+        &output,
+    ) {
         report["error"] = error;
+    } else if let Some(e) = delivery_error {
+        // The CLI exits 5 here with successes kept; over HTTP the run
+        // still "happened" — the error says what did not land.
+        report["error"] = serde_json::json!({
+            "kind": e.kind.as_str(),
+            "message": e.chain_inline(),
+        });
     }
     let _ = events.send(SseEvent::Done { report });
 }
@@ -460,16 +534,17 @@ fn finish(
 /// generation that did not complete or satisfy the request, or a
 /// batch's partial failure.
 fn error_of(
-    assembled: &crate::app::AssembledRun,
+    record: &RunRecord,
+    unsatisfied: Option<&str>,
+    batch_partial: bool,
     output: &runner::RunOutput,
 ) -> Option<serde_json::Value> {
-    let record = &assembled.record;
     if !record.generation.is_complete() {
         let reason = match &record.generation {
             GenerationStatus::Incomplete { reason } => format!(" ({reason})"),
             _ => String::new(),
         };
-        let message = if assembled.unsatisfied.is_some() && output.failure.is_none() {
+        let message = if unsatisfied.is_some() && output.failure.is_none() {
             format!(
                 "the generation did not satisfy the request{reason}; the result is not delivered"
             )
@@ -486,7 +561,7 @@ fn error_of(
             "message": message,
         }));
     }
-    if assembled.batch_partial {
+    if batch_partial {
         let listed = output
             .failed_parts
             .iter()
@@ -530,6 +605,12 @@ fn cancelled_record(plan: &ExecutionPlan, run_id: &str, created_at: &str) -> Run
 fn best_effort_save(record: &RunRecord, keep_artifacts: bool) {
     if let Err(e) = crate::history::save_generation(record, keep_artifacts) {
         eprintln!("warning: failed to record the run: {e:#}");
+    }
+}
+
+fn best_effort(result: anyhow::Result<()>, warning: &str) {
+    if let Err(e) = result {
+        eprintln!("warning: {warning}: {e:#}");
     }
 }
 

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { getRun } from '../api';
 import ArtifactViewer from '../components/ArtifactViewer';
+import Deliveries from '../components/Deliveries';
 import StatusBadge from '../components/StatusBadge';
 import type { RunReport } from '../types';
 
@@ -102,6 +103,12 @@ export default function RunDetail() {
           />
         )}
       </section>
+
+      {(report.deliveries?.length ?? 0) > 0 && (
+        <section className="card">
+          <Deliveries report={report} />
+        </section>
+      )}
     </div>
   );
 }
