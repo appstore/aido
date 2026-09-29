@@ -165,6 +165,7 @@ aido run <TASK> [INPUT...] [OPTIONS] # 无歧义入口；可访问与管理命�
 aido ask [INPUT...] -p <INSTRUCTION> # 临时任务
 aido -p <INSTRUCTION> [INPUT...]     # ask 的根命令简写
 aido watch DIR -- <TASK> [FLAGS]     # 目录守护：新文件自动执行任务（见下）
+aido ui [--port N] [--no-open]       # 本地 Web UI（见下）
 ```
 
 任务名可以出现在 flags 之前或之后：`aido ocr --copy` 与 `aido --copy ocr` 等价。
@@ -261,6 +262,22 @@ aido watch assets -- ask -p "为这张图写 alt 文本" --out-dir alts/   # 素
 - **失败不重试**：单个文件失败（类型不符、服务 5xx 等）stderr 记一行后守护继续；已处理文件被原地修改或同名重建不会重新处理（重启守护即重置）。
 - **每文件一行结果**：`[watch] shot.png → ocr: done` / `[watch] … → ocr: failed (not retried; still watching): …`，stderr 为终端时附加一声响铃（`--quiet` 关闭全部提示）。
 - **退出**：Ctrl+C / SIGTERM → exit 130，在途文件按取消记入历史（history 的 warning 写明实际信号）；守护目录暂时不可读只警告一次，恢复后继续（启动时建立初始文件清单失败则 exit 2，不守护）。
+
+## Web UI（`aido ui`）
+
+终端之外，aido 自带一个本地 Web 界面：
+
+```bash
+aido ui                    # 随机空闲端口，自动打开浏览器
+aido ui --port 8710        # 指定端口
+aido ui --no-open          # 只打印 URL，不动浏览器
+```
+
+三个页面：**运行**（选任务 → 拖拽/粘贴材料（Ctrl+V 直接收截图）→ 参数 → dry-run 预览 → 运行，流式输出、可取消、产物按类型渲染——文本可复制、图片内嵌、音频可播放）、**历史**（与 CLI 相同的编号，1 = 最新）与**运行详情**（manifest、产物、provenance、警告）。UI 走和 CLI 同一条 plan → runner → history 管线（同一套校验、同一份历史记录）；页面角落常驻当前操作等效的 aido 命令行，方便毕业后回到终端。
+
+安全边界：只监听 127.0.0.1；每个 `/api` 请求都要带会话令牌（打印出的 URL 里 `?t=…`，一次性进入后由页面保存）；Host 与 Origin 校验拦住 DNS rebinding 和其他网页的跨站请求。`AIDO_UI_TOKEN` 可固定令牌（测试与前端开发）。运行中新增自定义任务 TOML 需重启 `aido ui`。
+
+Web UI 由 `ui` feature 控制（默认开启，纯 Rust 依赖，`--no-default-features` 构建没有它，且 `aido ui` 会明确报错）。前端源码在 `ui/`（Vite + React + TypeScript）；**源码构建发布二进制前需要 Node**：`cd ui && npm install && npm run build`（release 构建把 `ui/dist` 编译期内嵌；debug 构建直接读盘，改前端不用重编 Rust）。仅 `cargo build` 的开发构建不需要 Node——此时界面显示占位页。
 
 ## 配置：Provider / Profile / Task 三层
 
