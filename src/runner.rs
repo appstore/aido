@@ -56,6 +56,35 @@ pub struct FailedPart {
     pub error: String,
 }
 
+/// Progress from a run in flight, for a watcher that is not the terminal
+/// (the web UI's SSE stream). Deltas are the merged text — the same bytes
+/// live stdout would print, so a UI and a terminal watching one run see
+/// the same stream — and step events carry the spinner's label. The plain
+/// CLI path never attaches a sink, so it emits nothing.
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    /// A piece of merged reply text, live or buffered alike.
+    Delta(String),
+    /// A request step started: `done` steps already finished of `total`.
+    Step {
+        done: usize,
+        total: usize,
+        label: String,
+    },
+    Warning(String),
+}
+
+/// The sink callbacks follow the runner's existing `Rc<RefCell<…>>`
+/// single-threaded style: `execute_with` runs on one task, and the sink
+/// is cloned into each group's `DeltaSink` exactly like the spinner cell.
+pub type EventSink = Rc<RefCell<dyn FnMut(RunEvent)>>;
+
+fn emit_event(sink: &Option<EventSink>, event: RunEvent) {
+    if let Some(sink) = sink {
+        (sink.borrow_mut())(event);
+    }
+}
+
 impl RunOutput {
     /// Why the artifacts do not satisfy what the plan asked for, if they
     /// do not. The plan's expectations re-validated against the real
@@ -125,10 +154,14 @@ struct DeltaSink {
     /// after it must break the line first, or its `\r` redraws chop the
     /// content.
     line_open: bool,
+    /// The run's event sink, shared with every group: merged text grows
+    /// here first (the live print is only one of its consumers).
+    events: Option<EventSink>,
 }
 
 impl DeltaSink {
     fn emit(&mut self, text: &str) {
+        emit_event(&self.events, RunEvent::Delta(text.to_string()));
         self.chars_seen += text.chars().count() as u64;
         self.merged.push_str(text);
         if self.live {
@@ -245,6 +278,14 @@ fn announce_step(cell: &SharedSpinner, label: &str, stderr_tty: bool, line_open:
 /// replies that did arrive, and the error itself in `failure` — the
 /// caller records the partial generation instead of losing it.
 pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
+    execute_with(plan, None).await
+}
+
+/// [`execute`] with a progress sink attached: every merged delta, step
+/// start and warning also reaches the sink. The terminal behaves exactly
+/// as without one — the sink is an additional consumer, never a
+/// replacement.
+pub async fn execute_with(plan: &ExecutionPlan, events: Option<EventSink>) -> AppResult<RunOutput> {
     // The same shared judgment the dry-run's credential line uses: the
     // provider's variable, or the conventional OpenAI name when the
     // default provider's key falls back to it.
@@ -417,6 +458,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 chars_seen: 0,
                 live_chars: 0,
                 line_open: false,
+                events: events.clone(),
             }));
             // A reduce group never merges through a gate: map replies
             // accumulate as sections (the reduce request's material) and
@@ -460,18 +502,28 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
                 .sections
                 .push((step.index, String::new()));
         }
+        let label = if plan.steps.len() > 1 {
+            format!(
+                "{} ({}/{}) — {}...",
+                prefix,
+                step.index + 1,
+                plan.steps.len(),
+                step.label
+            )
+        } else {
+            format!("{prefix}...")
+        };
+        // The sink is the watcher's terminal: step starts reach it even
+        // when the real one runs quiet.
+        emit_event(
+            &events,
+            RunEvent::Step {
+                done: steps_done,
+                total: plan.steps.len(),
+                label: label.clone(),
+            },
+        );
         if !plan.quiet {
-            let label = if plan.steps.len() > 1 {
-                format!(
-                    "{} ({}/{}) — {}...",
-                    prefix,
-                    step.index + 1,
-                    plan.steps.len(),
-                    step.label
-                )
-            } else {
-                format!("{prefix}...")
-            };
             // The current group's sink is the terminal's writer: its
             // `line_open` says where a restarted banner may draw.
             let line_open = group.as_ref().unwrap().sink.borrow().line_open;
@@ -676,6 +728,7 @@ pub async fn execute(plan: &ExecutionPlan) -> AppResult<RunOutput> {
         spinner.stop();
     }
     for warning in &warnings {
+        emit_event(&events, RunEvent::Warning(warning.clone()));
         eprintln!("warning: {warning}");
     }
 
