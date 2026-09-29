@@ -66,10 +66,13 @@ pub enum RunEvent {
     /// A piece of merged reply text, live or buffered alike.
     Delta(String),
     /// A request step started: `done` steps already finished of `total`.
+    /// `part` names the input file this step belongs to in a per-part
+    /// batch — the live grid's cell key.
     Step {
         done: usize,
         total: usize,
         label: String,
+        part: Option<String>,
     },
     Warning(String),
 }
@@ -521,6 +524,10 @@ pub async fn execute_with(plan: &ExecutionPlan, events: Option<EventSink>) -> Ap
                 done: steps_done,
                 total: plan.steps.len(),
                 label: label.clone(),
+                part: step
+                    .part
+                    .and_then(|id| plan.inputs.get(id))
+                    .map(|p| p.name.clone()),
             },
         );
         if !plan.quiet {

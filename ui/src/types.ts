@@ -100,7 +100,7 @@ export interface Preview {
 
 export type Frame =
   | { type: 'delta'; text: string }
-  | { type: 'step'; done: number; total: number; label: string }
+  | { type: 'step'; done: number; total: number; label: string; part?: string | null }
   | { type: 'warning'; text: string }
   | { type: 'done' }
   | { type: 'error'; kind: string; message: string }

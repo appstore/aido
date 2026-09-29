@@ -763,3 +763,9 @@ button.danger {
   display: flex;
   gap: 8px;
 }
+
+.chip.part {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-family: var(--mono);
+}

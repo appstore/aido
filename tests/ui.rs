@@ -991,3 +991,59 @@ async fn a_cli_partial_batch_reads_back_as_partial_through_the_ui() {
         .unwrap()
         .contains("500"));
 }
+
+#[tokio::test]
+async fn a_ui_batch_run_reports_its_parts_live() {
+    // U04 relaxed: two images through per-part ocr work from the UI
+    // (the placeholder out-dir satisfies the precheck; nothing is ever
+    // written there — history is the destination). The step frames must
+    // name the file they belong to, and the done frame carries both
+    // artifacts.
+    let (port, provider) = slow_chain_provider(
+        std::time::Duration::from_millis(250),
+        vec![chat_body("FIRST PAGE"), chat_body("SECOND PAGE")],
+    );
+    let dir = temp_dir("ui-batch");
+    let cfg = chat_cfg(&format!("http://127.0.0.1:{port}"));
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let request = serde_json::json!({ "task": "ocr", "profile": "test" });
+    let posted = post_run(
+        &server,
+        &request,
+        &[
+            ("a.png", solid_png(8, 8).as_slice()),
+            ("b.png", solid_png(8, 8).as_slice()),
+        ],
+    )
+    .await;
+    assert_eq!(posted.status(), 202);
+    let run_id = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let frames = sse_frames(&server, &run_id).await;
+    // The first file's step fired before this subscription existed
+    // (broadcast has no replay — the standing contract); the second
+    // proves the part names ride the step frames.
+    let parts: Vec<&str> = frames
+        .iter()
+        .filter(|f| f["type"] == "step")
+        .filter_map(|f| f["part"].as_str())
+        .collect();
+    assert!(parts.contains(&"b.png"), "step parts: {parts:?}");
+    let done = frames.iter().find(|f| f["type"] == "done").unwrap();
+    let ids: Vec<&str> = done["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a", "b"]);
+    assert!(done.get("error").is_none());
+    provider.join().unwrap();
+}

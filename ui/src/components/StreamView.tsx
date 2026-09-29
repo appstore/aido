@@ -10,7 +10,7 @@ export default function StreamView({
   onCancel,
 }: {
   text: string;
-  step: { done: number; total: number; label: string } | null;
+  step: { done: number; total: number; label: string; part?: string | null } | null;
   warnings: string[];
   onCancel: () => void;
 }) {
@@ -34,6 +34,7 @@ export default function StreamView({
             <span className="chip">
               {step.done}/{step.total}
             </span>
+            {step.part && <span className="chip part">{step.part}</span>}
             <span className="chip">{step.label}</span>
           </span>
         )}

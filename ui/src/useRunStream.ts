@@ -9,6 +9,8 @@ export interface StepState {
   done: number;
   total: number;
   label: string;
+  /** The input file this step belongs to — set in per-part batches. */
+  part?: string | null;
 }
 
 /** The run lifecycle both pages share: submit (any 202-returning starter),
@@ -52,7 +54,12 @@ export function useRunStream() {
           if (frame.type === 'delta') {
             setStreamText((current) => current + frame.text);
           } else if (frame.type === 'step') {
-            setStep({ done: frame.done, total: frame.total, label: frame.label });
+            setStep({
+              done: frame.done,
+              total: frame.total,
+              label: frame.label,
+              part: frame.part ?? null,
+            });
           } else if (frame.type === 'warning') {
             setWarnings((current) => [...current, frame.text]);
           } else if (frame.type === 'done') {

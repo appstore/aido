@@ -225,7 +225,23 @@ pub fn build_plan(invocation: &Invocation) -> AppResult<ExecutionPlan> {
         ))
     };
     let mut env = InputEnv::custom(&mut empty, &mut probe, &mut no_clipboard);
-    crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env)
+    match crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env) {
+        Ok(plan) => Ok(plan),
+        // A per-part batch hard-requires `--out-dir`, which the UI's
+        // request whitelist deliberately does not offer — the browser is
+        // the destination and the artifacts live in history. The check
+        // only wants the flag present: the UI path never delivers, so a
+        // placeholder directory (never created, never written) satisfies
+        // it and "一次拖两张图" works exactly like the CLI's grid.
+        Err(e) if e.message.contains("use --out-dir to collect") => {
+            let mut cli = cli.clone();
+            cli.out_dir = Some(
+                std::env::temp_dir().join(format!("aido-ui-batch-{}", crate::history::stamp_now())),
+            );
+            crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One chain stage as the UI sends it — the same whitelist as a single

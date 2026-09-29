@@ -31,6 +31,7 @@ pub enum SseEvent {
         done: usize,
         total: usize,
         label: String,
+        part: Option<String>,
     },
     Warning {
         text: String,
@@ -52,7 +53,17 @@ impl From<RunEvent> for SseEvent {
     fn from(event: RunEvent) -> Self {
         match event {
             RunEvent::Delta(text) => Self::Delta { text },
-            RunEvent::Step { done, total, label } => Self::Step { done, total, label },
+            RunEvent::Step {
+                done,
+                total,
+                label,
+                part,
+            } => Self::Step {
+                done,
+                total,
+                label,
+                part,
+            },
             RunEvent::Warning(text) => Self::Warning { text },
         }
     }
