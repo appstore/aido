@@ -512,28 +512,20 @@ fn validate_task_params(cli: &Cli, task: &Task) -> AppResult<()> {
         }
     }
     if let Some(speed) = cli.speed {
-        if !(0.25..=4.0).contains(&speed) {
+        if !(crate::tasks::SPEED_RANGE.0..=crate::tasks::SPEED_RANGE.1).contains(&speed) {
             return Err(AppError::usage("--speed must be between 0.25 and 4"));
         }
     }
     if let Some(count) = cli.count {
-        if !(1..=10).contains(&count) {
+        if !(crate::tasks::COUNT_RANGE.0..=crate::tasks::COUNT_RANGE.1).contains(&count) {
             return Err(AppError::usage("--count must be between 1 and 10"));
         }
     }
     if let Some(size) = &cli.size {
-        let valid = [
-            "auto",
-            "1024x1024",
-            "1536x1024",
-            "1024x1536",
-            "1792x1024",
-            "1024x1792",
-        ];
-        if !valid.contains(&size.as_str()) {
+        if !crate::tasks::SIZE_CHOICES.contains(&size.as_str()) {
             return Err(AppError::usage(format!(
                 "--size must be one of: {}",
-                valid.join(", ")
+                crate::tasks::SIZE_CHOICES.join(", ")
             )));
         }
     }

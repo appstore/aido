@@ -74,6 +74,31 @@ pub enum ProcessorKind {
     ChunkReduce,
 }
 
+impl ProcessorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::OcrTiles => "ocr-tiles",
+            Self::ChunkJoin => "chunk-join",
+            Self::ChunkReduce => "chunk-reduce",
+        }
+    }
+}
+
+/// Shared bounds for the typed task parameters — the plan's validation
+/// and the web UI's dynamic forms both read these, so a UI control can
+/// never offer what a run would reject.
+pub const SPEED_RANGE: (f64, f64) = (0.25, 4.0);
+pub const COUNT_RANGE: (u64, u64) = (1, 10);
+pub const SIZE_CHOICES: &[&str] = &[
+    "auto",
+    "1024x1024",
+    "1536x1024",
+    "1024x1536",
+    "1792x1024",
+    "1024x1792",
+];
+
 /// Typed CLI parameters a task accepts (`--to`, `--voice`, ...); validated
 /// and mapped to protocol options by the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

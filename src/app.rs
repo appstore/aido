@@ -935,8 +935,9 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
 /// Resolve a `history show` operand: a 1-based index into `history list`
 /// order (1 = the newest entry), a full run id, or a unique id prefix.
 /// Run ids always contain '-' and '.', so an all-digit operand can only
-/// be an index.
-fn resolve_run(target: &str) -> AppResult<RunRecord> {
+/// be an index. The ui server's run lookup takes the same operands —
+/// its URLs and the CLI's `history show` address one run identically.
+pub(crate) fn resolve_run(target: &str) -> AppResult<RunRecord> {
     let ids = history::list_ids().map_err(|e| AppError::usage(format!("{e:#}")))?;
     if ids.is_empty() {
         return Err(AppError::usage("no runs recorded yet"));
