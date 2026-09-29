@@ -37,6 +37,8 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/tasks", get(tasks_list))
         .route("/api/tasks/{name}", get(task_show))
+        .route("/api/profiles", get(profiles_list))
+        .route("/api/config", get(config_show).put(config_save))
         .route("/api/runs", get(runs_list).post(runs_create))
         .route("/api/runs/preview", post(runs_preview))
         .route("/api/runs/{id}", get(run_show))
@@ -439,4 +441,143 @@ async fn run_cancel(State(state): State<Arc<UiState>>, Path(id): Path<String>) -
             format!("no live run '{id}' to cancel"),
         )
     }
+}
+
+// --- configuration ---------------------------------------------------------
+
+/// The profile names a run can pick — the datalist behind the run form's
+/// `--profile` and the chain builder's per-stage picker. The built-in
+/// `default` profile exists only when the user defined none (the config's
+/// own rule); the caller shows it accordingly.
+async fn profiles_list() -> Response {
+    let cfg = match crate::config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => return io_error("cannot load the config", &AppError::usage(format!("{e:#}"))),
+    };
+    Json(serde_json::json!({
+        "default_profile": cfg.default_profile,
+        "profiles": cfg.profiles.iter().map(|(name, p)| serde_json::json!({
+            "name": name,
+            "provider": p.provider,
+            "model": p.model,
+            "is_default": cfg.default_profile.as_deref() == Some(name.as_str()),
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// The config as the editor sees it: the file's own bytes (the textarea's
+/// truth), the parsed view of what runs actually resolve against, and
+/// `check`'s issues. A config that cannot load (an AIDO_CONFIG typo, a
+/// broken file) still answers 200 — the editor is exactly where that gets
+/// fixed — with `load_error` carrying the message.
+async fn config_show() -> Response {
+    let path = crate::config::config_path();
+    let exists = path.as_ref().is_some_and(|p| p.exists());
+    let raw = match &path {
+        Some(path) if exists => std::fs::read_to_string(path).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let (effective, load_error, issues) = match crate::config::load() {
+        Ok(cfg) => (Some(config_dto(&cfg)), None, crate::config::check(&cfg)),
+        Err(e) => (None, Some(format!("{e:#}")), Vec::new()),
+    };
+    Json(serde_json::json!({
+        "path": path.as_ref().map(|p| p.display().to_string()),
+        "exists": exists,
+        "raw": raw,
+        "effective": effective,
+        "load_error": load_error,
+        "issues": issues,
+    }))
+    .into_response()
+}
+
+/// The parsed view: names and shapes only — an `api_key_env` names an
+/// environment variable, it never carries a value, so nothing here is a
+/// secret.
+fn config_dto(cfg: &crate::config::Config) -> serde_json::Value {
+    serde_json::json!({
+        "default_profile": cfg.default_profile,
+        "profiles": cfg.profiles.iter().map(|(name, p)| serde_json::json!({
+            "name": name,
+            "provider": p.provider,
+            "model": p.model,
+            "operations": p
+                .operations
+                .as_ref()
+                .map(|ops| ops.iter().map(|o| o.to_string()).collect::<Vec<_>>()),
+            "input_types": p.input_types,
+            "output_types": p.output_types,
+            "is_default": cfg.default_profile.as_deref() == Some(name.as_str()),
+        })).collect::<Vec<_>>(),
+        "providers": cfg.providers.iter().map(|(name, p)| serde_json::json!({
+            "name": name,
+            "base_url": p.base_url,
+            "api_key_env": p.api_key_env,
+            "routes": p.routes.iter().map(|(op, adapter)| (
+                op.clone(), adapter.to_string()
+            )).collect::<std::collections::BTreeMap<String, String>>(),
+        })).collect::<Vec<_>>(),
+        "settings": {
+            "stream": cfg.settings.stream,
+            "timeout_secs": cfg.settings.timeout_secs,
+            "total_timeout_secs": cfg.settings.total_timeout_secs,
+            "hold_secs": cfg.settings.hold_secs,
+            "history_keep": cfg.settings.history_keep,
+            "history_bytes": cfg.settings.history_bytes,
+            "input_bytes": cfg.settings.input_bytes,
+            "watch_interval_ms": cfg.settings.watch_interval_ms,
+            "watch_stable_ms": cfg.settings.watch_stable_ms,
+        },
+    })
+}
+
+#[derive(Deserialize)]
+struct ConfigPut {
+    toml: String,
+}
+
+/// Save the config file: parse first (the file on disk must never become
+/// invalid), write atomically, then answer `check`'s verdict on exactly
+/// what was saved. Issues do not block the save — a config may be
+/// honestly incomplete — they are shown next to the editor's save button.
+async fn config_save(Json(body): Json<ConfigPut>) -> Response {
+    let parsed: crate::config::Config = match toml::from_str(&body.toml) {
+        Ok(parsed) => parsed,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("invalid TOML: {e}")),
+    };
+    let Some(path) = crate::config::config_path() else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot determine the config path on this platform",
+        );
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot create {}: {e}", parent.display()),
+            );
+        }
+    }
+    // Atomic (tmp + rename, umask-respecting): a failed write leaves the
+    // previous file exactly as it was.
+    if let Err(e) = crate::output::write_file_atomic(
+        body.toml.as_bytes(),
+        &path,
+        true,
+        crate::output::FileMode::Default,
+    ) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot write {}: {e:#}", path.display()),
+        );
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "issues": crate::config::check(&parsed),
+    }))
+    .into_response()
 }

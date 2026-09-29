@@ -505,3 +505,117 @@ async fn unknown_request_fields_are_refused() {
     let posted = post_run(&server, &request, &[]).await;
     assert_eq!(posted.status(), 400);
 }
+
+#[tokio::test]
+async fn config_reads_writes_and_checks_round_trip() {
+    let dir = temp_dir("ui-config");
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        "default_profile = \"test\"\n\
+         [profiles.test]\nprovider = \"srv\"\nmodel = \"YOUR_MODEL\"\n\
+         [providers.srv]\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap();
+    let server = UiServer::start(&[("AIDO_CONFIG", cfg_path.to_str().unwrap())]);
+
+    // The view: the file's own bytes, the parsed shape, and check's
+    // verdict on the placeholder model.
+    let view: serde_json::Value = server.get("/api/config").await.json().await.unwrap();
+    assert_eq!(view["path"], cfg_path.to_str().unwrap());
+    assert_eq!(view["exists"], true);
+    assert!(view["raw"].as_str().unwrap().contains("default_profile"));
+    assert_eq!(view["effective"]["default_profile"], "test");
+    let profiles = view["effective"]["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0]["name"], "test");
+    assert_eq!(profiles[0]["is_default"], true);
+    assert_eq!(profiles[0]["provider"], "srv");
+    assert!(view["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i.as_str().unwrap().contains("YOUR_MODEL")));
+
+    // The datalist behind the run form's --profile.
+    let listed: serde_json::Value = server.get("/api/profiles").await.json().await.unwrap();
+    assert_eq!(listed["default_profile"], "test");
+    assert_eq!(listed["profiles"][0]["name"], "test");
+    assert_eq!(listed["profiles"][0]["is_default"], true);
+
+    // Save: parse-first (invalid TOML answers 400 and touches nothing),
+    // atomic write, check's verdict on exactly what was saved.
+    let good = "default_profile = \"test\"\n\
+                [profiles.test]\nprovider = \"srv\"\nmodel = \"m\"\n\
+                [providers.srv]\nbase_url = \"http://127.0.0.1:9\"\n";
+    let saved: serde_json::Value = client()
+        .put(format!("http://127.0.0.1:{}/api/config", server.port))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({ "toml": good }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["issues"].as_array().unwrap().len(), 0);
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), good);
+
+    let refused = client()
+        .put(format!("http://127.0.0.1:{}/api/config", server.port))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({ "toml": "not [ toml" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), good);
+
+    // An honestly incomplete config saves — with its issues in the
+    // answer, next to the editor's save button.
+    let placeholder = good.replace("model = \"m\"", "model = \"YOUR_MODEL\"");
+    let saved: serde_json::Value = client()
+        .put(format!("http://127.0.0.1:{}/api/config", server.port))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({ "toml": placeholder }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["ok"], true);
+    assert!(!saved["issues"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_config_that_cannot_load_still_opens_the_editor() {
+    // An AIDO_CONFIG pointing at a missing file is exactly what the
+    // editor should show, not a five-hundred: the view answers with the
+    // error and an empty file. The path's parent must be creatable for
+    // the save half.
+    let dir = temp_dir("ui-config-missing");
+    let cfg_path = dir.join("missing").join("config.toml");
+    let server = UiServer::start(&[("AIDO_CONFIG", cfg_path.to_str().unwrap())]);
+    let view: serde_json::Value = server.get("/api/config").await.json().await.unwrap();
+    assert_eq!(view["exists"], false);
+    assert_eq!(view["raw"], "");
+    assert!(view["load_error"]
+        .as_str()
+        .unwrap()
+        .contains("missing file"));
+    // PUT then creates the file and the editor leaves the error state.
+    let saved: serde_json::Value = client()
+        .put(format!("http://127.0.0.1:{}/api/config", server.port))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({ "toml": "[profiles.p]\nprovider = \"x\"\nmodel = \"m\"\n" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["ok"], true);
+    assert!(cfg_path.exists());
+}
