@@ -35,7 +35,7 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> AppResult<()> {
         .local_addr()
         .map(|a| a.port())
         .map_err(|e| AppError::usage(format!("cannot tell the bound port: {e}")))?;
-    let url = format!("http://127.0.0.1:{port}/?t={token}");
+    let url = format!("http://127.0.0.1:{port}/?t={}", encode_token(&token));
     let state = Arc::new(api::UiState {
         guard: Arc::new(guard::Guard { token, port }),
         runs: runs::Runs::shared(),
@@ -69,6 +69,22 @@ fn token() -> String {
     let mut second = std::collections::hash_map::RandomState::new().build_hasher();
     second.write_u64(first.finish());
     format!("{:016x}", second.finish())
+}
+
+/// Percent-encode the token for the URL: a pinned AIDO_UI_TOKEN may
+/// carry `+`/`&`/`#`/`%`, which would silently mangle the printed link
+/// (the guard and the SPA both decode `+` back to a space).
+fn encode_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for byte in token.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Open the default browser with the platform opener — no dependency

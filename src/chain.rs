@@ -413,6 +413,23 @@ pub async fn execute(
     on_started: &mut dyn FnMut(RunSummary),
     on_progress: &mut dyn FnMut(&[Artifact], &[RunSummary]),
 ) -> AppResult<ChainRun> {
+    execute_with(chain, cfg, terminal, env, on_started, on_progress, None).await
+}
+
+/// [`execute`] with a progress sink threaded into every stage's runner
+/// call: merged deltas, step starts (their labels carry the
+/// `chain k/n` prefix the spinner would show) and warnings reach the
+/// sink as they happen — the web UI's SSE feed. The terminal behaves
+/// exactly as without one.
+pub async fn execute_with(
+    chain: &PreparedChain,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    env: &mut InputEnv<'_>,
+    on_started: &mut dyn FnMut(RunSummary),
+    on_progress: &mut dyn FnMut(&[Artifact], &[RunSummary]),
+    events: Option<runner::EventSink>,
+) -> AppResult<ChainRun> {
     let n = chain.stages.len();
     let mut all_artifacts: Vec<Artifact> = Vec::new();
     // The stage that just finished: the only artifacts the next junction
@@ -518,7 +535,7 @@ pub async fn execute(
             // run before the first request goes out.
             on_started(plan::summarize(&stage_plan));
         }
-        let mut out = runner::execute(&stage_plan).await?;
+        let mut out = runner::execute_with(&stage_plan, events.clone()).await?;
         // Re-base provenance onto the run-global request numbering so a
         // chain's manifests name every request without collisions.
         retag(&mut out.artifacts, request_offset);
@@ -763,10 +780,16 @@ fn rename_intermediates(artifacts: &mut [Artifact], task_name: &str, stage: usiz
 /// The `--dry-run` preview, one block per stage. Stage 1 builds its real
 /// plan (material gather included, under dry-run rules); later stages
 /// render from task + resolved route — their material only exists once
-/// the previous stage has run.
-pub fn describe_chain(chain: &PreparedChain, cfg: &Config) -> AppResult<String> {
-    let terminal = TerminalInfo::real();
-    let mut env = InputEnv::real();
+/// the previous stage has run. The terminal and env come from the
+/// caller: the CLI passes the real ones, the web UI its own (non-tty,
+/// clipboard-less) — the preview must describe the same plan shape the
+/// caller would execute.
+pub fn describe_chain(
+    chain: &PreparedChain,
+    cfg: &Config,
+    terminal: TerminalInfo,
+    env: &mut InputEnv<'_>,
+) -> AppResult<String> {
     let first = &chain.stages[0];
     let mut cli1 = first.cli.clone();
     cli1.dry_run = true; // never read the clipboard for a preview
@@ -774,7 +797,7 @@ pub fn describe_chain(chain: &PreparedChain, cfg: &Config) -> AppResult<String> 
     // Stage 1's real plan build doubles as the batch gate: an
     // intermediate stage that would run a per-part batch is refused at
     // plan time (plan_from), zero requests, before anything is previewed.
-    let plan1 = plan::build(&cli1, &first.task, &first.specs, cfg, terminal, &mut env)?;
+    let plan1 = plan::build(&cli1, &first.task, &first.specs, cfg, terminal, env)?;
     let n = chain.stages.len();
     let mut out = format!("chain: {}\n", chain.task_label());
     for (k, stage) in chain.stages.iter().enumerate() {

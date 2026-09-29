@@ -62,22 +62,42 @@ impl Drop for Landed {
 }
 
 pub fn land_uploads(files: Vec<(String, Vec<u8>)>) -> AppResult<(Landed, Vec<PathBuf>)> {
+    // A process-global counter makes the directory exclusive by
+    // construction: two requests in the same millisecond must never
+    // share one (the first finisher's cleanup would delete the other's
+    // files mid-gather) — the same collision discipline new_run_id
+    // applies to history ids.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "aido-ui-upload-{}-{}",
+        "aido-ui-upload-{}-{}-{n}",
         std::process::id(),
         crate::history::stamp_now()
     ));
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir(&dir)
         .map_err(|e| AppError::usage(format!("cannot land the uploaded files: {e}")))?;
     let mut paths = Vec::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, (name, bytes)) in files.into_iter().enumerate() {
         // Only the final component survives: a browser may send a whole
-        // path, and the name chooses prompts and artifact stems.
-        let name = Path::new(&name)
+        // path, and the name chooses prompts and artifact stems. A
+        // repeated name gets a `-2`/`-3` suffix — a silent overwrite
+        // would drop one upload's content while both specs point at the
+        // same path (the batch naming's own dedup rule).
+        let original = Path::new(&name)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| format!("upload-{}", index + 1));
+        let mut name = original.clone();
+        let mut nth = 1;
+        while !used.insert(name.clone()) {
+            nth += 1;
+            name = match original.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}-{nth}.{ext}"),
+                None => format!("{original}-{nth}"),
+            };
+        }
         let path = dir.join(&name);
         std::fs::write(&path, bytes)
             .map_err(|e| AppError::usage(format!("cannot land {name}: {e}")))?;
@@ -138,6 +158,7 @@ fn argv_for(request: &RunRequest, files: &[PathBuf]) -> Vec<std::ffi::OsString> 
 }
 
 pub fn parse(request: &RunRequest, files: &[PathBuf]) -> AppResult<Invocation> {
+    check_task_name(&request.task)?;
     let argv = argv_for(request, files);
     let normalized = cli::normalize(argv).map_err(|e| AppError::usage(format!("{e}")))?;
     let Normalized::Single { task, specs, argv } = &normalized else {
@@ -159,19 +180,36 @@ pub fn parse(request: &RunRequest, files: &[PathBuf]) -> AppResult<Invocation> {
     })
 }
 
+/// A task name that starts with '-' would be eaten as a flag by the
+/// normalizer and surface as a bizarre ask run; refuse it with the CLI's
+/// own unknown-task wording instead (an empty name is the same problem).
+fn check_task_name(name: &str) -> AppResult<()> {
+    if name.trim().is_empty() {
+        return Err(AppError::usage("name a task (see the task picker)"));
+    }
+    if name.starts_with('-') {
+        return Err(AppError::usage(format!("unknown task '{name}'")));
+    }
+    Ok(())
+}
+
 /// Build the plan with the server's environment: no terminal, no stdin,
-/// no clipboard. Every plan is buffered (a non-tty stdout forces it), no
-/// spinner starts, nothing reaches the server's own stdio — the SSE
-/// stream is the UI's terminal. Validation is the CLI's own: a bad
-/// combination fails here, in the response, with the same message the
-/// terminal would print.
+/// no clipboard — and quiet, so the spinner's tty check cannot draw on
+/// the SERVER's terminal (aido ui is itself started from one) and the
+/// gather notes stay off stderr. Progress reaches the UI through the
+/// event sink, which quiet does not gate. Every plan is buffered (a
+/// non-tty stdout forces it); the SSE stream is the UI's terminal.
+/// Validation is the CLI's own: a bad combination fails here, in the
+/// response, with the same message the terminal would print.
 pub fn build_plan(invocation: &Invocation) -> AppResult<ExecutionPlan> {
     let Invocation {
         cli,
         task_name,
         specs,
     } = invocation;
-    crate::app::require_ask_prompt(cli, task_name)?;
+    let mut cli = cli.clone();
+    cli.quiet = true;
+    crate::app::require_ask_prompt(&cli, task_name)?;
     let task = crate::tasks::get(task_name).map_err(|e| AppError::usage(format!("{e:#}")))?;
     let cfg = crate::config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
     let terminal = TerminalInfo {
@@ -187,5 +225,135 @@ pub fn build_plan(invocation: &Invocation) -> AppResult<ExecutionPlan> {
         ))
     };
     let mut env = InputEnv::custom(&mut empty, &mut probe, &mut no_clipboard);
-    crate::plan::build(cli, &task, specs, &cfg, terminal, &mut env)
+    crate::plan::build(&cli, &task, specs, &cfg, terminal, &mut env)
+}
+
+/// One chain stage as the UI sends it — the same whitelist as a single
+/// run, minus material: only stage 1 takes material (the chain's own
+/// files and texts), every later stage reads the junction.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageRequest {
+    pub task: String,
+    pub prompt: Option<String>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub to: Option<String>,
+    pub voice: Option<String>,
+    pub speed: Option<f64>,
+    pub count: Option<u64>,
+    pub size: Option<String>,
+    #[serde(default)]
+    pub no_split: bool,
+    pub timeout_secs: Option<u64>,
+    pub total_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainRequest {
+    pub stages: Vec<StageRequest>,
+    #[serde(default)]
+    pub texts: Vec<String>,
+}
+
+impl StageRequest {
+    /// Reuse the single-run argv builder: a stage IS one task invocation
+    /// with its own flags; only material differs (stage 1's comes from
+    /// the chain).
+    fn as_run_request(&self, texts: Vec<String>) -> RunRequest {
+        RunRequest {
+            task: self.task.clone(),
+            prompt: self.prompt.clone(),
+            profile: self.profile.clone(),
+            model: self.model.clone(),
+            to: self.to.clone(),
+            voice: self.voice.clone(),
+            speed: self.speed,
+            count: self.count,
+            size: self.size.clone(),
+            no_split: self.no_split,
+            timeout_secs: self.timeout_secs,
+            total_timeout_secs: self.total_timeout_secs,
+            texts,
+        }
+    }
+}
+
+/// The `--then` form of the chain — plain shell tokens, no spec-string
+/// quoting to get wrong (the chain sugar's grammar has no escapes; a
+/// prompt with quotes in it would be unbuildable there).
+fn chain_argv(request: &ChainRequest, files: &[PathBuf]) -> AppResult<Vec<std::ffi::OsString>> {
+    if request.stages.len() < 2 {
+        return Err(AppError::usage(
+            "a chain needs at least two stages (add one with the ＋ button)",
+        ));
+    }
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    for (index, stage) in request.stages.iter().enumerate() {
+        if index > 0 {
+            argv.push("--then".into());
+        }
+        // Stage 1 carries the chain's material; texts land in its
+        // segment so they join the files in order.
+        let texts = if index == 0 {
+            request.texts.clone()
+        } else {
+            Vec::new()
+        };
+        let stage_files: &[PathBuf] = if index == 0 { files } else { &[] };
+        argv.extend(argv_for(&stage.as_run_request(texts), stage_files));
+    }
+    Ok(argv)
+}
+
+/// A chain ready to plan or run, plus whether history will record it —
+/// the same judgment `run_chain` makes from the merged run surface.
+pub struct ChainPrepared {
+    pub chain: crate::chain::PreparedChain,
+    pub record_history: bool,
+}
+
+/// Parse and prepare the chain through the CLI's own path: normalize
+/// splits the `--then` argv into stages, `parse_syntax` applies the
+/// stage rules, `prepare` resolves routes and runs the junction type
+/// checks — zero requests, so every misuse answers here, in the
+/// response, with the message the terminal would print.
+pub fn parse_chain(request: &ChainRequest, files: &[PathBuf]) -> AppResult<ChainPrepared> {
+    for (index, stage) in request.stages.iter().enumerate() {
+        if let Err(e) = check_task_name(&stage.task) {
+            return Err(AppError::usage(format!(
+                "stage {}: {}",
+                index + 1,
+                e.message
+            )));
+        }
+    }
+    let argv = chain_argv(request, files)?;
+    let normalized = cli::normalize(argv).map_err(|e| AppError::usage(format!("{e}")))?;
+    let Normalized::Chain { stages } = normalized else {
+        return Err(AppError::usage(
+            "a chain needs at least two stages joined by --then",
+        ));
+    };
+    let syntax = crate::chain::parse_syntax(stages).map_err(|e| match e {
+        crate::chain::ChainParseError::Usage(e) => e,
+        // The UI never asks a stage for --help; reaching for it is a
+        // bug, not a display request.
+        crate::chain::ChainParseError::Display(_) => {
+            AppError::usage("a chain stage asked for --help, which the web UI never sends")
+        }
+    })?;
+    let cfg = crate::config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
+    let chain = crate::chain::prepare(syntax, &cfg)?;
+    let record_history = !chain.run_cli.no_history
+        && cfg
+            .settings
+            .history_keep
+            .unwrap_or(crate::history::DEFAULT_KEEP)
+            > 0;
+    Ok(ChainPrepared {
+        chain,
+        record_history,
+    })
 }

@@ -39,6 +39,8 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/api/tasks/{name}", get(task_show))
         .route("/api/profiles", get(profiles_list))
         .route("/api/config", get(config_show).put(config_save))
+        .route("/api/chain", post(chain_create))
+        .route("/api/chain/preview", post(chain_preview))
         .route("/api/runs", get(runs_list).post(runs_create))
         .route("/api/runs/preview", post(runs_preview))
         .route("/api/runs/{id}", get(run_show))
@@ -46,13 +48,22 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/api/runs/{id}/cancel", post(run_cancel))
         .route("/api/runs/{id}/artifacts/{aid}", get(run_artifact))
         .fallback(assets_fallback)
-        .layer(DefaultBodyLimit::max(
-            // The plan's own input budgets (per file, per run) still
-            // bind below this; the ceiling is only the HTTP headroom.
-            160 * 1024 * 1024,
-        ))
+        .layer(DefaultBodyLimit::max(body_limit()))
         .layer(from_fn_with_state(state.clone(), guard::check))
         .with_state(state)
+}
+
+/// The HTTP ceiling sits above the run's own input budget (a
+/// configurable `input_bytes` larger than the default must not have its
+/// requests die at the transport instead of at aido's own rules).
+fn body_limit() -> usize {
+    const DEFAULT_INPUT_BYTES: u64 = 128 * 1024 * 1024;
+    const HEADROOM: u64 = 32 * 1024 * 1024;
+    let input = crate::config::load()
+        .ok()
+        .and_then(|c| c.settings.input_bytes)
+        .unwrap_or(DEFAULT_INPUT_BYTES);
+    (input + HEADROOM) as usize
 }
 
 async fn health(State(_state): State<Arc<UiState>>) -> Json<serde_json::Value> {
@@ -297,12 +308,12 @@ async fn run_artifact(Path((id, aid)): Path<(String, String)>) -> Response {
 
 // --- starting runs ---------------------------------------------------------
 
-/// Parse the multipart body: one `request` field (the JSON RunRequest)
-/// and any number of `file` fields, in order.
-async fn parse_multipart(
+/// Parse the multipart body: one `request` field (the JSON body of a
+/// run or a chain) and any number of `file` fields, in order.
+async fn parse_multipart<T: serde::de::DeserializeOwned>(
     mut multipart: Multipart,
-) -> Result<(RunRequest, Vec<(String, Vec<u8>)>), String> {
-    let mut request: Option<RunRequest> = None;
+) -> Result<(T, Vec<(String, Vec<u8>)>), String> {
+    let mut request: Option<T> = None;
     let mut files = Vec::new();
     while let Some(field) = multipart.next_field().await.map_err(|e| e.to_string())? {
         match field.name().unwrap_or_default() {
@@ -578,6 +589,91 @@ async fn config_save(Json(body): Json<ConfigPut>) -> Response {
         "ok": true,
         "path": path.display().to_string(),
         "issues": crate::config::check(&parsed),
+    }))
+    .into_response()
+}
+
+// --- chains ----------------------------------------------------------------
+
+/// Start a chain run. The whole plan-time contract — stage parsing,
+/// route resolution, the junction type checks — runs here, so a chain
+/// that cannot work answers immediately with the CLI's own message and
+/// zero requests.
+async fn chain_create(State(state): State<Arc<UiState>>, multipart: Multipart) -> Response {
+    let (request, files) = match parse_multipart::<super::invoke::ChainRequest>(multipart).await {
+        Ok(parsed) => parsed,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let built = tokio::task::spawn_blocking(move || {
+        let (landed, paths) = invoke::land_uploads(files)?;
+        let prepared = invoke::parse_chain(&request, &paths)?;
+        // The plan holds stage 1's gathered inputs; the landed copies go.
+        drop(landed);
+        Ok::<_, AppError>((prepared.chain, prepared.record_history))
+    })
+    .await;
+    let (chain, record_history) = match built {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    let run_id = if record_history {
+        history::new_run_id()
+    } else {
+        history::stamp_now()
+    };
+    runs::spawn_chain(chain, state.runs.clone(), run_id.clone(), record_history);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    )
+        .into_response()
+}
+
+/// The chain's dry-run: `describe_chain`'s per-stage blocks, rendered
+/// against the same non-tty, clipboard-less environment a UI run would
+/// execute in — zero requests.
+async fn chain_preview(State(_state): State<Arc<UiState>>, multipart: Multipart) -> Response {
+    let (request, files) = match parse_multipart::<super::invoke::ChainRequest>(multipart).await {
+        Ok(parsed) => parsed,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let built = tokio::task::spawn_blocking(move || {
+        let (landed, paths) = invoke::land_uploads(files)?;
+        let prepared = invoke::parse_chain(&request, &paths)?;
+        let cfg = crate::config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
+        let terminal = crate::plan::TerminalInfo {
+            stdin: false,
+            stdout: false,
+            stderr: false,
+        };
+        let mut empty = std::io::empty();
+        let mut probe = || false;
+        let mut no_clipboard = || {
+            Err(anyhow::anyhow!(
+                "the clipboard is not available to the web UI; paste it as a file"
+            ))
+        };
+        let mut env = crate::input::InputEnv::custom(&mut empty, &mut probe, &mut no_clipboard);
+        let text = crate::chain::describe_chain(&prepared.chain, &cfg, terminal, &mut env)?;
+        drop(landed);
+        Ok::<_, AppError>((prepared.chain, text))
+    })
+    .await;
+    let (chain, text) = match built {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    Json(serde_json::json!({
+        "text": text,
+        "label": chain.task_label(),
+        "stages": chain.stages.iter().map(|stage| serde_json::json!({
+            "name": stage.task.name,
+            "profile": stage.resolved.profile_name,
+            "model": stage.resolved.model,
+            "produce": stage.resolved.produce,
+        })).collect::<Vec<_>>(),
     }))
     .into_response()
 }

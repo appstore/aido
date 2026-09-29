@@ -619,3 +619,259 @@ async fn a_config_that_cannot_load_still_opens_the_editor() {
     assert_eq!(saved["ok"], true);
     assert!(cfg_path.exists());
 }
+
+/// A provider holding back each of its replies — a chain of N stages
+/// stays in flight long enough for a test to subscribe deterministically.
+fn slow_chain_provider(
+    delay: std::time::Duration,
+    bodies: Vec<&'static str>,
+) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for body in bodies {
+            let mut stream = accept(&listener, deadline);
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, handle)
+}
+
+async fn post_chain(
+    server: &UiServer,
+    body: serde_json::Value,
+    files: &[(&str, &[u8])],
+) -> reqwest::Response {
+    let mut form = reqwest::multipart::Form::new().text("request", body.to_string());
+    for (name, bytes) in files {
+        form = form.part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(name.to_string()),
+        );
+    }
+    client()
+        .post(format!("http://127.0.0.1:{}/api/chain", server.port))
+        .header("x-aido-token", TOKEN)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_posted_chain_runs_stage_by_stage_and_records_one_run() {
+    let (port, provider) = slow_chain_provider(
+        std::time::Duration::from_millis(250),
+        vec![chat_body("第一阶段的输出"), chat_body("最终交付的译文")],
+    );
+    let dir = temp_dir("ui-chain");
+    let cfg = chat_cfg(&format!("http://127.0.0.1:{port}"));
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let request = serde_json::json!({
+        "stages": [
+            { "task": "ask", "prompt": "把材料原样返回", "profile": "test" },
+            { "task": "summarize" , "profile": "test" },
+        ],
+        "texts": ["链的材料"],
+    });
+    let posted = post_chain(&server, request, &[]).await;
+    assert_eq!(posted.status(), 202);
+    let run_id = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let frames = sse_frames(&server, &run_id).await;
+    let done = frames
+        .iter()
+        .find(|f| f["type"] == "done")
+        .expect("the chain closes with a done frame");
+    // The label and the record shape are the CLI's own: one run, two
+    // stages, the trailing artifact is the deliverable.
+    assert_eq!(done["task"], "ask|summarize");
+    assert_eq!(done["stages"].as_array().unwrap().len(), 2);
+    assert_eq!(done["last_stage_len"], 1);
+    assert_eq!(done["artifacts"].as_array().unwrap().len(), 2);
+    assert!(done["artifacts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("stage-1-"));
+    assert_eq!(done["artifacts"][1]["id"], "text");
+    assert_eq!(done["artifacts"][1]["size"], "最终交付的译文".len());
+
+    // One record for the whole chain; the detail answers with the same
+    // stages and the deliverable split.
+    let detail: serde_json::Value = server
+        .get(&format!("/api/runs/{run_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["task"], "ask|summarize");
+    assert_eq!(detail["stages"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["artifacts"].as_array().unwrap().len(), 2);
+    let listed: serde_json::Value = server.get("/api/runs").await.json().await.unwrap();
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+    provider.join().unwrap();
+}
+
+#[tokio::test]
+async fn chain_preview_describes_and_junction_mismatches_are_usage_errors() {
+    let (port, provider) = slow_chain_provider(
+        std::time::Duration::from_secs(1),
+        vec![chat_body("x"), chat_body("y")],
+    );
+    let cfg = chat_cfg(&format!("http://127.0.0.1:{port}"));
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", "/nonexistent/aido-test-history"),
+    ]);
+
+    // A working chain previews per-stage blocks and makes no request.
+    let good = serde_json::json!({
+        "stages": [
+            { "task": "summarize", "profile": "test" },
+            { "task": "translate" , "profile": "test" },
+        ],
+        "texts": ["preview me"],
+    });
+    let mut form = reqwest::multipart::Form::new().text("request", good.to_string());
+    let preview: serde_json::Value = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/chain/preview",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(preview["text"]
+        .as_str()
+        .unwrap()
+        .contains("chain: summarize|translate"));
+    assert_eq!(preview["label"], "summarize|translate");
+    assert_eq!(preview["stages"].as_array().unwrap().len(), 2);
+
+    // The junction contract fires at plan time, with the stage pair
+    // named: transcribe needs audio, translate produces text only.
+    let bad = serde_json::json!({
+        "stages": [
+            { "task": "translate", "profile": "test" },
+            { "task": "transcribe" , "profile": "test" },
+        ],
+        "texts": ["no audio here"],
+    });
+    form = reqwest::multipart::Form::new().text("request", bad.to_string());
+    let refused = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/chain/preview",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let refused: serde_json::Value = refused.json().await.unwrap();
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("stage 1 (translate) → stage 2 (transcribe)"),
+        "{message}"
+    );
+
+    // A one-stage "chain" is refused up front.
+    let single = serde_json::json!({ "stages": [{ "task": "summarize" }] });
+    let posted = post_chain(&server, single, &[]).await;
+    assert_eq!(posted.status(), 400);
+    drop(provider);
+}
+
+#[tokio::test]
+async fn cancelling_a_chain_keeps_the_paid_for_stages() {
+    // One held reply: the cancel lands during stage 1, so stage 2's
+    // request never exists — and the provider must not sit in accept()
+    // waiting for it (a blocking listener's accept ignores deadlines).
+    let (port, provider) =
+        slow_chain_provider(std::time::Duration::from_secs(4), vec![chat_body("held")]);
+    let dir = temp_dir("ui-chain-cancel");
+    let cfg = chat_cfg(&format!("http://127.0.0.1:{port}"));
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let request = serde_json::json!({
+        "stages": [
+            { "task": "ask", "prompt": "第一阶段", "profile": "test" },
+            { "task": "summarize", "profile": "test" },
+        ],
+        "texts": ["cancel mid-chain"],
+    });
+    let posted = post_chain(&server, request, &[]).await;
+    let run_id = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Subscribe first (the headers ARE the subscription), cancel during
+    // stage 1's held reply: the cancelled record keeps nothing (stage 1
+    // never finished), and a second cancel is a harmless 204.
+    let url = format!("/api/runs/{run_id}/events");
+    let stream = server.get(&url).await;
+    let first = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/runs/{run_id}/cancel",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 204);
+    // The second ask may land while the run is still tearing down (204,
+    // idempotent) or after the entry is gone (404) — both mean the stop
+    // registered; the stream below says which way the run ended.
+    let second = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/runs/{run_id}/cancel",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(second.status() == 204 || second.status() == 404);
+
+    let body = stream.text().await.unwrap();
+    assert!(body.contains("\"type\":\"cancelled\""), "stream: {body}");
+    let detail: serde_json::Value = server
+        .get(&format!("/api/runs/{run_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["status"]["status"], "cancelled");
+    assert!(detail["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("cancelled from the web UI"));
+    provider.join().unwrap();
+}

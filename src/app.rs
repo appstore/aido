@@ -713,7 +713,11 @@ async fn run_chain(
 ) -> AppResult<()> {
     if chain.run_cli.dry_run {
         let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
-        print!("{}", chain::describe_chain(&chain, &cfg)?);
+        let mut env = InputEnv::real();
+        print!(
+            "{}",
+            chain::describe_chain(&chain, &cfg, TerminalInfo::real(), &mut env)?
+        );
         return Ok(());
     }
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
