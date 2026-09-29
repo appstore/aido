@@ -1,5 +1,6 @@
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { hasToken } from './api';
+import Chain from './pages/Chain';
 import Config from './pages/Config';
 import History from './pages/History';
 import Run from './pages/Run';
@@ -15,6 +16,9 @@ export default function App() {
         </NavLink>
         <NavLink to="/history" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
           历史
+        </NavLink>
+        <NavLink to="/chain" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
+          链
         </NavLink>
         <NavLink to="/config" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
           配置
@@ -38,6 +42,7 @@ export default function App() {
         )}
         <Routes>
           <Route path="/" element={<Run />} />
+          <Route path="/chain" element={<Chain />} />
           <Route path="/history" element={<History />} />
           <Route path="/config" element={<Config />} />
           <Route path="/runs/:id" element={<RunDetail />} />

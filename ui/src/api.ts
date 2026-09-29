@@ -1,4 +1,6 @@
 import type {
+  ChainPreview,
+  ChainRequestPayload,
   ConfigView,
   Preview,
   ProfilesView,
@@ -120,4 +122,21 @@ export function saveConfig(toml: string): Promise<SaveResult> {
 
 export function listProfiles(): Promise<ProfilesView> {
   return json<ProfilesView>('/api/profiles');
+}
+
+export async function previewChain(
+  payload: ChainRequestPayload,
+  files: File[],
+): Promise<ChainPreview> {
+  const response = await postForm('/api/chain/preview', payload as unknown as RunRequestPayload, files);
+  return (await response.json()) as ChainPreview;
+}
+
+export async function startChain(payload: ChainRequestPayload, files: File[]): Promise<string> {
+  const response = await postForm(
+    '/api/chain',
+    payload as unknown as RunRequestPayload,
+    files,
+  );
+  return ((await response.json()) as { run_id: string }).run_id;
 }

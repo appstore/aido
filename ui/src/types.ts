@@ -172,3 +172,31 @@ export interface ProfilesView {
   default_profile: string | null;
   profiles: { name: string; provider: string | null; model: string | null; is_default: boolean }[];
 }
+
+// --- chains -----------------------------------------------------------------
+
+export interface ChainStagePayload {
+  task: string;
+  prompt?: string;
+  profile?: string;
+  model?: string;
+  to?: string;
+  voice?: string;
+  speed?: number;
+  count?: number;
+  size?: string;
+  no_split?: boolean;
+  timeout_secs?: number;
+  total_timeout_secs?: number;
+}
+
+export interface ChainRequestPayload {
+  stages: ChainStagePayload[];
+  texts?: string[];
+}
+
+export interface ChainPreview {
+  text: string;
+  label: string;
+  stages: { name: string; profile: string; model: string; produce: string[] }[];
+}
