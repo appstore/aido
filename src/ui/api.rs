@@ -5,35 +5,55 @@
 //! JSON response — they are served by their own endpoint, by mime.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::from_fn_with_state;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
+use tokio_stream::StreamExt as _;
 
 use super::assets;
 use super::guard::{self, Guard};
+use super::invoke::{self, RunRequest};
+use super::runs::{self, Runs, SseEvent};
 use crate::domain::{AppError, Artifact, GenerationStatus, RunRecord, JSON_ENVELOPE_VERSION};
 use crate::history;
 use crate::tasks::{Task, TaskParam, COUNT_RANGE, SIZE_CHOICES, SPEED_RANGE};
 
-pub fn router(guard: Arc<Guard>) -> Router {
+/// Everything the handlers share: the request gate and the live runs.
+#[derive(Clone)]
+pub struct UiState {
+    pub guard: Arc<Guard>,
+    pub runs: Arc<Runs>,
+}
+
+pub fn router(state: Arc<UiState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/tasks", get(tasks_list))
         .route("/api/tasks/{name}", get(task_show))
-        .route("/api/runs", get(runs_list))
+        .route("/api/runs", get(runs_list).post(runs_create))
+        .route("/api/runs/preview", post(runs_preview))
         .route("/api/runs/{id}", get(run_show))
+        .route("/api/runs/{id}/events", get(run_events))
+        .route("/api/runs/{id}/cancel", post(run_cancel))
         .route("/api/runs/{id}/artifacts/{aid}", get(run_artifact))
         .fallback(assets_fallback)
-        .layer(from_fn_with_state(guard.clone(), guard::check))
-        .with_state(guard)
+        .layer(DefaultBodyLimit::max(
+            // The plan's own input budgets (per file, per run) still
+            // bind below this; the ceiling is only the HTTP headroom.
+            160 * 1024 * 1024,
+        ))
+        .layer(from_fn_with_state(state.clone(), guard::check))
+        .with_state(state)
 }
 
-async fn health(State(_guard): State<Arc<Guard>>) -> Json<serde_json::Value> {
+async fn health(State(_state): State<Arc<UiState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "ok": true,
@@ -213,7 +233,9 @@ async fn run_show(Path(id): Path<String>) -> Response {
     Json(run_dto(&record)).into_response()
 }
 
-fn run_dto(record: &RunRecord) -> serde_json::Value {
+/// The record as the done frame and the detail endpoint both serve it
+/// (runs.rs flattens this into its SSE `done`).
+pub(super) fn run_dto(record: &RunRecord) -> serde_json::Value {
     serde_json::json!({
         "version": JSON_ENVELOPE_VERSION,
         "run_id": record.run_id,
@@ -269,4 +291,152 @@ async fn run_artifact(Path((id, aid)): Path<(String, String)>) -> Response {
         artifact.bytes.clone(),
     )
         .into_response()
+}
+
+// --- starting runs ---------------------------------------------------------
+
+/// Parse the multipart body: one `request` field (the JSON RunRequest)
+/// and any number of `file` fields, in order.
+async fn parse_multipart(
+    mut multipart: Multipart,
+) -> Result<(RunRequest, Vec<(String, Vec<u8>)>), String> {
+    let mut request: Option<RunRequest> = None;
+    let mut files = Vec::new();
+    while let Some(field) = multipart.next_field().await.map_err(|e| e.to_string())? {
+        match field.name().unwrap_or_default() {
+            "request" => {
+                let text = field.text().await.map_err(|e| e.to_string())?;
+                request = Some(
+                    serde_json::from_str(&text)
+                        .map_err(|e| format!("the request field is not valid: {e}"))?,
+                );
+            }
+            "file" => {
+                let name = field.file_name().unwrap_or("upload").to_string();
+                let bytes = field.bytes().await.map_err(|e| e.to_string())?;
+                files.push((name, bytes.to_vec()));
+            }
+            other => return Err(format!("unexpected multipart field '{other}'")),
+        }
+    }
+    let request = request.ok_or("the body must carry one 'request' field")?;
+    Ok((request, files))
+}
+
+/// Land the uploads and build the plan — the blocking half of starting
+/// a run, off the async workers. Returns Err with the message the CLI
+/// would have printed for the same mistake.
+fn prepare(
+    request: RunRequest,
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<crate::plan::ExecutionPlan, AppError> {
+    let (landed, paths) = invoke::land_uploads(files)?;
+    let invocation = invoke::parse(&request, &paths)?;
+    let plan = invoke::build_plan(&invocation)?;
+    // The plan holds the gathered inputs; the landed copies can go.
+    drop(landed);
+    Ok(plan)
+}
+
+/// Start a run. The plan (validation included) is built here, so every
+/// usage mistake answers immediately with the CLI's own message; the
+/// run id exists before the first request, exactly as run_task reserves
+/// it, so a cancel mid-flight still records.
+async fn runs_create(State(state): State<Arc<UiState>>, multipart: Multipart) -> Response {
+    let (request, files) = match parse_multipart(multipart).await {
+        Ok(parsed) => parsed,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let built = tokio::task::spawn_blocking(move || prepare(request, files)).await;
+    let plan = match built {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    let run_id = if plan.record_history {
+        history::new_run_id()
+    } else {
+        history::stamp_now()
+    };
+    runs::spawn(plan, state.runs.clone(), run_id.clone());
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    )
+        .into_response()
+}
+
+/// The dry-run of the UI: the same plan a run would build, described,
+/// with zero requests (the provider never hears about it).
+async fn runs_preview(State(_state): State<Arc<UiState>>, multipart: Multipart) -> Response {
+    let (request, files) = match parse_multipart(multipart).await {
+        Ok(parsed) => parsed,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let built = tokio::task::spawn_blocking(move || {
+        let (landed, paths) = invoke::land_uploads(files)?;
+        let mut invocation = invoke::parse(&request, &paths)?;
+        invocation.cli.dry_run = true;
+        invoke::build_plan(&invocation).map(|plan| (plan, landed))
+    })
+    .await;
+    let (plan, _landed) = match built {
+        Ok(Ok(built)) => built,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    Json(serde_json::json!({
+        "text": crate::plan::describe(&plan),
+        "task": plan.task.name,
+        "profile": plan.resolved.profile_name,
+        "model": plan.resolved.model,
+        "adapter": plan.resolved.adapter.to_string(),
+        "steps": plan.steps.iter().map(|s| serde_json::json!({
+            "label": s.label,
+            "part": s.part,
+            "role": format!("{:?}", s.role).to_lowercase(),
+        })).collect::<Vec<_>>(),
+        "destinations": plan.destinations.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+        "credentials_available": plan.credentials_available,
+    }))
+    .into_response()
+}
+
+/// One live run's progress, as SSE. The stream ends when the run does
+/// (its closing frame is `done`, `error` or `cancelled`); a run that is
+/// not live answers 404 and the detail endpoint tells the rest.
+async fn run_events(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Response {
+    let Some(receiver) = state.runs.subscribe(&id) else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("no live run '{id}'; GET /api/runs/{id} tells what it became"),
+        );
+    };
+    let stream = tokio_stream::wrappers::BroadcastStream::new(receiver).map(|item| {
+        let event = match item {
+            Ok(event) => event,
+            // The subscriber fell behind a fast stream; history keeps
+            // the whole truth, and the closing frame still arrives.
+            Err(_) => SseEvent::Warning {
+                text: "events were skipped to keep up; the final frame is authoritative".into(),
+            },
+        };
+        let data = serde_json::to_string(&event)
+            .unwrap_or_else(|_| r#"{"type":"warning","text":"an event failed to encode"}"#.into());
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+async fn run_cancel(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Response {
+    if state.runs.cancel(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("no live run '{id}' to cancel"),
+        )
+    }
 }

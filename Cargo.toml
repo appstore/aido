@@ -18,7 +18,7 @@ edge-tts = ["dep:kothok-edge-tts", "dep:futures-util"]
 # (which ships a placeholder index.html) builds and runs without node —
 # CI builds the real assets before release builds. Pure Rust throughout:
 # no new C, and --no-default-features drops it with everything else.
-ui = ["dep:axum", "dep:rust-embed", "tokio/net"]
+ui = ["dep:axum", "dep:rust-embed", "dep:tokio-stream", "tokio/net"]
 # Static pdfium rendering for PDFs aido cannot extract anything from
 # (vector-drawn pages). Off by default: the build needs PDFIUM_LIB_DIR
 # pointing at a static pdfium archive (see build.rs), and the binary
@@ -65,6 +65,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # debug 构建运行时读盘（cargo-only 检出凭占位 index.html 也能构建）。
 # 不开 debug-embed，保持 debug 的读盘行为作为前端开发回路。
 rust-embed = { version = "8", optional = true }
+# SSE 的事件桥（"ui" feature）：BroadcastStream 把 run 线程的 broadcast
+# 接收端变成响应流；sync feature 是它唯一需要的部分。
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

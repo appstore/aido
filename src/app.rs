@@ -806,7 +806,9 @@ fn best_effort(result: Result<()>, what: &str) {
     }
 }
 
-fn now_iso() -> String {
+/// Wall-clock UTC as ISO 8601 — the stamp every record carries (the ui
+/// server's records use it too, so CLI and UI records read alike).
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

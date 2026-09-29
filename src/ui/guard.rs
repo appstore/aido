@@ -16,6 +16,8 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use super::api::UiState;
+
 /// What every request is checked against: the session token and the
 /// port the server actually bound (the URL was built from it, so the
 /// Host check uses the same truth).
@@ -24,7 +26,8 @@ pub struct Guard {
     pub port: u16,
 }
 
-pub async fn check(State(guard): State<Arc<Guard>>, req: Request, next: Next) -> Response {
+pub async fn check(State(state): State<Arc<UiState>>, req: Request, next: Next) -> Response {
+    let guard = &state.guard;
     let host = req
         .headers()
         .get(header::HOST)

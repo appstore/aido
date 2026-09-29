@@ -9,6 +9,8 @@
 mod api;
 mod assets;
 mod guard;
+mod invoke;
+mod runs;
 
 #[cfg(test)]
 mod tests;
@@ -34,7 +36,10 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> AppResult<()> {
         .map(|a| a.port())
         .map_err(|e| AppError::usage(format!("cannot tell the bound port: {e}")))?;
     let url = format!("http://127.0.0.1:{port}/?t={token}");
-    let state = Arc::new(guard::Guard { token, port });
+    let state = Arc::new(api::UiState {
+        guard: Arc::new(guard::Guard { token, port }),
+        runs: runs::Runs::shared(),
+    });
     let app = api::router(state);
     println!("aido ui listening on {url}");
     if !no_open {
