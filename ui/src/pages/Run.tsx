@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ApiError, cancelRun, listTasks, previewRun, startRun } from '../api';
+import { ApiError, cancelRun, listProfiles, listTasks, previewRun, startRun } from '../api';
 import ArtifactViewer from '../components/ArtifactViewer';
 import Dropzone from '../components/Dropzone';
 import ParamForm, { type ParamValues } from '../components/ParamForm';
@@ -24,6 +24,9 @@ export default function Run() {
   const [model, setModel] = useState('');
   const [advanced, setAdvanced] = useState(false);
   const [noSplit, setNoSplit] = useState(false);
+  // What --profile may name: the config's own profiles, or the built-in
+  // "default" when the user defined none (the config's own rule).
+  const [profileNames, setProfileNames] = useState<string[]>(['default']);
 
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewError, setPreviewError] = useState('');
@@ -42,6 +45,15 @@ export default function Run() {
         if (all.length > 0) setTaskName(all[0].name);
       })
       .catch((e: ApiError) => setLoadError(e.message));
+    listProfiles()
+      .then((view) => {
+        const names = view.profiles.map((p) => p.name);
+        setProfileNames(names.length > 0 ? names : ['default']);
+      })
+      .catch(() => {
+        // An unloadable config keeps the free-text box; the plan's own
+        // error names the available profiles anyway.
+      });
   }, []);
 
   const task = useMemo(() => tasks?.find((t) => t.name === taskName) ?? null, [tasks, taskName]);
@@ -262,10 +274,16 @@ export default function Run() {
                   <label htmlFor="adv-profile">--profile</label>
                   <input
                     id="adv-profile"
+                    list="profile-names"
                     value={profile}
                     placeholder="默认"
                     onChange={(e) => setProfile(e.target.value)}
                   />
+                  <datalist id="profile-names">
+                    {profileNames.map((name) => (
+                      <option key={name} value={name} />
+                    ))}
+                  </datalist>
                 </div>
                 <div className="param">
                   <label htmlFor="adv-model">--model</label>

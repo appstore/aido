@@ -1,4 +1,13 @@
-import type { Preview, RunReport, RunRequestPayload, RunRow, Task } from './types';
+import type {
+  ConfigView,
+  Preview,
+  ProfilesView,
+  RunReport,
+  RunRequestPayload,
+  RunRow,
+  SaveResult,
+  Task,
+} from './types';
 
 // The session token: `aido ui` prints one URL (`?t=…`); landing there
 // keeps the token for the session. Development pins it through
@@ -92,4 +101,20 @@ export async function startRun(payload: RunRequestPayload, files: File[]): Promi
 
 export async function cancelRun(runId: string): Promise<void> {
   await request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
+}
+
+export function getConfig(): Promise<ConfigView> {
+  return json<ConfigView>('/api/config');
+}
+
+export function saveConfig(toml: string): Promise<SaveResult> {
+  return request('/api/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ toml }),
+  }).then((r) => r.json());
+}
+
+export function listProfiles(): Promise<ProfilesView> {
+  return json<ProfilesView>('/api/profiles');
 }

@@ -120,3 +120,49 @@ export interface RunRequestPayload {
   total_timeout_secs?: number;
   texts?: string[];
 }
+
+// --- configuration ---------------------------------------------------------
+
+export interface ProfileEntry {
+  name: string;
+  provider: string | null;
+  model: string | null;
+  operations: string[] | null;
+  input_types: string[] | null;
+  output_types: string[] | null;
+  is_default: boolean;
+}
+
+export interface ProviderEntry {
+  name: string;
+  base_url: string | null;
+  api_key_env: string | null;
+  routes: Record<string, string>;
+}
+
+export interface ConfigEffective {
+  default_profile: string | null;
+  profiles: ProfileEntry[];
+  providers: ProviderEntry[];
+  settings: Record<string, number | boolean | null>;
+}
+
+export interface ConfigView {
+  path: string | null;
+  exists: boolean;
+  raw: string;
+  effective: ConfigEffective | null;
+  load_error: string | null;
+  issues: string[];
+}
+
+export interface SaveResult {
+  ok: boolean;
+  path: string;
+  issues: string[];
+}
+
+export interface ProfilesView {
+  default_profile: string | null;
+  profiles: { name: string; provider: string | null; model: string | null; is_default: boolean }[];
+}

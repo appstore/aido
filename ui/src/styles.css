@@ -620,3 +620,54 @@ button.danger {
   background: none;
   padding: 2px 0;
 }
+
+/* --- config page --- */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.tab {
+  padding: 5px 14px;
+  border-radius: 999px;
+}
+
+.tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 4px 12px;
+  align-items: baseline;
+  padding: 3px 0;
+}
+
+.kv .k {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.toml-editor {
+  width: 100%;
+  min-height: 420px;
+  background: #101216;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 12px;
+  resize: vertical;
+}
+
+.banner.ok {
+  background: rgba(63, 178, 127, 0.12);
+  border: 1px solid rgba(63, 178, 127, 0.4);
+}
