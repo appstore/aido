@@ -14,9 +14,15 @@ export default function StreamView({
   warnings: string[];
   onCancel: () => void;
 }) {
-  const bottom = useRef<HTMLDivElement>(null);
+  const pre = useRef<HTMLPreElement>(null);
+  const bottom = useRef<HTMLSpanElement>(null);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ block: 'nearest' });
+    const el = pre.current;
+    if (!el) return;
+    // Follow the stream only when the reader is already at the bottom —
+    // a scroll up means they are reading, not watching.
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (near) bottom.current?.scrollIntoView({ block: 'nearest' });
   }, [text]);
 
   return (
@@ -35,9 +41,9 @@ export default function StreamView({
           取消
         </button>
       </div>
-      <pre className="stream-text">
+      <pre className="stream-text" ref={pre}>
         {text || '（等待第一个字符……）'}
-        <div ref={bottom} />
+        <span ref={bottom} />
       </pre>
       {warnings.length > 0 && (
         <ul className="warnings">

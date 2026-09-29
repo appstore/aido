@@ -36,7 +36,10 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
     headers: { 'X-Aido-Token': token, ...(init?.headers ?? {}) },
   });
   if (!response.ok) {
-    let message = `HTTP ${response.status}`;
+    let message =
+      response.status === 401
+        ? '会话令牌缺失或无效：请从 aido ui 打印的链接进入（URL 里的 ?t=…）'
+        : `HTTP ${response.status}`;
     try {
       const body = (await response.json()) as { error?: { message?: string } };
       message = body.error?.message ?? message;

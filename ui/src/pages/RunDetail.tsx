@@ -23,7 +23,16 @@ export default function RunDetail() {
     };
   }, [id]);
 
-  if (error) return <div className="banner bad">找不到这次运行：{error}</div>;
+  if (error) {
+    return (
+      <div>
+        <div className="banner bad">找不到这次运行：{error}</div>
+        <Link className="link" to="/history">
+          ← 历史
+        </Link>
+      </div>
+    );
+  }
   if (!report) return <div className="empty">加载记录……</div>;
 
   const summary = report.summary;

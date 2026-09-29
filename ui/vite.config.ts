@@ -10,7 +10,13 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8710', changeOrigin: true },
+      // changeOrigin rewrites Host but not Origin; the browser sends
+      // Origin on every non-GET, and the guard would 403 this origin.
+      '/api': {
+        target: 'http://127.0.0.1:8710',
+        changeOrigin: true,
+        configure: (proxy) => proxy.on('proxyReq', (req) => req.removeHeader('origin')),
+      },
     },
   },
 });

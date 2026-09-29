@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ApiError, cancelRun, listProfiles, listTasks, previewRun, startRun } from '../api';
+import { ApiError, cancelRun, getRun, listProfiles, listTasks, previewRun, startRun } from '../api';
 import ArtifactViewer from '../components/ArtifactViewer';
 import Dropzone from '../components/Dropzone';
 import ParamForm, { type ParamValues } from '../components/ParamForm';
@@ -31,12 +31,17 @@ export default function Run() {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [previewError, setPreviewError] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
+  const [starting, setStarting] = useState(false);
   const [runId, setRunId] = useState('');
   const [streamText, setStreamText] = useState('');
   const [step, setStep] = useState<{ done: number; total: number; label: string } | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [report, setReport] = useState<RunReport | null>(null);
   const [failure, setFailure] = useState('');
+  // Whether the failed phase has a history record to link to: cancelled
+  // runs are recorded, error-frame runs (a failed execute) are not.
+  const [failureHasRecord, setFailureHasRecord] = useState(false);
+  const closeStream = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     listTasks()
@@ -54,7 +59,16 @@ export default function Run() {
         // An unloadable config keeps the free-text box; the plan's own
         // error names the available profiles anyway.
       });
+    // A mid-run navigation must not leave the stream pushing into a
+    // dead page.
+    return () => closeStream.current?.();
   }, []);
+
+  // --no-split only exists for the slicing processors; switching tasks
+  // must not carry it invisibly.
+  useEffect(() => {
+    setNoSplit(false);
+  }, [taskName]);
 
   const task = useMemo(() => tasks?.find((t) => t.name === taskName) ?? null, [tasks, taskName]);
 
@@ -85,15 +99,27 @@ export default function Run() {
     if (prompt.trim()) parts.push(`-p ${JSON.stringify(prompt.trim())}`);
     if (profile.trim()) parts.push(`--profile ${profile.trim()}`);
     if (model.trim()) parts.push(`--model ${model.trim()}`);
+    if (noSplit) parts.push('--no-split');
     if (task) {
       for (const spec of task.params) {
         const value = (params[spec.name] ?? '').trim();
-        if (value) parts.push(`--${spec.name} ${value}`);
+        if (!value) continue;
+        if (
+          (spec.kind === 'number' || spec.kind === 'integer') &&
+          Number.isNaN(Number(value))
+        ) {
+          continue;
+        }
+        parts.push(
+          spec.kind === 'language' || spec.kind === 'string'
+            ? `--${spec.name} ${JSON.stringify(value)}`
+            : `--${spec.name} ${value}`,
+        );
       }
     }
     for (const text of texts) parts.push(`--text ${JSON.stringify(text)}`);
     return parts.join(' ');
-  }, [task, taskName, params, prompt, profile, model, files, texts]);
+  }, [task, taskName, params, prompt, profile, model, noSplit, files, texts]);
 
   async function doPreview() {
     setPreviewError('');
@@ -106,41 +132,74 @@ export default function Run() {
   }
 
   async function doRun() {
+    if (starting || phase === 'running') return;
+    setStarting(true);
     setPreviewError('');
     setFailure('');
     setReport(null);
+    setFailureHasRecord(false);
     setWarnings([]);
     setStreamText('');
     setStep(null);
+    // Settled by a closing frame, or by the onEnd fallback below.
+    let settled = false;
     try {
       const id = await startRun(payload(), files);
       setRunId(id);
       setPhase('running');
-      // The late subscriber's contract: events broadcast before
-      // subscribing are gone; the done frame and the detail endpoint
-      // carry the whole truth.
-      subscribe(id, (frame: Frame | DoneFrame) => {
-        if (frame.type === 'delta') {
-          setStreamText((current) => current + frame.text);
-        } else if (frame.type === 'step') {
-          setStep({ done: frame.done, total: frame.total, label: frame.label });
-        } else if (frame.type === 'warning') {
-          setWarnings((current) => [...current, frame.text]);
-        } else if (frame.type === 'done') {
-          const done = frame as DoneFrame;
-          setReport(done);
-          setPhase('done');
-        } else if (frame.type === 'error') {
-          setFailure(`${frame.kind}: ${frame.message}`);
-          setPhase('failed');
-        } else if (frame.type === 'cancelled') {
-          setFailure('已取消。');
-          setPhase('failed');
-        }
-      });
+      closeStream.current = subscribe(
+        id,
+        (frame: Frame | DoneFrame) => {
+          if (frame.type === 'delta') {
+            setStreamText((current) => current + frame.text);
+          } else if (frame.type === 'step') {
+            setStep({ done: frame.done, total: frame.total, label: frame.label });
+          } else if (frame.type === 'warning') {
+            setWarnings((current) => [...current, frame.text]);
+          } else if (frame.type === 'done') {
+            settled = true;
+            setReport(frame as DoneFrame);
+            setPhase('done');
+          } else if (frame.type === 'error') {
+            // An execute error leaves no record — do not offer one.
+            settled = true;
+            setFailure(`${frame.kind}: ${frame.message}`);
+            setPhase('failed');
+          } else if (frame.type === 'cancelled') {
+            settled = true;
+            setFailureHasRecord(true);
+            setFailure('已取消。');
+            setPhase('failed');
+          }
+        },
+        () => {
+          // The stream ended with no closing frame: the run finished
+          // between the 202 and this subscription (a fast failure wins
+          // that race). History is the truth; without a record, say so.
+          if (settled) return;
+          settled = true;
+          getRun(id)
+            .then((record) => {
+              setFailureHasRecord(true);
+              setReport(record);
+              if (record.error || record.status.status !== 'complete') {
+                setFailure(record.error?.message ?? record.status.reason ?? '运行未完成。');
+                setPhase('failed');
+              } else {
+                setPhase('done');
+              }
+            })
+            .catch(() => {
+              setFailure('运行中断，未留下记录（连接失败或服务未及应答）。');
+              setPhase('failed');
+            });
+        },
+      );
     } catch (e) {
       setFailure(e instanceof ApiError ? e.message : String(e));
       setPhase('failed');
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -154,9 +213,12 @@ export default function Run() {
   }
 
   function reset() {
+    closeStream.current?.();
+    closeStream.current = null;
     setPhase('idle');
     setReport(null);
     setFailure('');
+    setFailureHasRecord(false);
     setStreamText('');
     setStep(null);
     setWarnings([]);
@@ -206,7 +268,7 @@ export default function Run() {
         <div className="card result">
           <div className="card-title">
             {runId ? '运行失败' : '无法开始'}
-            {runId && (
+            {runId && failureHasRecord && (
               <span className="chips">
                 <Link className="link" to={`/runs/${runId}`}>
                   查看记录 →
@@ -216,9 +278,7 @@ export default function Run() {
             <button onClick={reset}>返回</button>
           </div>
           <div className="banner bad">{failure}</div>
-          {streamText && (
-            <pre className="artifact-text">{streamText}</pre>
-          )}
+          {streamText && <pre className="artifact-text">{streamText}</pre>}
         </div>
       ) : (
         <>
@@ -303,11 +363,15 @@ export default function Run() {
               <code>{equivalent}</code>
             </div>
             <div className="actions">
-              <button onClick={doPreview} disabled={!taskName}>
+              <button onClick={doPreview} disabled={!taskName || starting}>
                 预览（dry-run）
               </button>
-              <button className="primary" onClick={doRun} disabled={!taskName}>
-                运行
+              <button
+                className="primary"
+                onClick={doRun}
+                disabled={!taskName || starting}
+              >
+                {starting ? '提交中……' : '运行'}
               </button>
             </div>
           </section>

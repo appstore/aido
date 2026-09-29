@@ -38,7 +38,10 @@ function ArtifactCell({ runId, artifact }: { runId: string; artifact: Artifact }
     if (artifact.kind !== 'text') return;
     let alive = true;
     fetch(artifactUrl(runId, artifact.id))
-      .then((r) => r.text())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
       .then((body) => alive && setText(body))
       .catch(() => alive && setText('（无法读取产物）'));
     return () => {
@@ -60,7 +63,9 @@ function ArtifactCell({ runId, artifact }: { runId: string; artifact: Artifact }
               复制
             </button>
           )}
-          <a className="link" href={artifactUrl(runId, artifact.id)} download={artifact.id}>
+          {/* bare `download` keeps the server's Content-Disposition name
+              (id + extension) instead of the bare artifact id */}
+          <a className="link" href={artifactUrl(runId, artifact.id)} download>
             下载
           </a>
         </span>

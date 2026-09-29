@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { listRuns } from '../api';
+import { ApiError, listRuns } from '../api';
 import StatusBadge from '../components/StatusBadge';
 import type { RunRow } from '../types';
 
@@ -13,11 +13,14 @@ export default function History() {
   const [task, setTask] = useState('');
   const [status, setStatus] = useState('');
 
+  const [authorized, setAuthorized] = useState(true);
   const refresh = useCallback(async () => {
     try {
       setRows(await listRuns({ task: task.trim() || undefined, status: status || undefined }));
       setError('');
+      setAuthorized(true);
     } catch (e) {
+      if (e instanceof ApiError && e.status === 401) setAuthorized(false);
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [task, status]);
@@ -27,7 +30,7 @@ export default function History() {
     // Poll while the tab is visible: runs land here from the run page,
     // the terminal, and watch daemons alike.
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') refresh();
+      if (document.visibilityState === 'visible' && authorized) refresh();
     }, 5000);
     return () => window.clearInterval(timer);
   }, [refresh]);

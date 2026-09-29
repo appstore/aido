@@ -76,7 +76,12 @@ export interface RunReport {
   warnings: string[];
   failed_parts: { part: string; error: string }[];
   parts_total: number;
-  deliveries?: { destination: string; status: string }[];
+  // DeliveryState as serde writes it: a tagged destination and an
+  // externally tagged status (UI runs deliver nothing, CLI runs do).
+  deliveries?: {
+    destination: { type: 'stdout' | 'file' | 'directory' | 'clipboard'; path?: string };
+    status: 'pending' | 'succeeded' | { failed: { error: string } };
+  }[];
   stages?: RunSummary[];
   last_stage_len?: number;
   error?: { kind: string; message: string };
@@ -101,8 +106,9 @@ export type Frame =
   | { type: 'error'; kind: string; message: string }
   | { type: 'cancelled'; run_id: string };
 
-// RunReport doubles as the done frame's payload (the frame flattens it,
-// so its own "type" key is overwritten by the frame tag).
+// RunReport doubles as the done frame's payload: the frame's serde tag
+// is written first, then the report's keys flatten into the same object
+// (no report key is named "type", so the tag survives).
 export type DoneFrame = Frame & { type: 'done' } & RunReport;
 
 export interface RunRequestPayload {
