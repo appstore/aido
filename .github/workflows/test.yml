@@ -53,6 +53,13 @@ jobs:
           python3 scripts/check_no_inline_tests.py --self-test
           python3 scripts/check_no_inline_tests.py src
 
+      # rust-embed 编译期要求 ui/dist 存在；cargo-only 检出靠这个占位文件
+      # （npm build 的 emptyOutDir 会清空 dist，public/ 的副本负责每次构建
+      # 后自动再生它——U01 的防回归）。
+      - name: Web UI placeholder exists
+        if: runner.os == 'Linux'
+        run: test -f ui/dist/.placeholder
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
