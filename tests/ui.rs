@@ -48,7 +48,15 @@ impl UiServer {
             .stderr(Stdio::null())
             .env("AIDO_UI_TOKEN", TOKEN)
             .env("AIDO_TASKS_DIR", "/nonexistent/aido-test-tasks");
-        for var in ["AIDO_PROFILE", "OPENAI_API_KEY", "AIDO_API_KEY"] {
+        // Same discipline as the CLI harness: no developer's ambient
+        // config or history leaks into a test; each test sets its own.
+        for var in [
+            "AIDO_PROFILE",
+            "OPENAI_API_KEY",
+            "AIDO_API_KEY",
+            "AIDO_CONFIG",
+            "AIDO_HISTORY_DIR",
+        ] {
             cmd.env_remove(var);
         }
         for (key, value) in envs {
@@ -283,10 +291,14 @@ fn slow_provider(
     body: &'static str,
 ) -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Nonblocking, or support::accept's 30s deadline is dead code and a
+    // cancel-before-connect race hangs the suite forever.
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut stream = accept(&listener, deadline);
+        stream.set_nonblocking(false).unwrap();
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf);
         std::thread::sleep(delay);
@@ -627,11 +639,15 @@ fn slow_chain_provider(
     bodies: Vec<&'static str>,
 ) -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Nonblocking, or support::accept's 30s deadline is dead code and a
+    // cancel-before-connect race hangs the suite forever.
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         for body in bodies {
             let mut stream = accept(&listener, deadline);
+            stream.set_nonblocking(false).unwrap();
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
             std::thread::sleep(delay);
@@ -874,4 +890,104 @@ async fn cancelling_a_chain_keeps_the_paid_for_stages() {
         .unwrap()
         .contains("cancelled from the web UI"));
     provider.join().unwrap();
+}
+
+#[tokio::test]
+async fn the_sse_query_token_path_the_spa_uses_is_authorized() {
+    // The SPA's EventSource cannot send headers — the query string is
+    // its only token channel, and no other test exercises it (every
+    // helper goes through the header). This is exactly its shape.
+    let (port, provider) = slow_provider(
+        std::time::Duration::from_millis(250),
+        chat_body("via query token"),
+    );
+    let dir = temp_dir("ui-sse-query");
+    let cfg = chat_cfg(&format!("http://127.0.0.1:{port}"));
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+    let request = serde_json::json!({ "task": "summarize", "profile": "test" });
+    let posted = post_run(&server, &request, &[("note.txt", b"token by query")]).await;
+    let run_id = posted.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No header on this request — only ?t=.
+    let body = client()
+        .get(format!(
+            "http://127.0.0.1:{}/api/runs/{run_id}/events?t={TOKEN}",
+            server.port
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("\"type\":\"delta\""), "stream: {body}");
+    assert!(body.contains("via query token"));
+    assert!(body.contains("\"type\":\"done\""));
+    provider.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_cli_partial_batch_reads_back_as_partial_through_the_ui() {
+    // The UI cannot run a per-part batch yet (U04: --out-dir is not a
+    // UI field), but the CLI's exit-6 runs land in the same history —
+    // the list must call them "partial" and the detail must carry the
+    // failed-parts list it promises.
+    let provider = MultiServer::start_statuses(&[
+        ("200 OK", chat_body("SURVIVOR")),
+        ("500 Internal Server Error", "{\"error\":\"boom\"}"),
+    ]);
+    let dir = temp_dir("ui-partial");
+    let cfg = chat_cfg(&provider.url());
+    let a = temp_file("a.png", &solid_png(8, 8));
+    let b = temp_file("b.png", &solid_png(8, 8));
+    let out = dir.join("out");
+    let outcome = run_with(
+        &[
+            "ocr",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--profile",
+            "test",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ],
+        b"",
+        &[
+            ("AIDO_CONFIG", cfg.to_str().unwrap()),
+            ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ],
+        cfg.to_str().unwrap(),
+    );
+    assert_eq!(outcome.code(), 6);
+    provider.requests();
+
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+    let listed: serde_json::Value = server.get("/api/runs").await.json().await.unwrap();
+    let row = &listed["runs"][0];
+    assert_eq!(row["status"], "partial");
+    assert_eq!(row["failed_parts"], 1);
+    assert_eq!(row["artifacts"], 1);
+    let detail: serde_json::Value = server
+        .get(&format!("/api/runs/{}", row["run_id"].as_str().unwrap()))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["failed_parts"][0]["part"].as_str().unwrap(),
+        b.file_name().unwrap().to_str().unwrap()
+    );
+    assert!(detail["failed_parts"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("500"));
 }

@@ -1,8 +1,12 @@
 //! The JSON API: thin handlers over the library's existing surfaces.
 //! Run-shaped responses reuse the `--json` envelope's field names
-//! (`version`, `run_id`, `task`, `artifacts`, `failed_parts`, `error`),
-//! so the UI and scripts read one schema; artifact bytes never ride a
-//! JSON response — they are served by their own endpoint, by mime.
+//! (`version`, `run_id`, `task`, `artifacts`, `failed_parts`), so the
+//! UI and scripts read one schema. Two deliberate shape notes: `error`
+//! rides only the SSE done frame (a failed run's detail carries
+//! `status`/warnings instead), and the run LIST is a summary shape —
+//! `status` a flat word, `failed_parts` a count — where the detail
+//! carries the full objects. Artifact bytes never ride a JSON response;
+//! they are served by their own endpoint, by mime.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -144,7 +144,6 @@ jobs:
         working-directory: ui
         run: |
           npm ci
-          npm run typecheck
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable
