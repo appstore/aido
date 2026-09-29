@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 /// The operation selects the protocol route inside the chosen provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -233,13 +233,41 @@ pub fn tasks_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("aido").join("tasks"))
 }
 
+/// Where a custom task's TOML lives, when a tasks directory is known.
+pub fn file_path(name: &str) -> Option<PathBuf> {
+    tasks_dir().map(|dir| dir.join(format!("{name}.toml")))
+}
+
+/// The embedded source of a built-in task, for the editor's read-only
+/// view (a custom file that overrides a built-in is read from disk
+/// instead — it is the definition that actually runs).
+pub fn builtin_source(name: &str) -> Option<&'static str> {
+    BUILTIN
+        .iter()
+        .find(|(builtin, _)| *builtin == name)
+        .map(|(_, src)| *src)
+}
+
+/// The process-wide task table cache. A CLI invocation is one-shot, so
+/// the cache only matters for the long-lived UI server, which calls
+/// [`invalidate`] after it writes or removes a task file.
+static CACHE: Mutex<Option<Result<BTreeMap<String, Task>, String>>> = Mutex::new(None);
+
 /// Load every task: built-ins first, user files overriding by name.
 pub fn load_all() -> Result<BTreeMap<String, Task>> {
-    static CACHE: OnceLock<Result<BTreeMap<String, Task>, String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| load_all_uncached().map_err(|e| e.to_string()))
-        .clone()
-        .map_err(anyhow::Error::msg)
+    let mut cache = CACHE.lock().unwrap();
+    if cache.is_none() {
+        *cache = Some(load_all_uncached().map_err(|e| e.to_string()));
+    }
+    cache.as_ref().unwrap().clone().map_err(anyhow::Error::msg)
+}
+
+/// Drop the cached task table; the next [`load_all`] re-reads the
+/// built-ins and the tasks directory. Called after the UI writes or
+/// removes a task file — without it, a new custom task would need a
+/// server restart.
+pub fn invalidate() {
+    *CACHE.lock().unwrap() = None;
 }
 
 fn load_all_uncached() -> Result<BTreeMap<String, Task>> {
@@ -276,7 +304,7 @@ fn load_all_uncached() -> Result<BTreeMap<String, Task>> {
     Ok(map)
 }
 
-fn parse_task(name: &str, src: &str, builtin: bool) -> Result<Task> {
+pub(crate) fn parse_task(name: &str, src: &str, builtin: bool) -> Result<Task> {
     let file: TaskFile =
         toml::from_str(src).with_context(|| format!("invalid task definition for '{name}'"))?;
     if file.output_types.is_empty() {

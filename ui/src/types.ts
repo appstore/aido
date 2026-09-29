@@ -127,6 +127,20 @@ export interface RunRequestPayload {
   texts?: string[];
 }
 
+// --- tasks (the wizard) ------------------------------------------------------
+
+export interface TaskSource {
+  name: string;
+  builtin: boolean;
+  path: string | null;
+  toml: string;
+}
+
+export interface TaskSaveResult {
+  task: Task;
+  path: string;
+}
+
 // --- configuration ---------------------------------------------------------
 
 export interface ProfileEntry {

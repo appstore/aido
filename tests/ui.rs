@@ -210,6 +210,154 @@ async fn tasks_list_and_show_expose_the_builtins() {
     assert_eq!(unknown.status(), 404);
 }
 
+/// POST /api/tasks must validate with the loader's own rules, write the
+/// file atomically, and — the whole point — drop the task cache so the
+/// definition answers the next request without a server restart. The
+/// preview at the end proves the reload reaches plan building, not just
+/// the list endpoint.
+#[tokio::test]
+async fn tasks_are_created_reloaded_overwritten_and_deleted() {
+    let tasks = temp_dir("ui-tasks");
+    let dir = temp_dir("ui-tasks-run");
+    let cfg = chat_cfg("http://127.0.0.1:1");
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+        ("AIDO_TASKS_DIR", tasks.to_str().unwrap()),
+    ]);
+
+    let post = |body: serde_json::Value| {
+        client()
+            .post(format!("http://127.0.0.1:{}/api/tasks", server.port))
+            .header("x-aido-token", TOKEN)
+            .json(&body)
+    };
+
+    let toml = "operation = 'generate'\noutput_types = ['text']\ninstruction = 'say hi politely'\n";
+    let created = post(serde_json::json!({ "name": "hello-ui", "toml": toml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let answer: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(answer["task"]["name"], "hello-ui");
+    assert_eq!(answer["task"]["summary"], "say hi politely");
+    assert!(
+        answer["path"].as_str().unwrap().ends_with("hello-ui.toml"),
+        "{answer}"
+    );
+
+    // Same process, no restart: the list and the plan both see it.
+    let listed: serde_json::Value = server.get("/api/tasks").await.json().await.unwrap();
+    let names: Vec<&str> = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"hello-ui"), "{names:?}");
+
+    let mut form = reqwest::multipart::Form::new().text(
+        "request",
+        serde_json::json!({ "task": "hello-ui", "profile": "test" }).to_string(),
+    );
+    form = form.part(
+        "file",
+        reqwest::multipart::Part::bytes(b"material".to_vec()).file_name("note.txt"),
+    );
+    let preview = client()
+        .post(format!("http://127.0.0.1:{}/api/runs/preview", server.port))
+        .header("x-aido-token", TOKEN)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    let planned: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(planned["task"], "hello-ui");
+
+    // A second save without overwrite is a conflict; with it, a replace.
+    let again = post(serde_json::json!({ "name": "hello-ui", "toml": toml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 409);
+    let replaced = post(serde_json::json!({
+        "name": "hello-ui",
+        "toml": toml,
+        "overwrite": true,
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(replaced.status(), 201);
+
+    // The loader's own refusals arrive as 400s with the load-time
+    // message, and so do unusable file names.
+    let invalid = post(serde_json::json!({
+        "name": "broken-ui",
+        "toml": "operation = 'generate'\noutput_types = []\n",
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(invalid.status(), 400);
+    let message: String = invalid.json::<serde_json::Value>().await.unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("output_types"), "{message}");
+    let traversal = post(serde_json::json!({
+        "name": "../escape",
+        "toml": toml,
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(traversal.status(), 400);
+
+    // The source endpoint answers the custom file first, the embedded
+    // bytes for a bare built-in.
+    let source: serde_json::Value = server
+        .get("/api/tasks/hello-ui/source")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(source["builtin"], false);
+    assert_eq!(source["toml"], toml);
+    let builtin: serde_json::Value = server
+        .get("/api/tasks/ask/source")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(builtin["builtin"], true);
+    assert!(builtin["toml"].as_str().unwrap().contains("generate"));
+
+    // Delete removes the file (and only the file's task); a bare
+    // built-in has nothing on disk and refuses.
+    let removed = client()
+        .delete(format!(
+            "http://127.0.0.1:{}/api/tasks/hello-ui",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+    let gone = server.get("/api/tasks/hello-ui").await;
+    assert_eq!(gone.status(), 404);
+    let builtin_delete = client()
+        .delete(format!("http://127.0.0.1:{}/api/tasks/ask", server.port))
+        .header("x-aido-token", TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(builtin_delete.status(), 400);
+}
+
 #[tokio::test]
 async fn runs_list_detail_and_artifact_bytes_read_a_cli_run() {
     // One ordinary CLI run lands in history; the UI must see exactly

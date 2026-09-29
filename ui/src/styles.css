@@ -769,3 +769,19 @@ button.danger {
   border-color: var(--accent);
   font-family: var(--mono);
 }
+
+/* --- small utilities ------------------------------------------------ */
+
+.hint-line {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.muted-cell {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.link.danger-link {
+  color: var(--bad);
+}

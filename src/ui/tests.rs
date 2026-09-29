@@ -14,3 +14,37 @@ mod guard_query_token {
         assert_eq!(query_token("x=1"), None);
     }
 }
+
+mod task_file_stem {
+    use super::super::api::task_file_stem;
+
+    #[test]
+    fn plain_stems_pass_with_surrounding_space_trimmed() {
+        assert_eq!(task_file_stem("daily-report").unwrap(), "daily-report");
+        assert_eq!(task_file_stem("  tts_fast  ").unwrap(), "tts_fast");
+        assert_eq!(task_file_stem("v2.report").unwrap(), "v2.report");
+        // Shadowing a built-in is load_all's own override rule, not a
+        // name problem.
+        assert_eq!(task_file_stem("ocr").unwrap(), "ocr");
+    }
+
+    #[test]
+    fn path_shapes_and_empty_names_are_refused() {
+        for bad in [
+            "",
+            "   ",
+            "-flag",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a b",
+            "..",
+            "中文名",
+            &"x".repeat(65),
+        ] {
+            assert!(task_file_stem(bad).is_err(), "'{bad}' should be refused");
+        }
+        // 64 bytes is the ceiling, and it passes.
+        assert!(task_file_stem(&"x".repeat(64)).is_ok());
+    }
+}

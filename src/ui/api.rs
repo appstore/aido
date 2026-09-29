@@ -39,8 +39,9 @@ pub struct UiState {
 pub fn router(state: Arc<UiState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/tasks", get(tasks_list))
-        .route("/api/tasks/{name}", get(task_show))
+        .route("/api/tasks", get(tasks_list).post(tasks_create))
+        .route("/api/tasks/{name}", get(task_show).delete(task_delete))
+        .route("/api/tasks/{name}/source", get(task_source))
         .route("/api/profiles", get(profiles_list))
         .route("/api/config", get(config_show).put(config_save))
         .route("/api/chain", post(chain_create))
@@ -107,6 +108,157 @@ async fn task_show(Path(name): Path<String>) -> Response {
         Ok(task) => Json(task_dto(&task)).into_response(),
         Err(e) => api_error(StatusCode::NOT_FOUND, format!("{e:#}")),
     }
+}
+
+/// A task file name the UI may write: one path component of plain stem
+/// characters, so a request can never escape the tasks directory (the
+/// name becomes `<tasks dir>/<name>.toml` verbatim). A name that shadows
+/// a built-in is allowed — that override is `load_all`'s own rule.
+pub(super) fn task_file_stem(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name the task (a file stem, e.g. `daily-report`)".into());
+    }
+    if name.len() > 64 {
+        return Err("the task name is too long (64 bytes at most)".into());
+    }
+    let legal = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !legal || name.starts_with(['-', '.']) {
+        return Err(format!(
+            "'{name}' is not a usable task file name: use letters, digits, '-', '_' and '.', \
+             not starting with '-' or '.'"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+#[derive(Deserialize)]
+struct TaskPut {
+    name: String,
+    toml: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Create or replace a custom task: parse with the loader's own rules
+/// (the file on disk must never become invalid), write atomically, then
+/// drop the task cache so the new definition answers the very next
+/// request — including the run form's task picker.
+async fn tasks_create(Json(body): Json<TaskPut>) -> Response {
+    let name = match task_file_stem(&body.name) {
+        Ok(name) => name,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    let task = match crate::tasks::parse_task(&name, &body.toml, false) {
+        Ok(task) => task,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    };
+    let Some(path) = crate::tasks::file_path(&name) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot determine the tasks directory on this platform",
+        );
+    };
+    if path.exists() && !body.overwrite {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "task '{name}' already has a file at {}; save with overwrite to replace it",
+                path.display()
+            ),
+        );
+    }
+    if let Err(e) =
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("/")))
+    {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot create {}: {e}", path.display()),
+        );
+    }
+    if let Err(e) = crate::output::write_file_atomic(
+        body.toml.as_bytes(),
+        &path,
+        true,
+        crate::output::FileMode::Default,
+    ) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot write {}: {e:#}", path.display()),
+        );
+    }
+    crate::tasks::invalidate();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "task": task_dto(&task),
+            "path": path.display().to_string(),
+        })),
+    )
+        .into_response()
+}
+
+/// The TOML behind a task: the custom file when one exists (it is the
+/// definition that actually runs), else the embedded built-in — read-only
+/// truth for the wizard's editor view.
+async fn task_source(Path(name): Path<String>) -> Response {
+    let custom = crate::tasks::file_path(&name).filter(|p| p.exists());
+    match custom {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(toml) => Json(serde_json::json!({
+                "name": name,
+                "builtin": false,
+                "path": path.display().to_string(),
+                "toml": toml,
+            }))
+            .into_response(),
+            Err(e) => io_error(
+                "cannot read the task file",
+                &AppError::service(format!("{}: {e}", path.display())),
+            ),
+        },
+        None => match crate::tasks::builtin_source(&name) {
+            Some(toml) => Json(serde_json::json!({
+                "name": name,
+                "builtin": true,
+                "path": serde_json::Value::Null,
+                "toml": toml,
+            }))
+            .into_response(),
+            None => api_error(StatusCode::NOT_FOUND, format!("unknown task '{name}'")),
+        },
+    }
+}
+
+/// Remove a custom task's file. A built-in without a custom file has
+/// nothing on disk to remove — that is a refusal, not a 404 (the name
+/// resolves, and will keep resolving after the call).
+async fn task_delete(Path(name): Path<String>) -> Response {
+    let Some(path) = crate::tasks::file_path(&name) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot determine the tasks directory on this platform",
+        );
+    };
+    if !path.exists() {
+        return match crate::tasks::get(&name) {
+            Ok(_) => api_error(
+                StatusCode::BAD_REQUEST,
+                format!("'{name}' is a built-in task with no file to delete"),
+            ),
+            Err(e) => api_error(StatusCode::NOT_FOUND, format!("{e:#}")),
+        };
+    }
+    if let Err(e) = std::fs::remove_file(&path) {
+        return io_error(
+            "cannot delete the task file",
+            &AppError::service(format!("{}: {e}", path.display())),
+        );
+    }
+    crate::tasks::invalidate();
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// One task as the UI sees it: its contract (types, processor, per-part)

@@ -5,6 +5,7 @@ import Config from './pages/Config';
 import History from './pages/History';
 import Run from './pages/Run';
 import RunDetail from './pages/RunDetail';
+import Tasks from './pages/Tasks';
 
 export default function App() {
   return (
@@ -19,6 +20,9 @@ export default function App() {
         </NavLink>
         <NavLink to="/chain" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
           链
+        </NavLink>
+        <NavLink to="/tasks" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
+          任务
         </NavLink>
         <NavLink to="/config" className={({ isActive }) => (isActive ? 'nav active' : 'nav')}>
           配置
@@ -43,6 +47,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Run />} />
           <Route path="/chain" element={<Chain />} />
+          <Route path="/tasks" element={<Tasks />} />
           <Route path="/history" element={<History />} />
           <Route path="/config" element={<Config />} />
           <Route path="/runs/:id" element={<RunDetail />} />

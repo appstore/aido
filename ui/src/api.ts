@@ -9,6 +9,8 @@ import type {
   RunRow,
   SaveResult,
   Task,
+  TaskSaveResult,
+  TaskSource,
 } from './types';
 
 // The session token: `aido ui` prints one URL (`?t=…`); landing there
@@ -63,6 +65,29 @@ export function listTasks(): Promise<Task[]> {
 
 export function getTask(name: string): Promise<Task> {
   return json<Task>(`/api/tasks/${encodeURIComponent(name)}`);
+}
+
+export function getTaskSource(name: string): Promise<TaskSource> {
+  return json<TaskSource>(`/api/tasks/${encodeURIComponent(name)}/source`);
+}
+
+/** Save a custom task: the server parses with the loader's own rules
+ * first, so the file on disk never becomes invalid. A 409 means a file
+ * already exists — resend with overwrite after confirming. */
+export function saveTask(
+  name: string,
+  toml: string,
+  overwrite = false,
+): Promise<TaskSaveResult> {
+  return request('/api/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, toml, overwrite }),
+  }).then((r) => r.json());
+}
+
+export async function deleteTask(name: string): Promise<void> {
+  await request(`/api/tasks/${encodeURIComponent(name)}`, { method: 'DELETE' });
 }
 
 export function listRuns(query: { task?: string; status?: string } = {}): Promise<RunRow[]> {
