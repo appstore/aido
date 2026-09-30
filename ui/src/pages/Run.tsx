@@ -13,6 +13,10 @@ import type { DoneFrame, Frame, Preview, RunReport, RunRequestPayload, Task } fr
 
 type Phase = 'idle' | 'running' | 'done' | 'failed';
 
+// The OutputFormat enum the CLI accepts (src/cli.rs): a bad pick would
+// be a clap error anyway — the list keeps the form honest.
+const FORMATS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm', 'png', 'jpeg', 'webp'];
+
 export default function Run() {
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [loadError, setLoadError] = useState('');
@@ -30,6 +34,10 @@ export default function Run() {
   // one clears the other here.
   const [outDir, setOutDir] = useState('');
   const [outFile, setOutFile] = useState('');
+  // --produce / --format: what the generation should emit and how a
+  // single media artifact should be encoded.
+  const [produce, setProduce] = useState<string[]>([]);
+  const [format, setFormat] = useState('');
   // What --profile may name: the config's own profiles, or the built-in
   // "default" when the user defined none (the config's own rule).
   const [profileNames, setProfileNames] = useState<string[]>(['default']);
@@ -96,11 +104,13 @@ export default function Run() {
       }
     }
     if (noSplit) body.no_split = true;
+    if (produce.length > 0) body.produce = produce;
+    if (format) body.format = format;
     if (outDir.trim()) body.out_dir = outDir.trim();
     if (outFile.trim()) body.out_file = outFile.trim();
     if (texts.length > 0) body.texts = texts;
     return body as unknown as RunRequestPayload;
-  }, [task, taskName, params, prompt, profile, model, noSplit, outDir, outFile, texts]);
+  }, [task, taskName, params, prompt, profile, model, noSplit, produce, format, outDir, outFile, texts]);
 
   const equivalent = useMemo(() => {
     const parts = ['aido', taskName, ...files.map((f) => f.name)];
@@ -108,6 +118,8 @@ export default function Run() {
     if (profile.trim()) parts.push(`--profile ${profile.trim()}`);
     if (model.trim()) parts.push(`--model ${model.trim()}`);
     if (noSplit) parts.push('--no-split');
+    if (produce.length > 0) parts.push(`--produce ${produce.join(',')}`);
+    if (format) parts.push(`--format ${format}`);
     if (outDir.trim()) parts.push(`--out-dir <deliveries>/${outDir.trim()}`);
     if (outFile.trim()) parts.push(`-o <deliveries>/${outFile.trim()}`);
     if (task) {
@@ -129,7 +141,7 @@ export default function Run() {
     }
     for (const text of texts) parts.push(`--text ${JSON.stringify(text)}`);
     return parts.join(' ');
-  }, [task, taskName, params, prompt, profile, model, noSplit, outDir, outFile, files, texts]);
+  }, [task, taskName, params, prompt, profile, model, noSplit, produce, format, outDir, outFile, files, texts]);
 
   async function doPreview() {
     setPreviewError('');
@@ -364,6 +376,41 @@ export default function Run() {
                     placeholder="Profile 的模型"
                     onChange={(e) => setModel(e.target.value)}
                   />
+                </div>
+                <div className="param">
+                  <label htmlFor="adv-format">--format</label>
+                  <select
+                    id="adv-format"
+                    value={format}
+                    onChange={(e) => setFormat(e.target.value)}
+                  >
+                    <option value="">默认编码</option>
+                    {FORMATS.map((f) => (
+                      <option key={f} value={f}>
+                        {f}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="param">
+                  <label>--produce</label>
+                  <div className="chips">
+                    {['text', 'image', 'audio'].map((kind) => (
+                      <button
+                        key={kind}
+                        className={produce.includes(kind) ? 'chip part' : 'chip'}
+                        onClick={() =>
+                          setProduce((current) =>
+                            current.includes(kind)
+                              ? current.filter((k) => k !== kind)
+                              : [...current, kind],
+                          )
+                        }
+                      >
+                        {kind}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}

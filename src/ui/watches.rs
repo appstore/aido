@@ -190,6 +190,8 @@ impl Watches {
             count: request.count,
             size: request.size.clone(),
             no_split: request.no_split,
+            produce: Vec::new(),
+            format: None,
             timeout_secs: request.timeout_secs,
             total_timeout_secs: request.total_timeout_secs,
             out_dir: None,

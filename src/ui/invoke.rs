@@ -35,6 +35,12 @@ pub struct RunRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub no_split: bool,
+    /// `--produce` as kind names ("text", "image", "audio"); empty
+    /// means the task's own choice.
+    #[serde(default)]
+    pub produce: Vec<String>,
+    /// `--format`, the single media output's encoding.
+    pub format: Option<String>,
     pub timeout_secs: Option<u64>,
     pub total_timeout_secs: Option<u64>,
     /// `--out-dir` as a name under the deliveries directory.
@@ -190,6 +196,12 @@ fn argv_for(request: &RunRequest, files: &[PathBuf]) -> AppResult<Vec<std::ffi::
     if request.no_split {
         argv.push("--no-split".into());
     }
+    if !request.produce.is_empty() {
+        flag(&mut argv, "produce", &request.produce.join(","));
+    }
+    if let Some(value) = &request.format {
+        flag(&mut argv, "format", value);
+    }
     if let Some(value) = request.timeout_secs {
         flag(&mut argv, "timeout", &value.to_string());
     }
@@ -330,6 +342,9 @@ pub struct StageRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub no_split: bool,
+    #[serde(default)]
+    pub produce: Vec<String>,
+    pub format: Option<String>,
     pub timeout_secs: Option<u64>,
     pub total_timeout_secs: Option<u64>,
 }
@@ -358,6 +373,8 @@ impl StageRequest {
             count: self.count,
             size: self.size.clone(),
             no_split: self.no_split,
+            produce: self.produce.clone(),
+            format: self.format.clone(),
             timeout_secs: self.timeout_secs,
             total_timeout_secs: self.total_timeout_secs,
             // Chains deliver nothing server-side in v1: the last stage

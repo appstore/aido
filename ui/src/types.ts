@@ -125,6 +125,8 @@ export interface RunRequestPayload {
   count?: number;
   size?: string;
   no_split?: boolean;
+  produce?: string[];
+  format?: string;
   timeout_secs?: number;
   total_timeout_secs?: number;
   // Server-side delivery, the whitelist form: a NAME under aido's
@@ -207,6 +209,8 @@ export interface ChainStagePayload {
   count?: number;
   size?: string;
   no_split?: boolean;
+  produce?: string[];
+  format?: string;
   timeout_secs?: number;
   total_timeout_secs?: number;
 }

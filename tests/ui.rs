@@ -1378,6 +1378,61 @@ async fn a_ui_batch_run_reports_its_parts_live() {
     provider.join().unwrap();
 }
 
+/// --produce/--format ride the whitelist into the real plan: the
+/// preview answers with the requested kinds, a mismatched format is the
+/// CLI's own refusal, and a made-up kind never leaves the parser.
+#[tokio::test]
+async fn produce_and_format_reach_the_plan() {
+    let provider = Server::json(chat_body("x"));
+    let dir = temp_dir("ui-produce");
+    let cfg = chat_cfg(&provider.url());
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let request =
+        serde_json::json!({ "task": "summarize", "profile": "test", "produce": ["text"] });
+    let mut form = reqwest::multipart::Form::new().text("request", request.to_string());
+    form = form.part(
+        "file",
+        reqwest::multipart::Part::bytes(b"material".to_vec()).file_name("note.txt"),
+    );
+    let preview = client()
+        .post(format!("http://127.0.0.1:{}/api/runs/preview", server.port))
+        .header("x-aido-token", TOKEN)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    let planned: serde_json::Value = preview.json().await.unwrap();
+    let text = planned["text"].as_str().unwrap();
+    assert!(text.contains("produce:"), "{text}");
+    assert!(text.contains("text"), "{text}");
+
+    // A format that cannot match the produced type is refused with the
+    // plan's own message.
+    let bad = serde_json::json!({
+        "task": "image", "profile": "test", "produce": ["image"], "format": "mp3",
+        "texts": ["a cat"],
+    });
+    let refused = post_run(&server, &bad, &[]).await;
+    assert_eq!(refused.status(), 400);
+    let message: String = refused.json::<serde_json::Value>().await.unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("format"), "{message}");
+
+    // A kind the CLI does not know is a parse-time refusal.
+    let unknown = serde_json::json!({
+        "task": "summarize", "profile": "test", "produce": ["video"],
+    });
+    let refused = post_run(&server, &unknown, &[("note.txt", b"hi")]).await;
+    assert_eq!(refused.status(), 400);
+}
+
 /// The watch dashboard's contract: a validated daemon starts, processes
 /// what arrives (and what `include_existing` seeds), delivers under the
 /// guarded directory, stops between files, and answers its list and

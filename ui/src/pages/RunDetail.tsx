@@ -112,6 +112,86 @@ export default function RunDetail() {
           <Deliveries report={report} />
         </section>
       )}
+
+      <section className="card">
+        <div className="card-title">来源时间线</div>
+        {report.artifacts.length === 0 ? (
+          <div className="empty">没有产物，也就没有来源。</div>
+        ) : (
+          <table className="run-table">
+            <thead>
+              <tr>
+                <th>材料（按请求顺序）</th>
+                <th />
+                <th>产物</th>
+                <th>来源</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(summary?.inputs ?? []).map((input, i) => {
+                const consumers = report.artifacts.filter((a) =>
+                  a.provenance?.type === 'request'
+                    ? a.provenance.index === i
+                    : a.provenance?.type === 'merged' &&
+                      a.provenance.requests?.includes(i),
+                );
+                return (
+                  <tr key={i}>
+                    <td>
+                      <span className="chip">{`#${i}`}</span>{' '}
+                      <span className="muted-cell">{input.kind}</span> {input.name}
+                    </td>
+                    <td className="muted-cell">──▶</td>
+                    <td>
+                      {consumers.length === 0 ? (
+                        <span className="muted-cell">（未进入任何产物）</span>
+                      ) : (
+                        consumers.map((a) => (
+                          <div key={a.id}>
+                            {a.id} <span className="muted-cell">({a.kind})</span>
+                          </div>
+                        ))
+                      )}
+                    </td>
+                    <td className="muted-cell">
+                      {i === 0 ? provenanceNote(report.artifacts) : null}
+                    </td>
+                  </tr>
+                );
+              })}
+              {report.artifacts
+                .filter(
+                  (a) =>
+                    a.provenance?.type === 'restored' ||
+                    (a.provenance === undefined && (summary?.inputs ?? []).length === 0),
+                )
+                .map((a) => (
+                  <tr key={a.id}>
+                    <td className="muted-cell">—</td>
+                    <td className="muted-cell">──▶</td>
+                    <td>
+                      {a.id} <span className="muted-cell">({a.kind})</span>
+                    </td>
+                    <td className="muted-cell">恢复的历史产物</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        )}
+      </section>
     </div>
   );
+}
+
+/** The one-line legend for provenance shapes the timeline can't draw as
+ * arrows (merged/reduced results spanning several inputs). */
+function provenanceNote(artifacts: RunReport['artifacts']): string | null {
+  const merged = artifacts.filter((a) => a.provenance?.type === 'merged');
+  const reduced = artifacts.length > 0 && artifacts.every((a) => a.provenance === undefined);
+  if (merged.length > 0) {
+    const parts = merged.map((a) => `${a.id} ← 合并 #${(a.provenance?.requests ?? []).join('+#')}`);
+    return `另有合并产物：${parts.join('；')}`;
+  }
+  if (reduced) return '产物由全部材料归纳而来（reduce）。';
+  return null;
 }
