@@ -22,6 +22,8 @@ pub mod processors;
 pub mod runner;
 pub mod spinner;
 pub mod tasks;
+#[cfg(feature = "ui")]
+pub mod ui;
 pub mod watch;
 
 #[cfg(test)]

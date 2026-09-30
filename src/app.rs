@@ -299,6 +299,10 @@ async fn dispatch(
         Some(Commands::Config { cmd }) => return manage_config(cmd),
         Some(Commands::History { cmd }) => return manage_history(&cli, cmd).await,
         Some(Commands::Hold { image, secs }) => return run_hold(*image, *secs).await,
+        // The server runs until Ctrl+C; its errors map to exit codes the
+        // same way every other command's do.
+        #[cfg(feature = "ui")]
+        Some(Commands::Ui { port, no_open }) => return crate::ui::serve(*port, *no_open).await,
         None => {}
     }
 
@@ -446,22 +450,35 @@ pub(crate) async fn run_task(
     .await
 }
 
-/// Record, save and deliver a finished generation — the shared tail of
-/// the single-task path and the chain runner. A chain passes where its
-/// final stage's deliverables begin (`deliverable_start`) and one summary
-/// per stage (`stage_summaries`); a single-task run passes `None` and an
-/// empty vec, keeping the pre-chain record shape.
-#[allow(clippy::too_many_arguments)]
-async fn finish_run(
-    cli: &Cli,
+/// What [`assemble_record`] decided about a finished generation, besides
+/// the record itself: the pieces its callers still act on.
+pub(crate) struct AssembledRun {
+    pub record: RunRecord,
+    /// Why the artifacts do not satisfy the request — already folded into
+    /// the record's generation status; the caller only words the error.
+    pub unsatisfied: Option<String>,
+    /// A batch with failed parts but surviving deliverables: delivery
+    /// proceeds normally and the exit becomes 6 after it.
+    pub batch_partial: bool,
+    /// Whether an incomplete generation's artifacts are worth keeping in
+    /// history: validated artifacts of an unsatisfied run, or whatever
+    /// text arrived before a request failed.
+    pub keep_artifacts: bool,
+}
+
+/// Judge a finished generation and assemble its [`RunRecord`] — the one
+/// truth for how a run's outcome becomes history, shared by the CLI tail
+/// and the web UI's server. A chain passes where its final stage's
+/// deliverables begin (`deliverable_start`) and one summary per stage; a
+/// single-task run passes `None` and an empty vec.
+pub(crate) fn assemble_record(
     task_label: &str,
-    cfg: &config::Config,
     plan: &ExecutionPlan,
-    output: runner::RunOutput,
+    output: &runner::RunOutput,
     deliverable_start: Option<usize>,
     stage_summaries: Vec<RunSummary>,
     run_id: &str,
-) -> AppResult<()> {
+) -> AssembledRun {
     // A generation that finished cleanly but did not satisfy the request
     // (missing kind, short count) is recorded, clearly marked as
     // incomplete, and not delivered. A chain judges its final stage's
@@ -496,9 +513,7 @@ async fn finish_run(
         }
     };
 
-    // Truncated or otherwise incomplete generations are recorded but not
-    // delivered (what streamed live already cannot be taken back).
-    let mut record = RunRecord {
+    let record = RunRecord {
         run_id: run_id.to_string(),
         task: Some(task_label.to_string()),
         created_at: now_iso(),
@@ -520,6 +535,46 @@ async fn finish_run(
             .map(|start| output.artifacts.len().saturating_sub(start))
             .unwrap_or(0),
     };
+    AssembledRun {
+        record,
+        unsatisfied,
+        batch_partial,
+        keep_artifacts: output.status.is_complete()
+            || (output.failure.is_some() && !output.artifacts.is_empty()),
+    }
+}
+
+/// Record, save and deliver a finished generation — the shared tail of
+/// the single-task path and the chain runner. A chain passes where its
+/// final stage's deliverables begin (`deliverable_start`) and one summary
+/// per stage (`stage_summaries`); a single-task run passes `None` and an
+/// empty vec, keeping the pre-chain record shape.
+#[allow(clippy::too_many_arguments)]
+async fn finish_run(
+    cli: &Cli,
+    task_label: &str,
+    cfg: &config::Config,
+    plan: &ExecutionPlan,
+    output: runner::RunOutput,
+    deliverable_start: Option<usize>,
+    stage_summaries: Vec<RunSummary>,
+    run_id: &str,
+) -> AppResult<()> {
+    let AssembledRun {
+        mut record,
+        unsatisfied,
+        batch_partial,
+        keep_artifacts,
+    } = assemble_record(
+        task_label,
+        plan,
+        &output,
+        deliverable_start,
+        stage_summaries,
+        run_id,
+    );
+    // Truncated or otherwise incomplete generations are recorded but not
+    // delivered (what streamed live already cannot be taken back).
     if !record.generation.is_complete() {
         if plan.record_history {
             // `output.status` is Complete for an unsatisfied generation:
@@ -530,8 +585,6 @@ async fn finish_run(
             // intermediate artifacts — but a failure before any text
             // arrived records metadata only, exactly like a truncated
             // stream.
-            let keep_artifacts = output.status.is_complete()
-                || (output.failure.is_some() && !output.artifacts.is_empty());
             best_effort(
                 history::save_generation(&record, keep_artifacts),
                 "failed to record the run",
@@ -660,7 +713,11 @@ async fn run_chain(
 ) -> AppResult<()> {
     if chain.run_cli.dry_run {
         let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
-        print!("{}", chain::describe_chain(&chain, &cfg)?);
+        let mut env = InputEnv::real();
+        print!(
+            "{}",
+            chain::describe_chain(&chain, &cfg, TerminalInfo::real(), &mut env)?
+        );
         return Ok(());
     }
     let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
@@ -753,7 +810,9 @@ fn best_effort(result: Result<()>, what: &str) {
     }
 }
 
-fn now_iso() -> String {
+/// Wall-clock UTC as ISO 8601 — the stamp every record carries (the ui
+/// server's records use it too, so CLI and UI records read alike).
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -882,8 +941,9 @@ async fn manage_history(cli: &Cli, cmd: &HistoryCmd) -> AppResult<()> {
 /// Resolve a `history show` operand: a 1-based index into `history list`
 /// order (1 = the newest entry), a full run id, or a unique id prefix.
 /// Run ids always contain '-' and '.', so an all-digit operand can only
-/// be an index.
-fn resolve_run(target: &str) -> AppResult<RunRecord> {
+/// be an index. The ui server's run lookup takes the same operands —
+/// its URLs and the CLI's `history show` address one run identically.
+pub(crate) fn resolve_run(target: &str) -> AppResult<RunRecord> {
     let ids = history::list_ids().map_err(|e| AppError::usage(format!("{e:#}")))?;
     if ids.is_empty() {
         return Err(AppError::usage("no runs recorded yet"));

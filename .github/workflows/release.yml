@@ -70,6 +70,20 @@ jobs:
             Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
           }
 
+      # Web UI（ui feature，默认开启）：release 构建把 ui/dist 编译期内嵌进
+      # 二进制，必须先于 cargo build 构建真实前端——仓库里只有占位文件。
+      - name: Build the web UI
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: npm build
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
       - name: Test
         run: cargo test --locked
 

@@ -53,6 +53,7 @@ fn live_chars_counts_only_what_was_printed_live() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     buffered.emit("一二三");
     assert_eq!(buffered.chars_seen, 3);
@@ -66,6 +67,7 @@ fn live_chars_counts_only_what_was_printed_live() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     live.emit("一二三");
     live.emit("四");
@@ -85,6 +87,7 @@ fn live_emits_track_whether_the_content_line_is_open() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     live.emit("半行");
     assert!(live.line_open);
@@ -105,6 +108,7 @@ fn live_emits_track_whether_the_content_line_is_open() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     buffered.emit("no newline");
     assert!(!buffered.line_open);
@@ -125,6 +129,7 @@ fn first_live_emit_retires_the_spinner_buffered_keeps_it() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     live.emit("君不见黄河之水天上来");
     assert!(cell.borrow().is_none());
@@ -142,6 +147,7 @@ fn first_live_emit_retires_the_spinner_buffered_keeps_it() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     buffered.emit("still there");
     assert!(cell.borrow().is_some());
@@ -169,6 +175,7 @@ fn announce_step_restarts_the_spinner_a_live_stream_retired() {
         chars_seen: 0,
         live_chars: 0,
         line_open: false,
+        events: None,
     };
     live.emit("君不见黄河之水天上来");
     assert!(cell.borrow().is_none());
@@ -194,6 +201,48 @@ fn announce_step_never_restarts_without_a_terminal_stderr() {
     let cell: SharedSpinner = Rc::new(RefCell::new(None));
     announce_step(&cell, "asking glm-4.6 (2/3)...", false, true);
     assert!(cell.borrow().is_none());
+}
+
+#[test]
+fn events_reach_the_sink_live_and_buffered_alike() {
+    // The sink is the watcher's terminal: merged deltas reach it in live
+    // and buffered mode alike — a UI run is buffered, a terminal run
+    // live, and both must see the same stream.
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let record = {
+        let seen = seen.clone();
+        move |event: RunEvent| seen.borrow_mut().push(event)
+    };
+    let sink: EventSink = Rc::new(RefCell::new(record));
+    let mut live = DeltaSink {
+        merged: String::new(),
+        live: true,
+        spinner: None,
+        chars_seen: 0,
+        live_chars: 0,
+        line_open: false,
+        events: Some(sink.clone()),
+    };
+    let mut buffered = DeltaSink {
+        merged: String::new(),
+        live: false,
+        spinner: None,
+        chars_seen: 0,
+        live_chars: 0,
+        line_open: false,
+        events: Some(sink),
+    };
+    live.emit("流式");
+    buffered.emit("缓冲");
+    let seen = seen.borrow();
+    assert!(matches!(&seen[0], RunEvent::Delta(t) if t == "流式"));
+    assert!(matches!(&seen[1], RunEvent::Delta(t) if t == "缓冲"));
+}
+
+#[test]
+fn emit_event_without_a_sink_is_a_no_op() {
+    // The plain CLI path attaches nothing; emit_event must stay silent.
+    emit_event(&None, RunEvent::Warning("quiet".into()));
 }
 
 #[test]

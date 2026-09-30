@@ -1,3 +1,10 @@
 __pycache__/
 /target
 /.zcode/
+
+# Web UI frontend: the folder must exist for rust-embed (the .placeholder
+# keeps it in a cargo-only checkout); the real dist is built by npm — CI
+# builds it before release builds.
+ui/node_modules/
+ui/dist/*
+!ui/dist/.placeholder

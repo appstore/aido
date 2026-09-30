@@ -53,6 +53,13 @@ jobs:
           python3 scripts/check_no_inline_tests.py --self-test
           python3 scripts/check_no_inline_tests.py src
 
+      # rust-embed 编译期要求 ui/dist 存在；cargo-only 检出靠这个占位文件
+      # （npm build 的 emptyOutDir 会清空 dist，public/ 的副本负责每次构建
+      # 后自动再生它——U01 的防回归）。
+      - name: Web UI placeholder exists
+        if: runner.os == 'Linux'
+        run: test -f ui/dist/.placeholder
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -115,6 +122,38 @@ jobs:
           else
             echo "aws-lc-rs is out of the tree (edge-tts feature off)"
           fi
+
+  ui:
+    # `ui` feature 默认开启，check job 已经编译并运行 src/ui 的测试——但那
+    # 时 ui/dist 只有占位文件。本 job 构建真实前端（node 22）后再跑全量
+    # 测试：rust-embed 在 debug 构建读盘，tests/ui.rs 的「首页可服务」断言
+    # 落在真 SPA 上；typecheck 把前端自身的类型错误拦在 CI。
+    name: ui (npm + cargo test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build the frontend
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ui
+
+      - name: Test (with the real ui/dist on disk)
+        run: cargo test --locked
 
   pdfium:
     # `pdfium` feature 的渲染回退（pdf_render.rs 与 pdf.rs 的全部
