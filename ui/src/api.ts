@@ -111,6 +111,12 @@ export function artifactUrl(runId: string, artifactId: string): string {
   );
 }
 
+/** The run's whole artifact set plus its manifest, zipped — same tree
+ * an `--out-dir` delivery would have written. */
+export function archiveUrl(runId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/archive?t=${encodeURIComponent(token)}`;
+}
+
 async function postForm(path: string, payload: RunRequestPayload, files: File[]): Promise<Response> {
   const form = new FormData();
   form.append('request', JSON.stringify(payload));

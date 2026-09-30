@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { getRun } from '../api';
+import { archiveUrl, getRun } from '../api';
 import ArtifactViewer from '../components/ArtifactViewer';
 import Deliveries from '../components/Deliveries';
 import StatusBadge from '../components/StatusBadge';
@@ -92,6 +92,9 @@ export default function RunDetail() {
               {report.parts_total - report.failed_parts.length}/{report.parts_total} 个文件成功
             </span>
           )}
+          <a className="link" href={archiveUrl(report.run_id)} download>
+            打包下载 .zip
+          </a>
         </div>
         {report.artifacts.length === 0 && report.failed_parts.length === 0 ? (
           <div className="empty">这次运行没有留下产物。</div>

@@ -358,6 +358,74 @@ async fn tasks_are_created_reloaded_overwritten_and_deleted() {
     assert_eq!(builtin_delete.status(), 400);
 }
 
+/// The archive endpoint zips what an `--out-dir` would have written:
+/// the history manifest plus every artifact under its delivered name —
+/// and an empty run refuses instead of shipping an empty zip.
+#[tokio::test]
+async fn the_archive_zips_the_manifest_and_artifacts() {
+    let provider = Server::json(chat_body("ARCHIVE ME"));
+    let dir = temp_dir("ui-archive");
+    let cfg = chat_cfg(&provider.url());
+    let out = run_with(
+        &["summarize", "--profile", "test"],
+        b"hi\n",
+        &[("AIDO_HISTORY_DIR", dir.to_str().unwrap())],
+        cfg.to_str().unwrap(),
+    );
+    out.assert_code(0);
+    provider.request();
+
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let archive = server.get("/api/runs/1/archive").await;
+    assert_eq!(archive.status(), 200);
+    assert_eq!(
+        archive
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/zip"
+    );
+    let disposition = archive
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(disposition.contains("attachment"), "{disposition}");
+    assert!(disposition.contains(".zip"), "{disposition}");
+    let bytes = archive.bytes().await.unwrap();
+
+    // Read the zip back: manifest.json + text.txt with the run's bytes.
+    let cursor = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(cursor).expect("a real zip");
+    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    assert!(names.contains(&"manifest.json".into()), "{names:?}");
+    assert!(names.contains(&"text.txt".into()), "{names:?}");
+    let mut text = String::new();
+    zip.by_name("text.txt")
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "ARCHIVE ME");
+    let mut manifest = String::new();
+    zip.by_name("manifest.json")
+        .unwrap()
+        .read_to_string(&mut manifest)
+        .unwrap();
+    assert!(manifest.contains("\"summarize\""), "{manifest}");
+
+    // Nothing to archive is a refusal, not an empty zip.
+    let empty = server.get("/api/runs/9/archive").await;
+    assert_eq!(empty.status(), 404);
+}
+
 #[tokio::test]
 async fn runs_list_detail_and_artifact_bytes_read_a_cli_run() {
     // One ordinary CLI run lands in history; the UI must see exactly

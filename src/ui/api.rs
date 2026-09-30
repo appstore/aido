@@ -52,6 +52,7 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/cancel", post(run_cancel))
         .route("/api/runs/{id}/artifacts/{aid}", get(run_artifact))
+        .route("/api/runs/{id}/archive", get(run_archive))
         .fallback(assets_fallback)
         .layer(DefaultBodyLimit::max(body_limit()))
         .layer(from_fn_with_state(state.clone(), guard::check))
@@ -433,6 +434,78 @@ fn artifact_dto(artifact: &Artifact) -> serde_json::Value {
         "size": artifact.bytes.len(),
         "provenance": artifact.provenance,
     })
+}
+
+/// One run as a single download: every artifact under its delivered
+/// name plus the history manifest when there is one — the same set
+/// `--out-dir` would have written, zipped for the browser that has no
+/// directory to receive into.
+async fn run_archive(Path(id): Path<String>) -> Response {
+    let record = match crate::app::resolve_run(&id) {
+        Ok(record) => record,
+        Err(e) => return api_error(StatusCode::NOT_FOUND, format!("{e:#}")),
+    };
+    let manifest = crate::history::history_dir()
+        .filter(|dir| dir.join(&record.run_id).is_dir())
+        .and_then(|dir| std::fs::read(dir.join(&record.run_id).join("manifest.json")).ok());
+    if record.artifacts.is_empty() && manifest.is_none() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("run {id} has nothing to archive"),
+        );
+    }
+    let name = format!("aido-{}.zip", crate::output::sanitize_stem(&record.run_id));
+    let built =
+        tokio::task::spawn_blocking(move || build_archive(&record, manifest.as_deref())).await;
+    let bytes = match built {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return io_error("cannot build the archive", &e),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// manifest.json first, then the artifacts under the names a delivery
+/// would use (`artifact_file_name`: stems sanitized, kinds extended) —
+/// a reader of the zip and a reader of an `--out-dir` see the same
+/// tree. Deflated like every aido zip.
+fn build_archive(
+    record: &RunRecord,
+    manifest: Option<&[u8]>,
+) -> Result<Vec<u8>, crate::domain::AppError> {
+    use std::io::Write as _;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if let Some(bytes) = manifest {
+            zip.start_file("manifest.json", options)
+                .map_err(|e| crate::domain::AppError::service(format!("zip: {e}")))?;
+            zip.write_all(bytes)
+                .map_err(|e| crate::domain::AppError::service(format!("zip: {e}")))?;
+        }
+        for artifact in &record.artifacts {
+            let name = crate::output::artifact_file_name(artifact);
+            zip.start_file(&name, options)
+                .map_err(|e| crate::domain::AppError::service(format!("zip: {e}")))?;
+            zip.write_all(&artifact.bytes)
+                .map_err(|e| crate::domain::AppError::service(format!("zip: {e}")))?;
+        }
+        zip.finish()
+            .map_err(|e| crate::domain::AppError::service(format!("zip: {e}")))?;
+    }
+    Ok(buf.into_inner())
 }
 
 /// One artifact's bytes, as the mime says — a text file downloads as
