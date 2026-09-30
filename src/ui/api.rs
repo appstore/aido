@@ -25,15 +25,18 @@ use super::assets;
 use super::guard::{self, Guard};
 use super::invoke::{self, RunRequest};
 use super::runs::{self, Runs, SseEvent};
+use super::watches::{self, Watches};
 use crate::domain::{AppError, Artifact, GenerationStatus, RunRecord, JSON_ENVELOPE_VERSION};
 use crate::history;
 use crate::tasks::{Task, TaskParam, COUNT_RANGE, SIZE_CHOICES, SPEED_RANGE};
 
-/// Everything the handlers share: the request gate and the live runs.
+/// Everything the handlers share: the request gate, the live runs and
+/// the watch daemons this server started.
 #[derive(Clone)]
 pub struct UiState {
     pub guard: Arc<Guard>,
     pub runs: Arc<Runs>,
+    pub watches: Arc<Watches>,
 }
 
 pub fn router(state: Arc<UiState>) -> Router {
@@ -53,6 +56,10 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/api/runs/{id}/cancel", post(run_cancel))
         .route("/api/runs/{id}/artifacts/{aid}", get(run_artifact))
         .route("/api/runs/{id}/archive", get(run_archive))
+        .route("/api/watches", get(watches_list).post(watches_create))
+        .route("/api/watches/preview", post(watches_preview))
+        .route("/api/watches/{id}/events", get(watch_events))
+        .route("/api/watches/{id}/stop", post(watch_stop))
         .fallback(assets_fallback)
         .layer(DefaultBodyLimit::max(body_limit()))
         .layer(from_fn_with_state(state.clone(), guard::check))
@@ -909,4 +916,71 @@ async fn chain_preview(State(_state): State<Arc<UiState>>, multipart: Multipart)
         })).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+// --- watch daemons ---------------------------------------------------------
+
+/// The dashboard's list: every watch this server started, running and
+/// stopped (stopping is between files; the current file finishes).
+async fn watches_list(State(state): State<Arc<UiState>>) -> Response {
+    Json(serde_json::json!({ "watches": state.watches.list() })).into_response()
+}
+
+/// Start a watch daemon. The full CLI precheck — task resolution, the
+/// probe plan, delivery sanity, credentials — runs here in the
+/// response, so a watch that cannot work never starts.
+async fn watches_create(
+    State(state): State<Arc<UiState>>,
+    Json(request): Json<watches::WatchRequest>,
+) -> Response {
+    let built = tokio::task::spawn_blocking(move || Watches::prepare(&request)).await;
+    let prepared = match built {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    let id = state.watches.start(prepared);
+    (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
+}
+
+/// The watch's dry-run: the probe plan every arriving file would run,
+/// zero requests.
+async fn watches_preview(Json(request): Json<watches::WatchRequest>) -> Response {
+    let built = tokio::task::spawn_blocking(move || Watches::prepare(&request)).await;
+    let prepared = match built {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return api_error(StatusCode::BAD_REQUEST, e.chain_inline()),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    };
+    Json(Watches::preview(&prepared)).into_response()
+}
+
+/// One daemon's live activity, as SSE; the stream ends with its
+/// `stopped` frame. A late subscriber sees nothing before it joined —
+/// the list's counters are the catch-up.
+async fn watch_events(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Response {
+    let Some(receiver) = state.watches.subscribe(&id) else {
+        return api_error(StatusCode::NOT_FOUND, format!("no live watch '{id}'"));
+    };
+    let stream = tokio_stream::wrappers::BroadcastStream::new(receiver).map(|item| {
+        let event = match item {
+            Ok(event) => event,
+            Err(_) => watches::lagged_frame(),
+        };
+        let data = serde_json::to_string(&event)
+            .unwrap_or_else(|_| r#"{"type":"dir_unreadable","dir":"…"}"#.into());
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Ask a daemon to stop (between files; the current one finishes).
+async fn watch_stop(State(state): State<Arc<UiState>>, Path(id): Path<String>) -> Response {
+    if state.watches.stop(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        api_error(StatusCode::NOT_FOUND, format!("no watch '{id}' to stop"))
+    }
 }

@@ -214,6 +214,13 @@ fn argv_for(request: &RunRequest, files: &[PathBuf]) -> AppResult<Vec<std::ffi::
     Ok(argv)
 }
 
+/// The task flags of a request as plain argv, without material and
+/// without delivery resolution — the watch dashboard composes its own
+/// task invocation from the same whitelist.
+pub(super) fn argv_for_task(request: &RunRequest) -> AppResult<Vec<std::ffi::OsString>> {
+    argv_for(request, &[])
+}
+
 pub fn parse(request: &RunRequest, files: &[PathBuf]) -> AppResult<Invocation> {
     check_task_name(&request.task)?;
     let argv = argv_for(request, files)?;
@@ -240,7 +247,7 @@ pub fn parse(request: &RunRequest, files: &[PathBuf]) -> AppResult<Invocation> {
 /// A task name that starts with '-' would be eaten as a flag by the
 /// normalizer and surface as a bizarre ask run; refuse it with the CLI's
 /// own unknown-task wording instead (an empty name is the same problem).
-fn check_task_name(name: &str) -> AppResult<()> {
+pub(super) fn check_task_name(name: &str) -> AppResult<()> {
     if name.trim().is_empty() {
         return Err(AppError::usage("name a task (see the task picker)"));
     }

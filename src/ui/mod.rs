@@ -11,6 +11,7 @@ mod assets;
 mod guard;
 mod invoke;
 mod runs;
+mod watches;
 
 #[cfg(test)]
 mod tests;
@@ -39,6 +40,7 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> AppResult<()> {
     let state = Arc::new(api::UiState {
         guard: Arc::new(guard::Guard { token, port }),
         runs: runs::Runs::shared(),
+        watches: watches::Watches::shared(),
     });
     let app = api::router(state);
     println!("aido ui listening on {url}");

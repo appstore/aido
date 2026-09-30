@@ -42,17 +42,7 @@ pub(crate) async fn run(
     // Everything that can be known to fail before the first file arrives is
     // checked here, so a broken watch exits 2 instead of guarding and then
     // failing file after file.
-    if !args.dir.is_dir() {
-        return Err(AppError::usage(format!(
-            "watch directory '{}' is not a directory",
-            args.dir.display()
-        )));
-    }
-    let guard = absolute(&args.dir);
-    let probe = probe(cli, &args, &guard)?;
-
-    let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
-    let (interval, stable) = resolve_timing(&args, &cfg);
+    let setup = precheck(cli, &args)?;
 
     if cli.dry_run {
         if !cli.quiet {
@@ -61,49 +51,157 @@ pub(crate) async fn run(
                 args.dir.display()
             );
         }
-        print!("{}", plan::describe(&probe.plan));
+        print!("{}", plan::describe(&setup.probe.plan));
         return Ok(());
     }
 
-    // Startup inventory is seeded before the banner goes out: the banner
-    // is the deterministic "now everything already on disk counts as
-    // history, everything arriving next is a fresh file" mark. The
-    // baseline must be real: treating a failed scan as an empty directory
-    // would replay every old file once the directory is readable again.
+    // The bell needs both a listener and a place to ring: `--quiet`
+    // silences everything, and a piped stderr (test harness, log file)
+    // never rings.
     let bell = bell_enabled(cli.quiet, std::io::stderr().is_terminal());
-    let existing = initial_inventory(&guard, &args.dir)?;
-    let mut watched = WatchState::new(stable, existing, args.include_existing);
-    let mut unreadable = false;
-
     if !cli.quiet {
         eprintln!(
             "watch: guarding {} → {} (interval {} ms, stability window {} ms); Ctrl+C to stop",
             args.dir.display(),
-            probe.task_name,
-            interval.as_millis(),
-            stable.as_millis()
+            setup.probe.task_name,
+            setup.interval.as_millis(),
+            setup.stable.as_millis()
         );
     }
 
+    // The CLI's event sink is its stderr: the announce lines (and the
+    // bell) the daemon has always printed, exactly as before.
+    let quiet = cli.quiet;
+    let mut emit = move |event: WatchEvent| match event {
+        WatchEvent::FileDone { path, task } => announce(&path, &task, None, quiet, bell),
+        WatchEvent::FileFailed { path, task, reason } => {
+            announce(&path, &task, Some(reason), quiet, bell)
+        }
+        WatchEvent::DirUnreadable { dir, error } => {
+            if !quiet {
+                eprintln!("warning: cannot read '{dir}': {error}; still watching");
+            }
+        }
+        WatchEvent::DirReadable { dir } => {
+            if !quiet {
+                eprintln!("watch: '{dir}' is readable again");
+            }
+        }
+        WatchEvent::Stopped => {}
+    };
+    serve(cli, &args, setup, &state, &mut emit, std::future::pending()).await;
+    Ok(())
+}
+
+/// What one daemon run is about to guard, proven workable: the absolute
+/// directory, the validated probe plan, the resolved timing, and the
+/// startup inventory the baseline is seeded from.
+pub(crate) struct WatchSetup {
+    pub(crate) guard: PathBuf,
+    pub(crate) interval: Duration,
+    pub(crate) stable: Duration,
+    pub(crate) probe: Probe,
+    existing: Vec<(PathBuf, u64)>,
+}
+
+/// Everything [`run`] knows before the first file arrives — shared with
+/// the web UI's watch dashboard, which validates the same way and then
+/// serves the same loop.
+pub(crate) fn precheck(cli: &Cli, args: &WatchArgs) -> AppResult<WatchSetup> {
+    if !args.dir.is_dir() {
+        return Err(AppError::usage(format!(
+            "watch directory '{}' is not a directory",
+            args.dir.display()
+        )));
+    }
+    let guard = absolute(&args.dir);
+    let probe = probe(cli, args, &guard)?;
+    let cfg = config::load().map_err(|e| AppError::usage(format!("{e:#}")))?;
+    let (interval, stable) = resolve_timing(args, &cfg);
+    // Startup inventory is taken before the caller prints its banner:
+    // the banner is the deterministic "now everything already on disk
+    // counts as history, everything arriving next is a fresh file" mark.
+    // The baseline must be real: treating a failed scan as an empty
+    // directory would replay every old file once the directory is
+    // readable again.
+    let existing = initial_inventory(&guard, &args.dir)?;
+    Ok(WatchSetup {
+        guard,
+        interval,
+        stable,
+        probe,
+        existing,
+    })
+}
+
+/// What the daemon loop reports as it guards: one event per file
+/// verdict and per directory readability change, plus the final stop.
+/// The CLI turns these into its stderr lines; the web UI turns them
+/// into its live stream. Paths stay paths; the `dir` fields carry the
+/// user's own spelling (`args.dir`, not the canonical form).
+pub(crate) enum WatchEvent {
+    FileDone {
+        path: PathBuf,
+        task: String,
+    },
+    FileFailed {
+        path: PathBuf,
+        task: String,
+        reason: String,
+    },
+    DirUnreadable {
+        dir: String,
+        error: String,
+    },
+    DirReadable {
+        dir: String,
+    },
+    Stopped,
+}
+
+/// The guard loop: scan, debounce, run one file, repeat. `stop` is
+/// cooperative — it takes effect between files, never mid-run (an
+/// interrupted delivery is not a delivered file). Emits
+/// [`WatchEvent::Stopped`] exactly once, at the end.
+pub(crate) async fn serve(
+    cli: &Cli,
+    args: &WatchArgs,
+    mut setup: WatchSetup,
+    state: &Arc<std::sync::Mutex<RunState>>,
+    emit: &mut dyn FnMut(WatchEvent),
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut watched = WatchState::new(
+        setup.stable,
+        std::mem::take(&mut setup.existing),
+        args.include_existing,
+    );
+    let mut unreadable = false;
+    let dir = args.dir.display().to_string();
+    let mut stop = std::pin::pin!(stop);
     loop {
-        match scan_dir(&guard) {
+        match scan_dir(&setup.guard) {
             Ok(files) => {
                 if unreadable {
                     unreadable = false;
-                    if !cli.quiet {
-                        eprintln!("watch: '{}' is readable again", args.dir.display());
-                    }
+                    emit(WatchEvent::DirReadable { dir: dir.clone() });
                 }
                 if let Some(path) = watched.next_ready(std::time::Instant::now(), &files) {
-                    let outcome = run_one(cli, &args, &path, &state).await;
+                    let outcome = run_one(cli, args, &path, state).await;
                     // Failed or not, the file is done: a watch never
                     // retries (a broken input stays broken), it keeps
                     // guarding.
-                    let failure = match &outcome {
-                        Ok(()) => None,
-                        Err(e) => Some(first_line(&e.chain(), 160)),
-                    };
-                    announce(&path, &probe.task_name, failure, cli.quiet, bell);
+                    match &outcome {
+                        Ok(()) => emit(WatchEvent::FileDone {
+                            path: path.clone(),
+                            task: setup.probe.task_name.clone(),
+                        }),
+                        Err(e) => emit(WatchEvent::FileFailed {
+                            path: path.clone(),
+                            task: setup.probe.task_name.clone(),
+                            reason: first_line(&e.chain(), 160),
+                        }),
+                    }
                     watched.mark_done(&path);
                     // No sleep before the next verdict: the loop folds a
                     // fresh listing in immediately, so a file that grew
@@ -118,17 +216,19 @@ pub(crate) async fn run(
                 // comes back.
                 if !unreadable {
                     unreadable = true;
-                    if !cli.quiet {
-                        eprintln!(
-                            "warning: cannot read '{}': {e}; still watching",
-                            args.dir.display()
-                        );
-                    }
+                    emit(WatchEvent::DirUnreadable {
+                        dir: dir.clone(),
+                        error: e.to_string(),
+                    });
                 }
             }
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = stop.as_mut() => break,
+            _ = tokio::time::sleep(setup.interval) => {}
+        }
     }
+    emit(WatchEvent::Stopped);
 }
 
 /// One file, one ordinary run: re-normalize the task invocation with the
@@ -237,9 +337,9 @@ fn bell_enabled(quiet: bool, stderr_is_tty: bool) -> bool {
 
 /// What the precheck proved about the watch: the resolved task name for
 /// the banner and result lines, and the validated probe plan.
-struct Probe {
-    task_name: String,
-    plan: plan::ExecutionPlan,
+pub(crate) struct Probe {
+    pub(crate) task_name: String,
+    pub(crate) plan: plan::ExecutionPlan,
 }
 
 /// The startup precheck: build the per-file invocation against a probe

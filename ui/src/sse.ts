@@ -1,7 +1,8 @@
 import { token } from './api';
-import type { DoneFrame, Frame } from './types';
+import type { DoneFrame, Frame, WatchFrame } from './types';
 
 export type FrameHandler = (frame: Frame | DoneFrame) => void;
+export type WatchFrameHandler = (frame: WatchFrame) => void;
 
 /** Subscribe to a live run's progress. `onEnd` fires when the stream is
  * over for good — the server closed it after the closing frame, or the
@@ -14,9 +15,39 @@ export function subscribe(
   onFrame: FrameHandler,
   onEnd: () => void,
 ): () => void {
-  const source = new EventSource(
-    `/api/runs/${encodeURIComponent(runId)}/events?t=${encodeURIComponent(token)}`,
+  return subscribePath<Frame | DoneFrame>(
+    `/api/runs/${encodeURIComponent(runId)}/events`,
+    onFrame,
+    (frame) => frame.type === 'done' || frame.type === 'error' || frame.type === 'cancelled',
+    onEnd,
   );
+}
+
+/** A watch daemon's live activity; ends with its `stopped` frame. */
+export function subscribeWatch(
+  id: string,
+  onFrame: WatchFrameHandler,
+  onEnd: () => void,
+): () => void {
+  return subscribePath<WatchFrame>(
+    `/api/watches/${encodeURIComponent(id)}/events`,
+    onFrame,
+    (frame) => frame.type === 'stopped',
+    onEnd,
+  );
+}
+
+/** The path-level subscription both streams share: frames are JSON, a
+ * true return from `isTerminal` ends the stream locally (no browser
+ * reconnect into a 404), and only a CLOSED source counts as an error
+ * ending — a blip retries. */
+export function subscribePath<T>(
+  path: string,
+  onFrame: (frame: T) => void,
+  isTerminal: (frame: T) => boolean,
+  onEnd: () => void,
+): () => void {
+  const source = new EventSource(`${path}?t=${encodeURIComponent(token)}`);
   let ended = false;
   const end = () => {
     if (ended) return;
@@ -26,9 +57,9 @@ export function subscribe(
   };
   source.onmessage = (event) => {
     try {
-      const frame = JSON.parse(event.data) as Frame | DoneFrame;
+      const frame = JSON.parse(event.data) as T;
       onFrame(frame);
-      if (frame.type === 'done' || frame.type === 'error' || frame.type === 'cancelled') {
+      if (isTerminal(frame)) {
         // The server closes right after its closing frame; end locally
         // instead of letting the browser reconnect into a 404.
         ended = true;
@@ -40,8 +71,6 @@ export function subscribe(
     }
   };
   source.onerror = () => {
-    // Fatal (e.g. 404 on reconnect: CLOSED) or a blip (CONNECTING, the
-    // browser retries). Only a closed source is the end.
     if (source.readyState === EventSource.CLOSED) end();
   };
   return () => {

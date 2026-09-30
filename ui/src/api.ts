@@ -11,6 +11,9 @@ import type {
   Task,
   TaskSaveResult,
   TaskSource,
+  WatchPreview,
+  WatchRequestPayload,
+  WatchRow,
 } from './types';
 
 // The session token: `aido ui` prints one URL (`?t=…`); landing there
@@ -170,4 +173,31 @@ export async function startChain(payload: ChainRequestPayload, files: File[]): P
     files,
   );
   return ((await response.json()) as { run_id: string }).run_id;
+}
+
+// --- watch daemons ------------------------------------------------------------
+
+export function listWatches(): Promise<WatchRow[]> {
+  return json<{ watches: WatchRow[] }>('/api/watches').then((b) => b.watches);
+}
+
+export async function startWatch(payload: WatchRequestPayload): Promise<string> {
+  const response = await request('/api/watches', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return ((await response.json()) as { id: string }).id;
+}
+
+export function previewWatch(payload: WatchRequestPayload): Promise<WatchPreview> {
+  return request('/api/watches/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then((r) => r.json());
+}
+
+export async function stopWatch(id: string): Promise<void> {
+  await request(`/api/watches/${encodeURIComponent(id)}/stop`, { method: 'POST' });
 }

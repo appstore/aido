@@ -221,3 +221,60 @@ export interface ChainPreview {
   label: string;
   stages: { name: string; profile: string; model: string; produce: string[] }[];
 }
+
+// --- watch daemons -----------------------------------------------------------
+
+export interface WatchRequestPayload {
+  dir: string;
+  task: string;
+  prompt?: string;
+  profile?: string;
+  model?: string;
+  to?: string;
+  voice?: string;
+  speed?: number;
+  count?: number;
+  size?: string;
+  no_split?: boolean;
+  timeout_secs?: number;
+  total_timeout_secs?: number;
+  out_subdir?: string;
+  interval_secs?: number;
+  stable_ms?: number;
+  include_existing?: boolean;
+}
+
+export interface WatchRow {
+  id: string;
+  dir: string;
+  task: string;
+  out_dir: string;
+  interval_ms: number;
+  stable_ms: number;
+  include_existing: boolean;
+  started_at: string;
+  status: 'running' | 'stopping' | 'stopped';
+  processed: number;
+  failed: number;
+  last_file: string | null;
+  last_error: string | null;
+  stop_reason: string | null;
+}
+
+export interface WatchPreview {
+  text: string;
+  task: string;
+  dir: string;
+  out_dir: string;
+  interval_ms: number;
+  stable_ms: number;
+}
+
+export type WatchFrame =
+  | { type: 'started'; at: string; dir: string; task: string; out_dir: string; interval_ms: number; stable_ms: number }
+  | { type: 'file_done'; at: string; file: string; task: string }
+  | { type: 'file_failed'; at: string; file: string; task: string; reason: string }
+  | { type: 'dir_unreadable'; at: string; dir: string; error: string }
+  | { type: 'dir_readable'; at: string; dir: string }
+  | { type: 'stopped'; at: string; reason: string | null }
+  | { type: 'lagged'; at: string };

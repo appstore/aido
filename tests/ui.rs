@@ -1377,3 +1377,147 @@ async fn a_ui_batch_run_reports_its_parts_live() {
     assert!(done.get("error").is_none());
     provider.join().unwrap();
 }
+
+/// The watch dashboard's contract: a validated daemon starts, processes
+/// what arrives (and what `include_existing` seeds), delivers under the
+/// guarded directory, stops between files, and answers its list and
+/// preview along the way. The probe and per-file runs are the CLI's own
+/// path, so a UI watch IS a CLI watch.
+#[tokio::test]
+async fn a_watch_daemon_processes_files_and_stops_between_them() {
+    let watched = temp_dir("ui-watch-dir");
+    std::fs::write(watched.join("note.txt"), "hi\n").unwrap();
+    // One file, one request: short text, single chunk.
+    let provider = MultiServer::start(&[chat_body("WATCHED")]);
+    let dir = temp_dir("ui-watch-history");
+    let cfg = chat_cfg(&provider.url());
+    let server = UiServer::start(&[
+        ("AIDO_CONFIG", cfg.to_str().unwrap()),
+        ("AIDO_HISTORY_DIR", dir.to_str().unwrap()),
+    ]);
+
+    let post = |body: serde_json::Value| {
+        client()
+            .post(format!("http://127.0.0.1:{}/api/watches", server.port))
+            .header("x-aido-token", TOKEN)
+            .json(&body)
+    };
+
+    // The preview is the CLI's dry-run: the probe plan, resolved out
+    // dir, zero requests.
+    let preview = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/watches/preview",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({
+            "dir": watched.to_str().unwrap(),
+            "task": "summarize",
+            "profile": "test",
+            "include_existing": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    let planned: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(planned["task"], "summarize");
+    assert!(
+        planned["out_dir"].as_str().unwrap().ends_with("/out"),
+        "{}",
+        planned["out_dir"]
+    );
+
+    // A missing directory answers with the CLI's own refusal.
+    let bad = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/watches/preview",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .json(&serde_json::json!({
+            "dir": "/nonexistent/ui-watch-dir",
+            "task": "summarize",
+            "profile": "test",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Start; the seeded file runs on its own.
+    let started = post(serde_json::json!({
+        "dir": watched.to_str().unwrap(),
+        "task": "summarize",
+        "profile": "test",
+        "include_existing": true,
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(started.status(), 201);
+    let id: String = started.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The list eventually reports the file processed…
+    let mut list = serde_json::Value::Null;
+    for _ in 0..150 {
+        list = server.get("/api/watches").await.json().await.unwrap();
+        let row = &list["watches"][0];
+        if row["processed"].as_u64() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let row = &list["watches"][0];
+    assert_eq!(row["id"], id.as_str());
+    assert_eq!(row["status"], "running");
+    assert_eq!(row["processed"], 1);
+    assert_eq!(row["failed"], 0);
+    assert_eq!(row["last_file"], "note.txt");
+
+    // …the delivery landed under the guarded directory (a subdirectory,
+    // never the guarded root)…
+    let out_dir = watched.join("out");
+    let delivered: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("txt"))
+        .collect();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(std::fs::read_to_string(&delivered[0]).unwrap(), "WATCHED");
+    // …and history kept the run, an ordinary record.
+    assert!(out_dir.join("manifest.json").is_file());
+
+    // Stop is cooperative: acknowledged now, effective between files.
+    let stop = client()
+        .post(format!(
+            "http://127.0.0.1:{}/api/watches/{id}/stop",
+            server.port
+        ))
+        .header("x-aido-token", TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), 204);
+    for _ in 0..100 {
+        list = server.get("/api/watches").await.json().await.unwrap();
+        if list["watches"][0]["status"] == "stopped" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(list["watches"][0]["status"], "stopped");
+
+    // A file arriving after the stop is never processed — and the ended
+    // daemon has no stream to subscribe to.
+    std::fs::write(watched.join("later.txt"), "too late\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let list: serde_json::Value = server.get("/api/watches").await.json().await.unwrap();
+    assert_eq!(list["watches"][0]["processed"], 1);
+    let events = server.get(&format!("/api/watches/{id}/events")).await;
+    assert_eq!(events.status(), 404);
+}
