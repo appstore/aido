@@ -273,9 +273,9 @@ aido ui --port 8710        # 指定端口
 aido ui --no-open          # 只打印 URL，不动浏览器
 ```
 
-五个页面：**运行**（选任务 → 拖拽/粘贴材料（Ctrl+V 直接收截图）→ 参数 → dry-run 预览 → 运行，流式输出、可取消、产物按类型渲染——文本可复制、图片内嵌、音频可播放；per-part 批处理逐文件显示进度，最终以网格呈现、失败格子标红）、**链**（可视化管线卡片搭 `--then` 链：每环挂自己的参数与 profile，plan 期类型检查在环间连线上即时标红，README 里的经典链做成一键模板；中间产物与最终交付分组展示）、**历史**（与 CLI 相同的编号，1 = 最新）、**运行详情**（manifest、产物、provenance、警告）与**配置**（providers/profiles/tasks 的解析视图 + TOML 编辑器——保存前先解析，写坏只报错不动盘上文件，`config check` 的结论贴在保存按钮旁）。UI 走和 CLI 同一条 plan → runner → history 管线（同一套校验、同一份历史记录）；页面角落常驻当前操作等效的 aido 命令行，方便毕业后回到终端。
+七个页面：**运行**（选任务 → 拖拽/粘贴材料（Ctrl+V 直接收截图）→ 参数 → dry-run 预览 → 运行，流式输出、可取消、产物按类型渲染——文本可复制、图片内嵌、音频可播放；高级区可设 `--profile`/`--model`/`--produce`/`--format`；交付区可把结果写入服务器磁盘——`--out-dir`/`-o` 只接受 aido 交付目录（deliveries）内的一个名字，不是路径，每个目的地的真实状态（已交付/失败原因）随报告展示）、**链**（可视化管线卡片搭 `--then` 链：每环挂自己的参数与 profile，plan 期类型检查在环间连线上即时标红，README 里的经典链做成一键模板；中间产物与最终交付分组展示）、**任务**（任务库 + 创建向导：表单（含实时 TOML 预览）或直接写 TOML，服务端用加载器自己的规则校验后原子落盘并即时生效——无需重启；自定义任务可编辑、可删除，可覆盖同名内置任务）、**守护**（watch 仪表盘：从浏览器新建目录守护——与 CLI 同一套 probe 预检、结果写入守护目录的子目录；卡片上看到每个守护的计数与最近判定，实时日志流跟随每个文件，停止在文件之间生效；只列出本 UI 启动的守护，CLI 另起的 watch 是另一个进程）、**历史**（与 CLI 相同的编号，1 = 最新）、**运行详情**（manifest、产物、provenance 来源时间线——每份材料指向它变成的产物、警告，可整次打包下载 .zip：manifest + 全部产物，与 `--out-dir` 同一棵树）与**配置**（providers/profiles/tasks 的解析视图 + TOML 编辑器——保存前先解析，写坏只报错不动盘上文件，`config check` 的结论贴在保存按钮旁）。UI 走和 CLI 同一条 plan → runner → history 管线（同一套校验、同一份历史记录）；页面角落常驻当前操作等效的 aido 命令行，方便毕业后回到终端。
 
-安全边界：只监听 127.0.0.1；每个 `/api` 请求都要带会话令牌（打印出的 URL 里 `?t=…`，一次性进入后由页面保存）；Host 与 Origin 校验拦住 DNS rebinding 和其他网页的跨站请求。`AIDO_UI_TOKEN` 可固定令牌（测试与前端开发）。运行中新增自定义任务 TOML 需重启 `aido ui`。
+安全边界：只监听 127.0.0.1；每个 `/api` 请求都要带会话令牌（打印出的 URL 里 `?t=…`，一次性进入后由页面保存）；Host 与 Origin 校验拦住 DNS rebinding 和其他网页的跨站请求。`AIDO_UI_TOKEN` 可固定令牌（测试与前端开发）。服务器端交付只落在 aido 的交付目录之内（`AIDO_DELIVERY_DIR`，默认本地数据目录下 `aido/deliveries/`）——浏览器请求永远不能指定任意路径。
 
 Web UI 由 `ui` feature 控制（默认开启，纯 Rust 依赖，`--no-default-features` 构建没有它，且 `aido ui` 会明确报错）。前端源码在 `ui/`（Vite + React + TypeScript）；**源码构建发布二进制前需要 Node**：`cd ui && npm install && npm run build`（release 构建把 `ui/dist` 编译期内嵌；debug 构建直接读盘，改前端不用重编 Rust）。仅 `cargo build` 的开发构建不需要 Node——此时界面显示占位页。
 
@@ -288,6 +288,7 @@ Web UI 由 `ui` feature 控制（默认开启，纯 Rust 依赖，`--no-default-
 | `AIDO_CONFIG` | 配置文件；默认平台配置目录下的 `aido/config.toml`。显式指定的文件不存在时直接报错，不回退默认配置。 |
 | `AIDO_TASKS_DIR` | 用户任务目录；默认平台配置目录下的 `aido/tasks/`。 |
 | `AIDO_HISTORY_DIR` | 历史目录；默认平台本地数据目录下的 `aido/history/`。 |
+| `AIDO_DELIVERY_DIR` | Web UI 的服务器端交付目录；默认平台本地数据目录下的 `aido/deliveries/`。 |
 
 Linux 通常使用 `~/.config/aido/` 和 `~/.local/share/aido/history/`（遵循 XDG 配置）。例如：`AIDO_CONFIG=./config.toml AIDO_HISTORY_DIR=./history aido ask --text "你好"`。
 
